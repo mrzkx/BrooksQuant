@@ -394,6 +394,13 @@ async def kline_producer(
                                             )
 
                             if not k.get("x"):  # 只处理已收盘的 K 线
+                                # 每60秒打印一次心跳日志（证明 WebSocket 连接正常）
+                                current_time = asyncio.get_event_loop().time()
+                                if (current_time - last_heartbeat) > 60:
+                                    logging.info(
+                                        f"💓 WebSocket 心跳: 当前价格={current_price:.2f}, 等待K线收盘..."
+                                    )
+                                    last_heartbeat = current_time
                                 continue
 
                             # 已收盘的 K 线
