@@ -1,0 +1,66 @@
+[Unit]
+Description=BrooksQuant Al Brooks Price Action Trading System v3.0
+Documentation=https://github.com/your-repo/BrooksQuant
+# 确保在网络、PostgreSQL 和 Redis 服务启动后再启动
+After=network.target network-online.target postgresql.service redis-server.service
+Wants=network-online.target
+# 如果 PostgreSQL 或 Redis 不可用，仍然尝试启动（容错机制）
+Wants=postgresql.service redis-server.service
+# 最大重启次数（5分钟内最多重启5次）
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+
+# 用户和组（推荐使用非 root 用户）
+User=ubuntu
+Group=ubuntu
+
+# 工作目录
+WorkingDirectory=/opt/BrooksQuant
+
+# 环境变量文件路径（所有敏感配置在此文件中）
+EnvironmentFile=/opt/BrooksQuant/.env
+
+# 确保日志实时输出到 journalctl（无缓冲）
+Environment=PYTHONUNBUFFERED=1
+
+# 观察模式（设为 false 进入实盘模式）
+Environment=OBSERVE_MODE=true
+
+# Python 虚拟环境路径（使用 venv 中的解释器）
+ExecStart=/opt/BrooksQuant/venv/bin/python /opt/BrooksQuant/main.py
+
+# 启动前检查虚拟环境是否存在
+ExecStartPre=/bin/bash -c 'test -f /opt/BrooksQuant/venv/bin/python || (echo "Virtual environment not found" && exit 1)'
+
+# 重启策略
+Restart=always
+RestartSec=10
+
+# 资源限制
+LimitNOFILE=65536
+
+# 优雅关闭信号（确保触发 main.py 的清理逻辑）
+KillSignal=SIGINT
+# 等待进程优雅退出的时间（秒）
+TimeoutStopSec=30
+
+# ============================================================================
+# 日志轮转配置（防止 journald 占用过多磁盘）
+# ============================================================================
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=brooksquant
+
+# 限制单个服务的日志大小（最大 100MB）
+LogRateLimitIntervalSec=30
+LogRateLimitBurst=10000
+
+# 安全设置
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
