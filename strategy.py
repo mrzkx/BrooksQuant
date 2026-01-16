@@ -72,7 +72,7 @@ class AlBrooksStrategy:
         """关闭 Redis 连接"""
         if self.redis_client:
             try:
-                await self.redis_client.close()
+                await self.redis_client.aclose()
             except:
                 pass
             self.redis_client = None

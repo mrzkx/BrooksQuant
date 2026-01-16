@@ -278,7 +278,7 @@ async def orderbook_worker(symbol: str = SYMBOL) -> None:
                     pass
             if redis_client is not None:
                 try:
-                    await redis_client.close()
+                    await redis_client.aclose()
                 except:
                     pass
     
@@ -336,7 +336,7 @@ async def kline_producer(
             # 如果有足够的历史数据，进行一次信号扫描
             if len(history) >= 50:
                 df = pd.DataFrame(history)
-                signals_df = strategy.generate_signals(df)
+                signals_df = await strategy.generate_signals(df)
                 last = signals_df.iloc[-1]
                 market_state = last.get("market_state", "Unknown")
                 logging.info(f"市场状态扫描完成，当前市场模式: {market_state}")
