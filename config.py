@@ -151,6 +151,49 @@ REDIS_URL = get_redis_url()
 
 
 # ============================================================================
+# 交易参数配置
+# ============================================================================
+
+def get_trading_config() -> dict:
+    """
+    获取交易参数配置
+    
+    环境变量：
+    - OBSERVE_BALANCE: 观察模式的模拟总资金（USDT），默认 10000
+    - POSITION_SIZE_PERCENT: 开仓使用资金百分比，默认 20（即 20%）
+    - LEVERAGE: 杠杆倍数，默认 20
+    - SYMBOL: 交易对，默认 BTCUSDT
+    - INTERVAL: K线周期，默认 5m
+    """
+    config = {
+        "observe_balance": float(os.getenv("OBSERVE_BALANCE", "")),
+        "position_size_percent": float(os.getenv("POSITION_SIZE_PERCENT", "")),
+        "leverage": int(os.getenv("LEVERAGE", "")),
+        "symbol": os.getenv("SYMBOL", ""),
+        "interval": os.getenv("INTERVAL", ""),
+    }
+    
+    logging.info(
+        f"交易参数: 模拟资金={config['observe_balance']} USDT, "
+        f"仓位={config['position_size_percent']}%, "
+        f"杠杆={config['leverage']}x"
+    )
+    
+    return config
+
+
+# 导出交易配置
+TRADING_CONFIG = get_trading_config()
+
+# 便捷常量
+OBSERVE_BALANCE = TRADING_CONFIG["observe_balance"]
+POSITION_SIZE_PERCENT = TRADING_CONFIG["position_size_percent"]
+LEVERAGE = TRADING_CONFIG["leverage"]
+SYMBOL = TRADING_CONFIG["symbol"]
+KLINE_INTERVAL = TRADING_CONFIG["interval"]
+
+
+# ============================================================================
 # 日志配置
 # ============================================================================
 

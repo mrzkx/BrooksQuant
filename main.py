@@ -9,7 +9,15 @@ from binance import AsyncClient, BinanceSocketManager
 from binance.exceptions import ReadLoopClosed
 import redis.asyncio as aioredis
 
-from config import load_user_credentials, REDIS_URL
+from config import (
+    load_user_credentials, 
+    REDIS_URL,
+    OBSERVE_BALANCE,
+    POSITION_SIZE_PERCENT,
+    LEVERAGE,
+    SYMBOL as CONFIG_SYMBOL,
+    KLINE_INTERVAL,
+)
 from strategy import AlBrooksStrategy
 from trade_logger import TradeLogger
 from user_manager import TradingUser
@@ -22,12 +30,46 @@ except ImportError:
     ConnectionClosed = Exception  # type: ignore
 
 
-SYMBOL = "BTCUSDT"
+# 交易参数（从 config.py 读取）
+SYMBOL = CONFIG_SYMBOL
 INTERVAL = AsyncClient.KLINE_INTERVAL_5MINUTE
-ORDER_QTY = 0.001  # 示例下单数量，可按需调整
 
 # 观察模式：设置为 True 时只模拟交易，不实际下单
 OBSERVE_MODE = os.getenv("OBSERVE_MODE", "true").lower() == "true"
+
+
+def calculate_order_quantity(current_price: float) -> float:
+    """
+    计算下单数量
+    
+    公式: 下单数量 = (总资金 × 仓位百分比 × 杠杆) / 当前价格
+    
+    示例（默认参数）:
+    - 总资金: 10000 USDT
+    - 仓位: 20%
+    - 杠杆: 20x
+    - 价格: 90000 USDT
+    - 数量: (10000 × 0.2 × 20) / 90000 = 0.444 BTC
+    
+    返回: BTC 数量（保留3位小数）
+    """
+    if current_price <= 0:
+        return 0.001  # 默认最小值
+    
+    # 开仓金额 = 总资金 × 仓位百分比
+    position_value = OBSERVE_BALANCE * (POSITION_SIZE_PERCENT / 100)
+    
+    # 实际购买力 = 开仓金额 × 杠杆
+    buying_power = position_value * LEVERAGE
+    
+    # 下单数量 = 购买力 / 当前价格
+    quantity = buying_power / current_price
+    
+    # 保留3位小数（Binance BTC 最小精度）
+    quantity = round(quantity, 3)
+    
+    # 确保不低于最小交易量
+    return max(quantity, 0.001)
 
 
 async def _load_historical_klines(
@@ -753,6 +795,9 @@ async def user_worker(
                 )
                 continue
 
+            # 根据当前价格动态计算下单数量
+            order_qty = calculate_order_quantity(signal["price"])
+            
             if OBSERVE_MODE:
                 # 观察模式：只记录模拟交易（支持分批止盈）
                 tp1_price = signal.get("tp1_price")
@@ -765,7 +810,7 @@ async def user_worker(
                     signal=signal["signal"],
                     side=signal["side"],
                     entry_price=signal["price"],
-                    quantity=ORDER_QTY,
+                    quantity=order_qty,
                     stop_loss=signal["stop_loss"],
                     take_profit=signal["take_profit"],
                     signal_strength=signal_strength,
@@ -775,23 +820,30 @@ async def user_worker(
                     tight_channel_score=tight_channel_score_val,
                 )
                 
+                # 计算持仓价值
+                position_value = order_qty * signal["price"]
+                
                 # 根据是否有TP1/TP2选择不同的日志格式
                 if tp1_price and tp2_price:
                     logging.info(
                         f"[{user.name}] ✅ 模拟开仓: {signal['signal']} {signal['side']} @ {signal['price']:.2f}, "
+                        f"数量={order_qty:.4f} BTC (≈{position_value:.2f} USDT), "
                         f"止损={signal['stop_loss']:.2f}, TP1={tp1_price:.2f}(50%), TP2={tp2_price:.2f}(50%)"
                     )
                     print(
                         f"[{user.name}] ✅ 模拟开仓: {signal['signal']} {signal['side']} @ {signal['price']:.2f}, "
+                        f"数量={order_qty:.4f} BTC (≈{position_value:.2f} USDT), "
                         f"止损={signal['stop_loss']:.2f}, TP1={tp1_price:.2f}(50%), TP2={tp2_price:.2f}(50%)"
                     )
                 else:
                     logging.info(
                         f"[{user.name}] ✅ 模拟开仓: {signal['signal']} {signal['side']} @ {signal['price']:.2f}, "
+                        f"数量={order_qty:.4f} BTC (≈{position_value:.2f} USDT), "
                         f"止损={signal['stop_loss']:.2f}, 止盈={signal['take_profit']:.2f}"
                     )
                     print(
                         f"[{user.name}] ✅ 模拟开仓: {signal['signal']} {signal['side']} @ {signal['price']:.2f}, "
+                        f"数量={order_qty:.4f} BTC (≈{position_value:.2f} USDT), "
                         f"止损={signal['stop_loss']:.2f}, 止盈={signal['take_profit']:.2f}"
                     )
             else:
@@ -800,7 +852,7 @@ async def user_worker(
                     "symbol": SYMBOL,
                     "side": signal["side"].upper(),
                     "type": "MARKET",
-                    "quantity": ORDER_QTY,
+                    "quantity": order_qty,
                 }
                 try:
                     logging.info(f"[{user.name}] 正在执行订单: {order_params}")
@@ -811,17 +863,19 @@ async def user_worker(
                         signal=signal["signal"],
                         side=signal["side"],
                         entry_price=signal["price"],
-                        quantity=ORDER_QTY,
+                        quantity=order_qty,
                         stop_loss=signal["stop_loss"],
                         take_profit=signal["take_profit"],
                         signal_strength=signal_strength,
                     )
                     logging.info(
-                        f"[{user.name}] ✅ 订单执行成功: {signal['signal']} {signal['side']} @ {signal['price']:.2f}"
+                        f"[{user.name}] ✅ 订单执行成功: {signal['signal']} {signal['side']} @ {signal['price']:.2f}, "
+                        f"数量={order_qty:.4f} BTC"
                     )
                     print(
                         f"[{user.name}] ✅ 已执行 {signal['signal']} 信号，方向={signal['side']}, "
-                        f"价格={signal['price']:.2f}, 止损={signal['stop_loss']:.2f}, 止盈={signal['take_profit']:.2f}"
+                        f"价格={signal['price']:.2f}, 数量={order_qty:.4f} BTC, "
+                        f"止损={signal['stop_loss']:.2f}, 止盈={signal['take_profit']:.2f}"
                     )
                 except Exception as exc:
                     logging.exception(f"[{user.name}] ❌ 下单失败: {exc}")
@@ -897,19 +951,23 @@ async def main() -> None:
     if OBSERVE_MODE:
         logging.info("=" * 60)
         logging.info("观察模式已启用 - 将进行模拟交易，不会实际下单")
+        logging.info(f"模拟资金: {OBSERVE_BALANCE} USDT, 仓位: {POSITION_SIZE_PERCENT}%, 杠杆: {LEVERAGE}x")
         logging.info("=" * 60)
         print("=" * 60)
         print("观察模式已启用 - 将进行模拟交易，不会实际下单")
+        print(f"模拟资金: {OBSERVE_BALANCE} USDT, 仓位: {POSITION_SIZE_PERCENT}%, 杠杆: {LEVERAGE}x")
         print("=" * 60)
     else:
         logging.info("=" * 60)
         logging.info("实际交易模式 - 将进行真实下单")
+        logging.info(f"仓位: {POSITION_SIZE_PERCENT}%, 杠杆: {LEVERAGE}x")
         logging.info("=" * 60)
         print("=" * 60)
         print("实际交易模式 - 将进行真实下单")
+        print(f"仓位: {POSITION_SIZE_PERCENT}%, 杠杆: {LEVERAGE}x")
         print("=" * 60)
 
-    logging.info(f"交易对: {SYMBOL}, K线周期: {INTERVAL}, 下单数量: {ORDER_QTY}")
+    logging.info(f"交易对: {SYMBOL}, K线周期: {INTERVAL}")
 
     queues = [asyncio.Queue() for _ in users]
     

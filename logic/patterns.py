@@ -165,7 +165,8 @@ class PatternDetector:
         if market_state == MarketState.TRADING_RANGE:
             return None
         
-        if market_state not in [MarketState.BREAKOUT, MarketState.CHANNEL, MarketState.TIGHT_CHANNEL]:
+        # STRONG_TREND 中允许顺势 Spike，方向由 strategy.py 过滤
+        if market_state not in [MarketState.BREAKOUT, MarketState.CHANNEL, MarketState.TIGHT_CHANNEL, MarketState.STRONG_TREND]:
             return None
         
         recent_bodies = [
