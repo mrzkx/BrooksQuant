@@ -6,6 +6,7 @@ import json
 
 import pandas as pd
 from binance import AsyncClient, BinanceSocketManager
+from binance.exceptions import ReadLoopClosed
 import redis.asyncio as aioredis
 
 from config import load_user_credentials, REDIS_URL
@@ -127,7 +128,7 @@ async def orderbook_worker(symbol: str = SYMBOL) -> None:
     订单簿深度监控工作线程
     
     功能：
-    1. 订阅 Binance WebSocket depth5 数据流
+    1. 订阅 Binance WebSocket depth20 数据流（20档深度，更难被操纵）
     2. 实时计算 OBI（Order Book Imbalance）
     3. 将结果存入 Redis，10秒过期
     
@@ -189,11 +190,15 @@ async def orderbook_worker(symbol: str = SYMBOL) -> None:
             # 创建 WebSocket 管理器
             bsm = BinanceSocketManager(client)
             
-            # 订阅 depth5 数据流（5档深度）
-            depth_socket = bsm.depth_socket(symbol, depth=BinanceSocketManager.WEBSOCKET_DEPTH_5)
+            # 订阅 depth20 数据流（20档深度，更难被操纵）
+            depth_socket = bsm.depth_socket(symbol, depth=BinanceSocketManager.WEBSOCKET_DEPTH_20)
+            
+            # OBI 历史记录（用于计算滑动平均和变化率）
+            obi_history: List[float] = []
+            OBI_HISTORY_SIZE = 30  # 保留最近30个OBI值（约30秒）
             
             async with depth_socket as stream:
-                logging.info(f"🔄 订单簿深度监控已启动: {symbol} (depth5)")
+                logging.info(f"🔄 订单簿深度监控已启动: {symbol} (depth20, 增强OBI分析)")
                 reconnect_attempt = 0  # 重置重连计数
                 
                 while True:
@@ -222,34 +227,75 @@ async def orderbook_worker(symbol: str = SYMBOL) -> None:
                         else:
                             obi = 0.0
                         
-                        # 存入 Redis，10秒过期
+                        # 更新 OBI 历史记录
+                        obi_history.append(obi)
+                        if len(obi_history) > OBI_HISTORY_SIZE:
+                            obi_history.pop(0)
+                        
+                        # 计算增强 OBI 指标
+                        obi_avg = sum(obi_history) / len(obi_history) if obi_history else obi
+                        
+                        # 计算 OBI 变化率（Delta OBI）：最近10个 vs 前10个
+                        obi_delta = 0.0
+                        if len(obi_history) >= 20:
+                            recent_avg = sum(obi_history[-10:]) / 10
+                            older_avg = sum(obi_history[-20:-10]) / 10
+                            obi_delta = recent_avg - older_avg
+                        elif len(obi_history) >= 5:
+                            # 数据不足时用简化计算
+                            obi_delta = obi - obi_history[0]
+                        
+                        # 计算 OBI 趋势方向
+                        obi_trend = "neutral"
+                        if obi_delta > 0.05:
+                            obi_trend = "bullish"  # 买盘增强
+                        elif obi_delta < -0.05:
+                            obi_trend = "bearish"  # 卖盘增强
+                        
+                        # 存入 Redis，10秒过期（增强版数据）
                         redis_key = f"cache:obi:{symbol}"
                         await redis_client.setex(
                             redis_key,
                             10,  # 10秒过期
                             json.dumps({
-                                "obi": round(obi, 4),
+                                "obi": round(obi, 4),           # 瞬时OBI
+                                "obi_avg": round(obi_avg, 4),   # 滑动平均OBI
+                                "obi_delta": round(obi_delta, 4),  # OBI变化率
+                                "obi_trend": obi_trend,         # OBI趋势方向
                                 "bid_qty": round(total_bid_qty, 4),
                                 "ask_qty": round(total_ask_qty, 4),
-                                "timestamp": msg.get("E", 0),  # 事件时间
+                                "timestamp": msg.get("E", 0),
                             })
                         )
                         
                         # 定期日志（每50次更新记录一次）
                         if int(msg.get("E", 0)) % 50000 < 1000:  # 约每50秒
-                            status = "买盘占优" if obi > 0.3 else "卖盘占优" if obi < -0.3 else "均衡"
+                            status = "买盘占优" if obi_avg > 0.3 else "卖盘占优" if obi_avg < -0.3 else "均衡"
                             logging.debug(
-                                f"📊 OBI更新: {obi:.4f} ({status}), "
+                                f"📊 OBI更新: 瞬时={obi:.4f}, 平均={obi_avg:.4f}, Delta={obi_delta:.4f} ({obi_trend}), "
                                 f"买盘={total_bid_qty:.2f}, 卖盘={total_ask_qty:.2f}"
                             )
                     
+                    except ReadLoopClosed:
+                        # WebSocket 读取循环已关闭，需要重连
+                        logging.warning("WebSocket 读取循环已关闭，准备重连...")
+                        break  # 退出内层循环，触发外层重连逻辑
                     except asyncio.TimeoutError:
                         logging.warning("订单簿数据流超时，尝试重连...")
                         break
                     except Exception as e:
+                        # 其他异常，记录但继续尝试（可能是临时错误）
                         logging.error(f"处理订单簿数据失败: {e}", exc_info=True)
                         await asyncio.sleep(1)
         
+        except ReadLoopClosed:
+            reconnect_attempt += 1
+            delay = min(base_delay * (2 ** reconnect_attempt), 60)
+            logging.warning(
+                f"订单簿 WebSocket 读取循环已关闭，"
+                f"{delay}秒后重连 ({reconnect_attempt}/{max_reconnect_attempts})"
+            )
+            await asyncio.sleep(delay)
         except ConnectionClosed as e:
             reconnect_attempt += 1
             delay = min(base_delay * (2 ** reconnect_attempt), 60)
@@ -295,7 +341,6 @@ async def kline_producer(
     """
     history: List[Dict] = []
     kline_count = 0
-    last_heartbeat = asyncio.get_event_loop().time()
     reconnect_attempt = 0
     max_reconnect_attempts = 10  # 最大重连次数
     base_delay = 1  # 基础延迟（秒）
@@ -394,29 +439,13 @@ async def kline_producer(
                                             )
 
                             if not k.get("x"):  # 只处理已收盘的 K 线
-                                # 每60秒打印一次心跳日志（证明 WebSocket 连接正常）
-                                current_time = asyncio.get_event_loop().time()
-                                if (current_time - last_heartbeat) > 60:
-                                    logging.info(
-                                        f"💓 WebSocket 心跳: 当前价格={current_price:.2f}, 等待K线收盘..."
-                                    )
-                                    last_heartbeat = current_time
                                 continue
 
                             # 已收盘的 K 线
                             kline_count += 1
-                            current_time = asyncio.get_event_loop().time()
-
-                            # 每10根K线或每5分钟输出一次心跳日志
-                            if (
-                                kline_count % 10 == 0
-                                or (current_time - last_heartbeat) > 300
-                            ):
-                                logging.info(
-                                    f"已接收 {kline_count} 根K线，当前价格: {current_price:.2f}, "
-                                    f"历史数据: {len(history)} 根"
-                                )
-                                last_heartbeat = current_time
+                            logging.info(
+                                f"📊 K线收盘 #{kline_count}: O={float(k['o']):.2f} H={float(k['h']):.2f} L={float(k['l']):.2f} C={float(k['c']):.2f}"
+                            )
 
                             # 提取 OHLC
                             kline_data = {
@@ -436,17 +465,41 @@ async def kline_producer(
                             signals_df = await strategy.generate_signals(df)
                             last = signals_df.iloc[-1]
 
-                            # 获取当前市场状态
+                            # 获取当前市场状态和技术指标
                             market_state = last.get("market_state", "Unknown")
+                            atr_value = last.get("atr", None)
+                            
+                            # 计算K线实体比例（用于调试）
+                            kline_range = float(k["h"]) - float(k["l"])
+                            kline_body = abs(float(k["c"]) - float(k["o"]))
+                            body_ratio = kline_body / kline_range if kline_range > 0 else 0
 
-                            # 每根K线都记录市场状态（用于监控）
+                            # 每根K线都记录市场状态和关键指标（用于调试）
                             if kline_count % 10 == 0:
+                                atr_str = f"{atr_value:.2f}" if atr_value else "N/A"
+                                climax_threshold = atr_value * 2.5 if atr_value else 0
+                                is_potential_climax = kline_range > climax_threshold if atr_value else False
                                 logging.info(
-                                    f"市场状态更新: {market_state}, 历史数据: {len(history)} 根, 当前价格: {current_price:.2f}"
+                                    f"📈 状态: {market_state}, ATR={atr_str}, "
+                                    f"K线范围={kline_range:.2f}, 实体比={body_ratio:.1%}, "
+                                    f"潜在Climax={'是' if is_potential_climax else '否'}"
                                 )
 
                             # 每根K线递增计数器（用于冷却期管理）
                             trade_logger.increment_kline()
+                            
+                            # 调试日志：详细记录信号检测条件
+                            if kline_count % 5 == 0 or last["signal"]:  # 每5根K线或有信号时输出
+                                # 计算最近10根K线的平均实体
+                                if len(history) >= 10:
+                                    recent_bodies = [abs(bar["close"] - bar["open"]) for bar in history[-10:]]
+                                    avg_body = sum(recent_bodies) / len(recent_bodies)
+                                    body_multiple = kline_body / avg_body if avg_body > 0 else 0
+                                    
+                                    logging.debug(
+                                        f"🔍 信号检测条件: 实体={kline_body:.2f}, 平均实体={avg_body:.2f}, "
+                                        f"倍数={body_multiple:.2f}x (需要>1.8x), 实体比={body_ratio:.1%} (需要>80%)"
+                                    )
                             
                             if last["signal"]:
                                 entry_price = last["close"]
@@ -567,6 +620,10 @@ async def kline_producer(
                         except asyncio.CancelledError:
                             logging.info("K线生产者任务已取消")
                             raise  # 重新抛出，让外层处理
+                        except ReadLoopClosed:
+                            # WebSocket 读取循环已关闭，需要重连
+                            logging.warning("WebSocket 读取循环已关闭，准备重连...")
+                            raise  # 重新抛出，触发重连
                         except (ConnectionClosed, ConnectionError, OSError) as e:
                             # WebSocket连接断开
                             logging.warning(f"WebSocket 连接断开: {e}")
@@ -580,6 +637,23 @@ async def kline_producer(
             except asyncio.CancelledError:
                 logging.info("K线生产者任务已取消")
                 raise  # 重新抛出，让外层处理
+            except ReadLoopClosed:
+                # WebSocket 读取循环已关闭，需要重连
+                logging.warning("WebSocket 读取循环已关闭，准备重连...")
+                reconnect_attempt += 1
+
+                # 关闭旧客户端
+                if client is not None:
+                    try:
+                        await client.close_connection()
+                    except:
+                        pass
+
+                # 指数退避：延迟时间 = base_delay * (2 ^ reconnect_attempt)
+                delay = min(base_delay * (2**reconnect_attempt), 60)  # 最多60秒
+                logging.info(f"等待 {delay} 秒后尝试重连...")
+                await asyncio.sleep(delay)
+                continue  # 继续重连循环
             except (ConnectionClosed, ConnectionError, OSError) as e:
                 # WebSocket连接错误，准备重连
                 logging.warning(f"WebSocket 连接错误: {e}")
@@ -658,14 +732,24 @@ async def user_worker(
             
             # 检查2: 如果有持仓，检查反手强度
             signal_strength = signal.get("signal_strength", 0.0)
+            
+            # ⭐ 动态反手阈值：根据市场状态调整
+            market_state_str = signal.get("market_state", "")
+            if market_state_str in ["Breakout", "StrongTrend"]:
+                reversal_threshold = 1.5  # 强趋势中提高门槛，减少反手
+            elif market_state_str == "TradingRange":
+                reversal_threshold = 1.0  # 震荡市放宽门槛，允许更多反转
+            else:
+                reversal_threshold = 1.2  # 默认值（Channel 等状态）
+            
             if not trade_logger.should_allow_reversal(
                 user.name, 
                 signal_strength, 
-                reversal_threshold=1.2  # 新信号需要比当前持仓强1.2倍
+                reversal_threshold=reversal_threshold
             ):
                 logging.info(
                     f"❌ [{user.name}] 反手信号强度不足，跳过: {signal['signal']} {signal['side']} "
-                    f"(强度={signal_strength:.2f})"
+                    f"(强度={signal_strength:.2f}, 阈值={reversal_threshold:.1f}x, 市场={market_state_str})"
                 )
                 continue
 

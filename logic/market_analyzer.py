@@ -4,19 +4,22 @@
 负责 MarketState（含 TightChannel）的识别逻辑
 
 Al Brooks 核心市场状态：
+- STRONG_TREND: 强劲趋势（连续同向K线，禁止逆势交易）
 - BREAKOUT: 强趋势突破
 - CHANNEL: 通道模式，EMA附近有序运行
 - TRADING_RANGE: 交易区间，价格频繁穿越EMA
 - TIGHT_CHANNEL: 紧凑通道，强劲单边趋势（禁止反转）
 """
 
+import logging
 import pandas as pd
 from enum import Enum
-from typing import Optional
+from typing import Optional, Tuple
 
 
 class MarketState(Enum):
     """市场状态分类"""
+    STRONG_TREND = "StrongTrend"  # 新增：强劲趋势状态
     BREAKOUT = "Breakout"
     CHANNEL = "Channel"
     TRADING_RANGE = "TradingRange"
@@ -32,24 +35,64 @@ class MarketAnalyzer:
     
     def __init__(self, ema_period: int = 20):
         self.ema_period = ema_period
+        # 趋势方向缓存（用于禁止逆势交易）
+        self._trend_direction: Optional[str] = None  # "up" / "down" / None
+        self._trend_strength: float = 0.0  # 0-1
     
     @staticmethod
     def compute_body_size(row: pd.Series) -> float:
         """计算K线实体大小"""
         return abs(row["close"] - row["open"])
     
+    def get_trend_direction(self) -> Optional[str]:
+        """获取当前趋势方向"""
+        return self._trend_direction
+    
+    def get_trend_strength(self) -> float:
+        """获取当前趋势强度 (0-1)"""
+        return self._trend_strength
+    
+    def is_counter_trend(self, side: str) -> bool:
+        """
+        判断是否是逆势交易
+        
+        Args:
+            side: "buy" 或 "sell"
+        
+        Returns:
+            True 如果是逆势交易（在上涨趋势中做空，或在下跌趋势中做多）
+        """
+        if self._trend_direction is None or self._trend_strength < 0.6:
+            return False
+        
+        if self._trend_direction == "up" and side == "sell":
+            return True
+        if self._trend_direction == "down" and side == "buy":
+            return True
+        
+        return False
+    
     def detect_market_state(self, df: pd.DataFrame, i: int, ema: float) -> MarketState:
         """
         检测当前市场状态
         
         优先级：
-        1. Tight Channel（紧凑通道）- 最高优先级
-        2. Breakout（强趋势突破）
-        3. Trading Range（交易区间）
-        4. Channel（通道模式）- 默认
+        1. Strong Trend（强趋势）- 最高优先级，禁止逆势交易
+        2. Tight Channel（紧凑通道）
+        3. Breakout（强趋势突破）
+        4. Trading Range（交易区间）
+        5. Channel（通道模式）- 默认
         """
         if i < 10:
+            self._trend_direction = None
+            self._trend_strength = 0.0
             return MarketState.CHANNEL
+        
+        # ========== 优先检测 STRONG_TREND（强趋势）==========
+        # Al Brooks: 连续同向K线 = 趋势，不要逆势交易
+        strong_trend = self._detect_strong_trend(df, i, ema)
+        if strong_trend is not None:
+            return strong_trend
         
         # 优先检测 TIGHT_CHANNEL
         tight_channel_state = self._detect_tight_channel(df, i, ema)
@@ -72,8 +115,8 @@ class MarketAnalyzer:
         if ema_crosses >= 4:
             return MarketState.TRADING_RANGE
         
-        # 检测强突破（Spike）
-        if i >= 2:
+        # 检测强突破（Spike）- 优化：放宽条件
+        if i >= 1:
             recent_bodies = [
                 self.compute_body_size(df.iloc[j])
                 for j in range(max(0, i - 10), i + 1)
@@ -81,21 +124,226 @@ class MarketAnalyzer:
             avg_body = sum(recent_bodies) / len(recent_bodies) if recent_bodies else 0
             
             current_body = self.compute_body_size(df.iloc[i])
-            prev_body = self.compute_body_size(df.iloc[i - 1]) if i > 0 else 0
             
             if avg_body > 0:
-                if current_body > avg_body * 2 and prev_body > avg_body * 2:
+                # 优化：只需当前K线实体 > 1.8倍平均值（原先需要连续两根 > 2倍）
+                if current_body > avg_body * 1.8:
                     close = df.iloc[i]["close"]
                     high = df.iloc[i]["high"]
                     low = df.iloc[i]["low"]
                     
                     if (high - low) > 0:
-                        if close > ema and (close - low) / (high - low) > 0.9:
+                        # 优化：body_ratio 从 0.9 降到 0.8
+                        if close > ema and (close - low) / (high - low) > 0.8:
                             return MarketState.BREAKOUT
-                        elif close < ema and (high - close) / (high - low) > 0.9:
+                        elif close < ema and (high - close) / (high - low) > 0.8:
                             return MarketState.BREAKOUT
         
         return MarketState.CHANNEL
+    
+    def _detect_strong_trend(self, df: pd.DataFrame, i: int, ema: float) -> Optional[MarketState]:
+        """
+        检测强趋势状态（Al Brooks 价格行为核心）
+        
+        优化增强（提前响应）：
+        1. 连续同向 K 线阈值从 4 降到 3
+        2. 新增"早期趋势"检测（5 根 K 线快速涨跌）
+        3. STRONG_TREND 触发阈值从 0.6 降到 0.5
+        4. ⭐ Gap 检测 - Al Brooks 最强趋势信号
+        
+        强趋势条件（组合评分）：
+        1. 连续3根以上同向K线（收盘>开盘 或 收盘<开盘）
+        2. 连续4根K线都创新高/新低
+        3. 价格持续远离EMA（距离 > 0.5% 且持续5根以上）
+        4. 最近5根K线快速涨跌超过0.8%
+        5. Gap（缺口）- Bar Gap 或 Body Gap（最强信号，+0.25~0.4 分）
+        
+        Al Brooks: "A gap is the strongest form of urgency"
+        
+        在强趋势中禁止逆势交易！
+        """
+        if i < 10:
+            return None
+        
+        lookback = 10  # 看最近10根K线
+        recent = df.iloc[max(0, i - lookback + 1) : i + 1]
+        
+        if len(recent) < 5:
+            return None
+        
+        # ========== 指标1: 连续同向K线 ==========
+        bullish_count = 0  # 连续阳线计数
+        bearish_count = 0  # 连续阴线计数
+        max_bullish_streak = 0
+        max_bearish_streak = 0
+        
+        for idx in recent.index:
+            close = recent.at[idx, "close"]
+            open_price = recent.at[idx, "open"]
+            
+            if close > open_price:
+                bullish_count += 1
+                bearish_count = 0
+                max_bullish_streak = max(max_bullish_streak, bullish_count)
+            elif close < open_price:
+                bearish_count += 1
+                bullish_count = 0
+                max_bearish_streak = max(max_bearish_streak, bearish_count)
+            else:
+                # Doji 不中断计数
+                pass
+        
+        # ========== 指标2: 连续创新高/新低 ==========
+        higher_highs = 0
+        lower_lows = 0
+        
+        for j in range(1, len(recent)):
+            curr_idx = recent.index[j]
+            prev_idx = recent.index[j - 1]
+            
+            if recent.at[curr_idx, "high"] > recent.at[prev_idx, "high"]:
+                higher_highs += 1
+            if recent.at[curr_idx, "low"] < recent.at[prev_idx, "low"]:
+                lower_lows += 1
+        
+        # ========== 指标3: 持续远离EMA ==========
+        bars_above_ema = 0
+        bars_below_ema = 0
+        avg_distance_pct = 0.0
+        
+        for idx in recent.index:
+            close = recent.at[idx, "close"]
+            bar_ema = recent.at[idx, "ema"] if "ema" in recent.columns else ema
+            
+            if bar_ema > 0:
+                distance_pct = (close - bar_ema) / bar_ema
+                avg_distance_pct += distance_pct
+                
+                if close > bar_ema:
+                    bars_above_ema += 1
+                else:
+                    bars_below_ema += 1
+        
+        avg_distance_pct = avg_distance_pct / len(recent) if len(recent) > 0 else 0
+        
+        # ========== 指标4: 早期趋势检测 - 5 根 K 线快速涨跌 ==========
+        recent_5 = df.iloc[max(0, i - 4) : i + 1]
+        price_change_pct = 0.0
+        if len(recent_5) >= 5 and recent_5.iloc[0]["open"] > 0:
+            price_change_pct = (recent_5.iloc[-1]["close"] - recent_5.iloc[0]["open"]) / recent_5.iloc[0]["open"]
+        
+        # ========== 指标5（新增）: Gap 检测 - Al Brooks 最强趋势信号 ==========
+        # Al Brooks: "A gap is the strongest form of urgency"
+        # Gap 类型：
+        # - Bar Gap（K线缺口）：当前低点 > 前一根高点（上涨），或当前高点 < 前一根低点（下跌）
+        # - Body Gap（实体缺口）：开盘价跳空于前一根收盘价
+        gap_up_count = 0.0
+        gap_down_count = 0.0
+        
+        for j in range(max(0, i - 2), i):  # 检查最近 3 根 K 线之间的缺口
+            curr_idx = j + 1
+            if curr_idx > i:
+                break
+            
+            prev_high = df.iloc[j]["high"]
+            prev_low = df.iloc[j]["low"]
+            prev_close = df.iloc[j]["close"]
+            curr_low = df.iloc[curr_idx]["low"]
+            curr_high = df.iloc[curr_idx]["high"]
+            curr_open = df.iloc[curr_idx]["open"]
+            
+            # 上涨 Bar Gap：当前低点 > 前一根高点（完全跳空）
+            if curr_low > prev_high:
+                gap_up_count += 1.0
+                logging.debug(f"📈 检测到上涨 Bar Gap: K线{curr_idx} 低点 {curr_low:.2f} > K线{j} 高点 {prev_high:.2f}")
+            # 上涨 Body Gap：开盘跳空高于前收盘（至少 0.1%）
+            elif prev_close > 0 and curr_open > prev_close * 1.001:
+                gap_up_count += 0.5
+            
+            # 下跌 Bar Gap：当前高点 < 前一根低点（完全跳空）
+            if curr_high < prev_low:
+                gap_down_count += 1.0
+                logging.debug(f"📉 检测到下跌 Bar Gap: K线{curr_idx} 高点 {curr_high:.2f} < K线{j} 低点 {prev_low:.2f}")
+            # 下跌 Body Gap：开盘跳空低于前收盘（至少 0.1%）
+            elif prev_close > 0 and curr_open < prev_close * 0.999:
+                gap_down_count += 0.5
+        
+        # ========== 综合判断趋势方向和强度 ==========
+        trend_direction = None
+        trend_strength = 0.0
+        
+        # 上涨趋势判断（优化：阈值降低，更早响应）
+        up_score = 0.0
+        if max_bullish_streak >= 3:  # 从 4 降到 3
+            up_score += 0.25
+        if max_bullish_streak >= 5:  # 从 6 降到 5
+            up_score += 0.25
+        if higher_highs >= 4:
+            up_score += 0.2
+        if bars_above_ema >= 8:
+            up_score += 0.15
+        if avg_distance_pct > 0.005:  # 价格在EMA上方0.5%以上
+            up_score += 0.1
+        # 早期趋势检测
+        if price_change_pct > 0.008:  # 5 根 K 线内涨超 0.8%
+            up_score += 0.15
+        # ⭐ 新增：Gap 检测 - Al Brooks 最强趋势信号
+        if gap_up_count >= 1:
+            up_score += 0.25  # 1 个缺口加 0.25
+        if gap_up_count >= 2:
+            up_score += 0.15  # 2 个缺口额外加 0.15
+        
+        # 下跌趋势判断（优化：阈值降低，更早响应）
+        down_score = 0.0
+        if max_bearish_streak >= 3:  # 从 4 降到 3
+            down_score += 0.25
+        if max_bearish_streak >= 5:  # 从 6 降到 5
+            down_score += 0.25
+        if lower_lows >= 4:
+            down_score += 0.2
+        if bars_below_ema >= 8:
+            down_score += 0.15
+        if avg_distance_pct < -0.005:  # 价格在EMA下方0.5%以上
+            down_score += 0.1
+        # 早期趋势检测
+        if price_change_pct < -0.008:  # 5 根 K 线内跌超 0.8%
+            down_score += 0.15
+        # ⭐ 新增：Gap 检测 - Al Brooks 最强趋势信号
+        if gap_down_count >= 1:
+            down_score += 0.25  # 1 个缺口加 0.25
+        if gap_down_count >= 2:
+            down_score += 0.15  # 2 个缺口额外加 0.15
+        
+        # 确定趋势方向
+        if up_score >= 0.5 and up_score > down_score:
+            trend_direction = "up"
+            trend_strength = up_score
+        elif down_score >= 0.5 and down_score > up_score:
+            trend_direction = "down"
+            trend_strength = down_score
+        
+        # 更新缓存
+        self._trend_direction = trend_direction
+        self._trend_strength = trend_strength
+        
+        # 判断是否达到强趋势状态（优化：阈值从 0.6 降到 0.5）
+        if trend_strength >= 0.5:
+            # 构建 Gap 信息字符串
+            gap_info = ""
+            if gap_up_count > 0:
+                gap_info = f", Gap↑={gap_up_count:.1f}"
+            elif gap_down_count > 0:
+                gap_info = f", Gap↓={gap_down_count:.1f}"
+            
+            logging.debug(
+                f"🔥 检测到强趋势: 方向={trend_direction}, 强度={trend_strength:.2f}, "
+                f"连续阳线={max_bullish_streak}, 连续阴线={max_bearish_streak}, "
+                f"连续新高={higher_highs}, 连续新低={lower_lows}, "
+                f"5K涨跌={price_change_pct:.2%}{gap_info}"
+            )
+            return MarketState.STRONG_TREND
+        
+        return None
     
     def _detect_tight_channel(self, df: pd.DataFrame, i: int, ema: float) -> Optional[MarketState]:
         """

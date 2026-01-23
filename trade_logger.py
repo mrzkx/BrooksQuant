@@ -189,7 +189,17 @@ class TradeLogger:
         """开仓并持久化"""
         # 已有持仓则先平仓
         if self.positions.get(user):
-            self.close_position(user, entry_price, "manual", "新信号开仓")
+            self.close_position(user, float(entry_price), "manual", "新信号开仓")
+
+        # 将 numpy 类型转换为 Python 原生类型（PostgreSQL 不支持 np.float64）
+        entry_price = float(entry_price)
+        quantity = float(quantity)
+        stop_loss = float(stop_loss)
+        take_profit = float(take_profit)
+        signal_strength = float(signal_strength) if signal_strength is not None else None
+        tp1_price = float(tp1_price) if tp1_price is not None else None
+        tp2_price = float(tp2_price) if tp2_price is not None else None
+        tight_channel_score = float(tight_channel_score) if tight_channel_score is not None else None
 
         with self.session_scope() as session:
             trade = Trade(
@@ -231,6 +241,9 @@ class TradeLogger:
         trade = self.positions.get(user)
         if not trade:
             return None
+
+        # 将 numpy 类型转换为 Python 原生类型
+        exit_price = float(exit_price)
 
         with self.session_scope() as session:
             trade.exit_price = exit_price
@@ -280,6 +293,9 @@ class TradeLogger:
         trade = self.positions.get(user)
         if not trade:
             return None
+
+        # 将 numpy 类型转换为 Python 原生类型
+        current_price = float(current_price)
 
         with self.session_scope() as session:
             # TP1 触发（阶段0 → 1）

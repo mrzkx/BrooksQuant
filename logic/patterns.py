@@ -10,6 +10,7 @@ Al Brooks 核心模式：
 - Climax Reversal: 高潮竭尽反转
 """
 
+import logging
 import pandas as pd
 from typing import Optional, Tuple
 from .market_analyzer import MarketState
@@ -187,9 +188,9 @@ class PatternDetector:
         prev_bar = df.iloc[i - 1]
         prev_prev_bar = df.iloc[i - 2]
         
-        # ATR 过滤：Climax 不追涨
+        # ATR 过滤：Climax 不追涨（优化：阈值从 3.5 降到 2.5）
         if atr is not None and atr > 0:
-            if (high - low) > atr * 3.5:
+            if (high - low) > atr * 2.5:
                 return None
         
         # 向上突破
@@ -236,11 +237,15 @@ class PatternDetector:
         """
         检测 Climax 反转信号
         
-        当检测到 Climax（Spike 长度超过 3.5 倍 ATR）后，寻找反转信号
+        当检测到 Climax（Spike 长度超过 2.5 倍 ATR）后，寻找反转信号
+        
+        优化增强：
+        1. 尾部影线检查 - Al Brooks 强调真正的 Climax 有明显的"拒绝影线"
+        2. 前期走势深度检查 - 确保是真正的超卖/超买
         
         返回: (signal_type, side, stop_loss, base_height) 或 None
         """
-        if i < 2 or atr is None or atr <= 0:
+        if i < 3 or atr is None or atr <= 0:  # 需要至少3根K线来检查前期走势
             return None
         
         current_bar = df.iloc[i]
@@ -248,28 +253,70 @@ class PatternDetector:
         
         close = current_bar["close"]
         open_price = current_bar["open"]
+        high = current_bar["high"]
+        low = current_bar["low"]
         prev_close = prev_bar["close"]
         prev_high = prev_bar["high"]
         prev_low = prev_bar["low"]
         prev_open = prev_bar["open"]
         prev_range = prev_high - prev_low
         
-        # 向上 Climax
-        if prev_range > atr * 3.5 and prev_close > prev_open:
+        # Climax 阈值
+        CLIMAX_ATR_MULTIPLIER = 2.5
+        
+        # 当前 K 线范围（用于尾部影线计算）
+        current_range = high - low
+        if current_range == 0:
+            return None
+        
+        # 向上 Climax -> Climax_Sell（做空反转）
+        if prev_range > atr * CLIMAX_ATR_MULTIPLIER and prev_close > prev_open:
             if close < open_price and close < prev_close:
                 if not self.validate_signal_close(current_bar, "sell"):
                     return None
                 
+                # ⭐ 新增：尾部影线检查（上影线 = 拒绝更高价格）
+                upper_tail = high - max(open_price, close)
+                tail_ratio = upper_tail / current_range
+                if tail_ratio < 0.15:  # 上影线至少占 K 线的 15%
+                    logging.debug(f"Climax_Sell 被跳过: 上影线不足 ({tail_ratio:.1%} < 15%)")
+                    return None
+                
+                # ⭐ 新增：前期走势深度检查（确保是真正的超买）
+                # 检查前 3 根 K 线的整体涨幅
+                prior_bar = df.iloc[i - 3]
+                prior_move = prev_high - prior_bar["low"]  # 从前3根的低点到Climax高点
+                if prior_move < atr * 1.5:  # 之前涨幅不够深
+                    logging.debug(f"Climax_Sell 被跳过: 前期涨幅不足 ({prior_move:.2f} < {atr * 1.5:.2f})")
+                    return None
+                
                 stop_loss = self.calculate_unified_stop_loss(df, i, "sell", close, atr)
+                logging.debug(f"✅ Climax_Sell 触发: 上影线={tail_ratio:.1%}, 前期涨幅={prior_move:.2f}")
                 return ("Climax_Sell", "sell", stop_loss, prev_range)
         
-        # 向下 Climax
-        if prev_range > atr * 3.5 and prev_close < prev_open:
+        # 向下 Climax -> Climax_Buy（做多反转）
+        if prev_range > atr * CLIMAX_ATR_MULTIPLIER and prev_close < prev_open:
             if close > open_price and close > prev_close:
                 if not self.validate_signal_close(current_bar, "buy"):
                     return None
                 
+                # ⭐ 新增：尾部影线检查（下影线 = 拒绝更低价格）
+                lower_tail = min(open_price, close) - low
+                tail_ratio = lower_tail / current_range
+                if tail_ratio < 0.15:  # 下影线至少占 K 线的 15%
+                    logging.debug(f"Climax_Buy 被跳过: 下影线不足 ({tail_ratio:.1%} < 15%)")
+                    return None
+                
+                # ⭐ 新增：前期走势深度检查（确保是真正的超卖）
+                # 检查前 3 根 K 线的整体跌幅
+                prior_bar = df.iloc[i - 3]
+                prior_move = prior_bar["high"] - prev_low  # 从前3根的高点到Climax低点
+                if prior_move < atr * 1.5:  # 之前跌幅不够深
+                    logging.debug(f"Climax_Buy 被跳过: 前期跌幅不足 ({prior_move:.2f} < {atr * 1.5:.2f})")
+                    return None
+                
                 stop_loss = self.calculate_unified_stop_loss(df, i, "buy", close, atr)
+                logging.debug(f"✅ Climax_Buy 触发: 下影线={tail_ratio:.1%}, 前期跌幅={prior_move:.2f}")
                 return ("Climax_Buy", "buy", stop_loss, prev_range)
         
         return None
@@ -281,11 +328,19 @@ class PatternDetector:
         """
         检测 Failed Breakout（失败突破反转）
         
-        仅在 TRADING_RANGE 状态下激活
+        优化：
+        1. 使用更短期的高/低点（10根而非20根），更敏感
+        2. 放宽收盘价验证（从75%降到60%）
+        3. 仅在 TRADING_RANGE 状态下激活
+        4. ⭐ 新增：检查之前是否已有突破（防止把真突破当假突破）
+        5. ⭐ 新增：要求当根K线是"第一根"创新高/新低的K线
         
         返回: (signal_type, side, stop_loss, base_height) 或 None
         """
-        if i < self.lookback_period + 1:
+        # 优化：使用更短期的回看周期（10根）
+        SHORT_LOOKBACK = 10
+        
+        if i < SHORT_LOOKBACK + 1:
             return None
         
         if market_state != MarketState.TRADING_RANGE:
@@ -294,33 +349,81 @@ class PatternDetector:
         current_high = df.iloc[i]["high"]
         current_low = df.iloc[i]["low"]
         current_bar = df.iloc[i]
+        close = current_bar["close"]
+        open_price = current_bar["open"]
+        high = current_bar["high"]
+        low = current_bar["low"]
         
-        lookback_highs = [df.iloc[j]["high"] for j in range(max(0, i - self.lookback_period), i)]
-        lookback_lows = [df.iloc[j]["low"] for j in range(max(0, i - self.lookback_period), i)]
+        # 优化：使用短期回看（10根）找近期高低点
+        lookback_highs = [df.iloc[j]["high"] for j in range(max(0, i - SHORT_LOOKBACK), i)]
+        lookback_lows = [df.iloc[j]["low"] for j in range(max(0, i - SHORT_LOOKBACK), i)]
         
         max_lookback_high = max(lookback_highs) if lookback_highs else current_high
         min_lookback_low = min(lookback_lows) if lookback_lows else current_low
         
+        # 用更长周期计算区间宽度（用于止盈）
         lookback_range = df.iloc[max(0, i - self.lookback_period) : i + 1]
         range_width = lookback_range["high"].max() - lookback_range["low"].min()
         
+        kline_range = high - low
+        if kline_range == 0:
+            return None
+        
+        # ⭐ 新增：检查最近3根K线是否已经在持续创新高/新低
+        # 如果是，说明这是真突破延续，不是假突破
+        recent_3_bars = df.iloc[max(0, i - 2) : i]  # 前2根K线
+        
         # 创新高后反转
         if current_high > max_lookback_high:
-            if current_bar["close"] < current_bar["open"] and current_bar["close"] < current_bar["high"] * 0.98:
-                if not self.validate_signal_close(current_bar, "sell"):
-                    return None
-                
-                stop_loss = self.calculate_unified_stop_loss(df, i, "sell", current_bar["close"], atr)
-                return ("FailedBreakout_Sell", "sell", stop_loss, range_width)
+            # ⭐ 防误判：检查前2根是否已经在创新高
+            prior_highs_above = sum(1 for j in recent_3_bars.index if recent_3_bars.at[j, "high"] > max_lookback_high * 0.999)
+            if prior_highs_above >= 2:
+                # 之前2根K线都在高位，这是趋势延续不是假突破
+                logging.debug(f"FailedBreakout_Sell 被跳过: 前{prior_highs_above}根K线已在新高，是趋势延续")
+                return None
+            
+            # ⭐ 防误判：检查前1根K线收盘是否也在高位（说明上涨趋势未结束）
+            prev_bar = df.iloc[i - 1]
+            prev_close_in_upper = (prev_bar["close"] - prev_bar["low"]) / (prev_bar["high"] - prev_bar["low"]) > 0.7 if (prev_bar["high"] - prev_bar["low"]) > 0 else False
+            if prev_close_in_upper and prev_bar["close"] > prev_bar["open"]:
+                # 前一根是收盘价在高位的阳线，趋势可能延续
+                logging.debug(f"FailedBreakout_Sell 被跳过: 前一根阳线收盘在高位，趋势可能延续")
+                return None
+            
+            # 条件：阴线 + 收盘价远离高点
+            if close < open_price:
+                # 优化：收盘价验证从75%放宽到60%（收盘在K线下半部分即可）
+                close_position = (high - close) / kline_range
+                if close_position >= 0.6:  # 收盘在K线60%以下位置
+                    stop_loss = self.calculate_unified_stop_loss(df, i, "sell", close, atr)
+                    logging.debug(f"✅ FailedBreakout_Sell 触发: 创新高{current_high:.2f}后反转，收盘位置={close_position:.1%}")
+                    return ("FailedBreakout_Sell", "sell", stop_loss, range_width)
         
         # 创新低后反转
         if current_low < min_lookback_low:
-            if current_bar["close"] > current_bar["open"] and current_bar["close"] > current_bar["low"] * 1.02:
-                if not self.validate_signal_close(current_bar, "buy"):
-                    return None
-                
-                stop_loss = self.calculate_unified_stop_loss(df, i, "buy", current_bar["close"], atr)
-                return ("FailedBreakout_Buy", "buy", stop_loss, range_width)
+            # ⭐ 防误判：检查前2根是否已经在创新低
+            prior_lows_below = sum(1 for j in recent_3_bars.index if recent_3_bars.at[j, "low"] < min_lookback_low * 1.001)
+            if prior_lows_below >= 2:
+                # 之前2根K线都在低位，这是趋势延续不是假突破
+                logging.debug(f"FailedBreakout_Buy 被跳过: 前{prior_lows_below}根K线已在新低，是趋势延续")
+                return None
+            
+            # ⭐ 防误判：检查前1根K线收盘是否也在低位（说明下跌趋势未结束）
+            prev_bar = df.iloc[i - 1]
+            prev_close_in_lower = (prev_bar["high"] - prev_bar["close"]) / (prev_bar["high"] - prev_bar["low"]) > 0.7 if (prev_bar["high"] - prev_bar["low"]) > 0 else False
+            if prev_close_in_lower and prev_bar["close"] < prev_bar["open"]:
+                # 前一根是收盘价在低位的阴线，趋势可能延续
+                logging.debug(f"FailedBreakout_Buy 被跳过: 前一根阴线收盘在低位，趋势可能延续")
+                return None
+            
+            # 条件：阳线 + 收盘价远离低点
+            if close > open_price:
+                # 优化：收盘价验证从75%放宽到60%（收盘在K线上半部分即可）
+                close_position = (close - low) / kline_range
+                if close_position >= 0.6:  # 收盘在K线60%以上位置
+                    stop_loss = self.calculate_unified_stop_loss(df, i, "buy", close, atr)
+                    logging.debug(f"✅ FailedBreakout_Buy 触发: 创新低{current_low:.2f}后反转，收盘位置={close_position:.1%}")
+                    return ("FailedBreakout_Buy", "buy", stop_loss, range_width)
         
         return None
     
