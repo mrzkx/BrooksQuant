@@ -249,6 +249,7 @@ async def _fill_missing_klines(
 
 async def kline_producer(
     user_queues: List[asyncio.Queue],
+    close_queues: Dict[str, asyncio.Queue],  # 平仓队列: {user_name: queue}
     strategy: AlBrooksStrategy,
     trade_logger: TradeLogger,
 ) -> None:
@@ -340,7 +341,8 @@ async def kline_producer(
                             # 实时检查止损止盈（使用当前价格）
                             if current_price > 0:
                                 for user_name in list(trade_logger.positions.keys()):
-                                    if trade_logger.positions[user_name] is not None:
+                                    trade = trade_logger.positions.get(user_name)
+                                    if trade is not None:
                                         closed_trade = (
                                             trade_logger.check_stop_loss_take_profit(
                                                 user_name, current_price
@@ -355,6 +357,18 @@ async def kline_producer(
                                                 f"[{user_name}] {closed_trade.exit_reason}: "
                                                 f"价格={current_price:.2f}, 盈亏={closed_trade.pnl:.4f} USDT ({closed_trade.pnl_percent:.2f}%)"
                                             )
+                                            
+                                            # 实盘模式：发送平仓请求到队列
+                                            if not OBSERVE_MODE and user_name in close_queues:
+                                                close_request = {
+                                                    "action": "close",
+                                                    "side": closed_trade.side,
+                                                    "quantity": float(closed_trade.remaining_quantity or closed_trade.quantity),
+                                                    "exit_price": float(closed_trade.exit_price),
+                                                    "exit_reason": closed_trade.exit_reason,
+                                                }
+                                                await close_queues[user_name].put(close_request)
+                                                logging.info(f"[{user_name}] 已发送平仓请求到队列: {close_request}")
 
                             if not k.get("x"):  # 只处理已收盘的 K 线
                                 continue
@@ -630,7 +644,10 @@ async def kline_producer(
 
 
 async def user_worker(
-    user: TradingUser, queue: asyncio.Queue, trade_logger: TradeLogger
+    user: TradingUser, 
+    signal_queue: asyncio.Queue, 
+    close_queue: asyncio.Queue,  # 平仓队列
+    trade_logger: TradeLogger
 ) -> None:
     """消费信号并为该用户下单（观察模式或实际下单）。"""
     logging.info(f"用户工作线程 [{user.name}] 已启动")
@@ -705,7 +722,59 @@ async def user_worker(
                     except Exception as tp2_err:
                         logging.error(f"[{user.name}] ⚠️ TP2止盈单设置失败: {tp2_err}")
             
-            signal: Dict = await queue.get()
+            # 使用 wait 同时监听两个队列（优先处理平仓请求）
+            signal_task = asyncio.create_task(signal_queue.get())
+            close_task = asyncio.create_task(close_queue.get())
+            
+            done, pending = await asyncio.wait(
+                [signal_task, close_task],
+                return_when=asyncio.FIRST_COMPLETED
+            )
+            
+            # 取消未完成的任务
+            for task in pending:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            
+            # 获取完成的任务结果
+            completed_task = done.pop()
+            result = completed_task.result()
+            
+            # 处理平仓请求（优先级高）
+            if completed_task == close_task or (isinstance(result, dict) and result.get("action") == "close"):
+                if not OBSERVE_MODE:
+                    close_request = result
+                    try:
+                        logging.info(f"[{user.name}] 🔴 执行平仓: {close_request}")
+                        
+                        close_response = await user.close_position_market(
+                            symbol=SYMBOL,
+                            side=close_request["side"],
+                            quantity=close_request["quantity"],
+                        )
+                        
+                        logging.info(
+                            f"[{user.name}] ✅ 平仓成功: {close_request['exit_reason']}, "
+                            f"数量={close_request['quantity']:.4f} BTC"
+                        )
+                        print(
+                            f"[{user.name}] ✅ 平仓成功: {close_request['exit_reason']}, "
+                            f"数量={close_request['quantity']:.4f} BTC"
+                        )
+                        
+                        # 取消该用户的所有挂单（止损单等）
+                        await user.cancel_all_orders(SYMBOL)
+                        
+                    except Exception as close_err:
+                        logging.error(f"[{user.name}] ❌ 平仓失败: {close_err}")
+                        print(f"[{user.name}] ❌ 平仓失败: {close_err}")
+                continue  # 处理完平仓后继续循环
+            
+            # 处理信号
+            signal: Dict = result
             signal_count += 1
             logging.info(
                 f"[{user.name}] 收到信号 #{signal_count}: {signal['signal']} {signal['side']} @ {signal['price']:.2f}"
@@ -921,8 +990,8 @@ async def user_worker(
                         # 市价单立即成交，取平均成交价
                         actual_price = float(entry_response.get("avgPrice", signal["price"]))
                     else:
-                        # 限价单可能未立即成交
-                        actual_price = float(entry_response.get("price", limit_price if 'limit_price' in dir() else signal["price"]))
+                        # 限价单可能未立即成交，使用限价单价格
+                        actual_price = float(entry_response.get("price", limit_price))
                     actual_qty = float(entry_response.get("origQty", order_qty))
                     executed_qty = float(entry_response.get("executedQty", 0))
                     
@@ -971,13 +1040,13 @@ async def user_worker(
                     logging.exception(f"[{user.name}] ❌ 实盘下单失败: {exc}")
                     print(f"[{user.name}] ❌ 实盘下单失败: {exc}")
 
-            queue.task_done()
+            signal_queue.task_done()
         except asyncio.CancelledError:
             logging.info(f"用户工作线程 [{user.name}] 已取消")
             break
         except Exception as e:
             logging.error(f"用户工作线程 [{user.name}] 出错: {e}", exc_info=True)
-            queue.task_done()
+            signal_queue.task_done()
 
 
 async def print_stats_periodically(trade_logger: TradeLogger, users: List[TradingUser]):
@@ -1060,7 +1129,11 @@ async def main() -> None:
 
     logging.info(f"交易对: {SYMBOL}, K线周期: {INTERVAL}")
 
-    queues = [asyncio.Queue() for _ in users]
+    # 信号队列（每个用户一个）
+    signal_queues = [asyncio.Queue() for _ in users]
+    
+    # 平仓队列（每个用户一个，用于实盘模式下的止盈止损平仓）
+    close_queues = {user.name: asyncio.Queue() for user in users}
     
     # 初始化策略（异步版本，Delta 窗口与 K 线周期对齐）
     strategy = AlBrooksStrategy(redis_url=REDIS_URL, kline_interval=KLINE_INTERVAL)
@@ -1076,9 +1149,10 @@ async def main() -> None:
 
     logging.info("正在启动所有任务...")
     tasks = [
-        kline_producer(queues, strategy, trade_logger),
+        kline_producer(signal_queues, close_queues, strategy, trade_logger),
         aggtrade_worker(SYMBOL, REDIS_URL, KLINE_INTERVAL),  # 动态订单流监控（Delta窗口与K线周期对齐）
-        *[user_worker(user, q, trade_logger) for user, q in zip(users, queues)],
+        *[user_worker(user, sq, close_queues[user.name], trade_logger) 
+          for user, sq in zip(users, signal_queues)],
         print_stats_periodically(trade_logger, users),
     ]
     logging.info(f"已创建 {len(tasks)} 个任务（含动态订单流监控，Delta窗口={KLINE_INTERVAL}）")

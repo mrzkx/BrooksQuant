@@ -351,11 +351,20 @@ class TradeLogger:
                 if user not in self._trailing_stop:
                     self._trailing_stop[user] = {
                         "trailing_stop": float(trade.stop_loss),
+                        "original_stop_loss": float(trade.stop_loss),  # 保存原始止损用于计算 R
                         "max_profit": 0.0,
                         "activated": False
                     }
                 
                 ts_state = self._trailing_stop[user]
+                
+                # 使用原始止损计算风险，避免追踪止损更新导致的不一致
+                original_risk = abs(float(trade.entry_price) - ts_state["original_stop_loss"])
+                if original_risk == 0:
+                    original_risk = initial_risk  # 回退到默认值
+                
+                # 重新计算盈利（使用原始风险）
+                profit_in_r = current_profit / original_risk if original_risk > 0 else 0
                 
                 # 更新最大盈利
                 if profit_in_r > ts_state["max_profit"]:
@@ -365,7 +374,7 @@ class TradeLogger:
                 if not ts_state["activated"] and profit_in_r >= self.TRAILING_ACTIVATION_R:
                     ts_state["activated"] = True
                     # 初始追踪止损 = 入场价 + (当前盈利 - 追踪距离)
-                    trailing_distance = initial_risk * self.TRAILING_DISTANCE_R
+                    trailing_distance = original_risk * self.TRAILING_DISTANCE_R
                     if trade.side == "buy":
                         ts_state["trailing_stop"] = float(trade.entry_price) + current_profit - trailing_distance
                     else:
@@ -378,7 +387,7 @@ class TradeLogger:
                 
                 # 更新追踪止损（只向有利方向移动）
                 if ts_state["activated"]:
-                    trailing_distance = initial_risk * self.TRAILING_DISTANCE_R
+                    trailing_distance = original_risk * self.TRAILING_DISTANCE_R
                     if trade.side == "buy":
                         new_trailing_stop = current_price - trailing_distance
                         if new_trailing_stop > ts_state["trailing_stop"]:
@@ -408,18 +417,24 @@ class TradeLogger:
                         
                         session.merge(trade)
                         
-                        # 更新追踪止损状态
-                        ts_state["trailing_stop"] = float(trade.entry_price)
+                        # 更新追踪止损状态（不允许后退）
+                        entry_price = float(trade.entry_price)
+                        if trade.side == "buy":
+                            # 做多：取追踪止损和入场价中的较大值
+                            ts_state["trailing_stop"] = max(ts_state["trailing_stop"], entry_price)
+                        else:
+                            # 做空：取追踪止损和入场价中的较小值
+                            ts_state["trailing_stop"] = min(ts_state["trailing_stop"], entry_price)
                         ts_state["activated"] = True
                         
                         if trade.side == "buy":
-                            tp1_pnl = (float(trade.tp1_price) - float(trade.entry_price)) * half_qty
+                            tp1_pnl = (float(trade.tp1_price) - entry_price) * half_qty
                         else:
-                            tp1_pnl = (float(trade.entry_price) - float(trade.tp1_price)) * half_qty
+                            tp1_pnl = (entry_price - float(trade.tp1_price)) * half_qty
                         
                         logging.info(
                             f"🎯 [{user}] TP1触发！平仓50% @ {float(trade.tp1_price):.2f}, "
-                            f"盈利={tp1_pnl:.4f}, 止损移至入场价（保本）"
+                            f"盈利={tp1_pnl:.4f}, 追踪止损={ts_state['trailing_stop']:.2f}"
                         )
                         
                         # 标记需要通知实盘平仓（如果存在 TP2）

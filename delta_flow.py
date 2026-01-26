@@ -32,6 +32,10 @@ import redis.asyncio as aioredis
 from binance import AsyncClient, BinanceSocketManager
 from binance.exceptions import ReadLoopClosed
 
+# 增大 WebSocket 队列大小以应对 aggTrade 高频流
+# 必须在任何实例创建前修改类属性
+BinanceSocketManager.QUEUE_SIZE = 10000  # 默认 100 太小，高波动时会溢出
+
 # 尝试导入 websockets 异常
 try:
     from websockets.exceptions import ConnectionClosed
@@ -751,10 +755,8 @@ async def aggtrade_worker(symbol: str = "BTCUSDT", redis_url: Optional[str] = No
                 logging.error(f"❌ Binance 客户端创建失败: {e}")
                 raise
             
-            # 创建 WebSocket 管理器（增大队列以应对 aggTrade 高频流）
+            # 创建 WebSocket 管理器（队列大小已在文件顶部设置为 10000）
             bsm = BinanceSocketManager(client, user_timeout=60)
-            # aggTrade 流在高波动时每秒可达数百条，默认 100 太小
-            bsm.QUEUE_SIZE = 1000
             
             # 订阅 aggTrade 数据流
             trade_socket = bsm.aggtrade_socket(symbol)
