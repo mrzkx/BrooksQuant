@@ -45,8 +45,58 @@ class TradingUser:
                     raise ValueError(f"{self.name} 缺少 API_KEY 或 API_SECRET")
                 self.client = await create_async_client_for_user(self.credentials)
                 logging.info("用户 %s 已连接 Binance API", self.name)
+                
+                # 确保持仓模式为单向模式（One-Way Mode）
+                await self._ensure_one_way_position_mode()
+                
         assert self.client is not None
         return self.client
+    
+    async def _ensure_one_way_position_mode(self) -> bool:
+        """
+        确保账户使用单向持仓模式（One-Way Mode）
+        
+        Binance 有两种持仓模式：
+        - 单向模式（One-Way）：一个交易对只能有一个方向的仓位
+        - 双向模式（Hedge Mode）：可以同时持有多仓和空仓
+        
+        本策略使用单向模式，更简单且符合 Al Brooks 理念
+        """
+        if self.client is None:
+            return False
+        
+        try:
+            # 获取当前持仓模式
+            position_mode = await self.client.futures_get_position_mode()
+            is_hedge_mode = position_mode.get("dualSidePosition", False)
+            
+            if is_hedge_mode:
+                logging.info(f"[{self.name}] 检测到双向持仓模式，正在切换为单向模式...")
+                try:
+                    await self.client.futures_change_position_mode(dualSidePosition=False)
+                    logging.info(f"[{self.name}] ✅ 已切换为单向持仓模式")
+                except Exception as e:
+                    error_msg = str(e)
+                    if "No need to change" in error_msg:
+                        logging.info(f"[{self.name}] 持仓模式已是单向模式")
+                    elif "position" in error_msg.lower():
+                        # 如果有持仓无法切换，需要先平仓
+                        logging.error(
+                            f"[{self.name}] ⚠️ 无法切换持仓模式（可能有未平仓位置）。"
+                            f"请在 Binance 手动切换为单向模式，或先平掉所有仓位。"
+                        )
+                        return False
+                    else:
+                        logging.error(f"[{self.name}] 切换持仓模式失败: {e}")
+                        return False
+            else:
+                logging.info(f"[{self.name}] 持仓模式: 单向模式 ✓")
+            
+            return True
+            
+        except Exception as e:
+            logging.error(f"[{self.name}] 获取持仓模式失败: {e}", exc_info=True)
+            return False
 
     async def close(self) -> None:
         async with self._lock:
@@ -605,7 +655,8 @@ class TradingUser:
         current_price: float, 
         side: str, 
         slippage_pct: float = 0.05,
-        symbol: str = "BTCUSDT"
+        symbol: str = "BTCUSDT",
+        atr: float = None,
     ) -> float:
         """
         计算限价单价格（带滑点容忍度，符合 tickSize 规则）
@@ -615,6 +666,7 @@ class TradingUser:
             side: 方向（"buy" 或 "sell"）
             slippage_pct: 滑点百分比（默认 0.05%）
             symbol: 交易对（用于获取 tickSize）
+            atr: ATR值（可选，用于动态调整滑点）
         
         Returns:
             float: 符合 tickSize 规则的限价
@@ -622,6 +674,15 @@ class TradingUser:
         # 获取 tickSize（使用缓存）
         filters = self._symbol_filters.get(symbol, {"tickSize": 0.01})
         tick_size = filters.get("tickSize", 0.01)
+        
+        # 动态滑点计算（问题6修复）
+        # 如果提供了ATR，根据市场波动调整滑点
+        if atr is not None and atr > 0:
+            # ATR 相对于价格的百分比
+            atr_pct = (atr / current_price) * 100
+            # 滑点至少为 ATR 的 10%，但不超过 0.3%
+            dynamic_slippage = max(slippage_pct, min(atr_pct * 0.1, 0.3))
+            slippage_pct = dynamic_slippage
         
         slippage = current_price * (slippage_pct / 100)
         
@@ -634,3 +695,88 @@ class TradingUser:
         
         # 按 tickSize 取整
         return self.round_tick_size(limit_price, tick_size)
+    
+    async def get_order_status(self, symbol: str, order_id: int) -> Dict[str, Any]:
+        """
+        查询订单状态
+        
+        Args:
+            symbol: 交易对
+            order_id: 订单ID
+        
+        Returns:
+            订单详情
+        """
+        if self.client is None:
+            raise RuntimeError(f"用户 {self.name} 尚未连接客户端")
+        
+        response = await self.client.futures_get_order(symbol=symbol, orderId=order_id)
+        return response
+    
+    async def wait_for_order_fill(
+        self,
+        symbol: str,
+        order_id: int,
+        timeout_seconds: float = 60.0,
+        poll_interval: float = 2.0,
+    ) -> Dict[str, Any]:
+        """
+        等待限价单成交（带超时）
+        
+        问题1修复：添加订单状态轮询和超时取消逻辑
+        
+        Args:
+            symbol: 交易对
+            order_id: 订单ID
+            timeout_seconds: 超时时间（秒）
+            poll_interval: 轮询间隔（秒）
+        
+        Returns:
+            订单详情（如果成交）
+        
+        Raises:
+            TimeoutError: 如果超时未成交
+        """
+        import asyncio
+        start_time = asyncio.get_event_loop().time()
+        
+        while True:
+            try:
+                order = await self.get_order_status(symbol, order_id)
+                status = order.get("status", "")
+                
+                if status == "FILLED":
+                    logging.info(f"[{self.name}] ✅ 限价单 {order_id} 已成交: avgPrice={order.get('avgPrice')}")
+                    return order
+                elif status == "PARTIALLY_FILLED":
+                    executed_qty = float(order.get("executedQty", 0))
+                    logging.info(f"[{self.name}] ⏳ 限价单 {order_id} 部分成交: {executed_qty}")
+                elif status in ["CANCELED", "EXPIRED", "REJECTED"]:
+                    logging.warning(f"[{self.name}] ⚠️ 限价单 {order_id} 状态异常: {status}")
+                    return order
+                
+                # 检查超时
+                elapsed = asyncio.get_event_loop().time() - start_time
+                if elapsed >= timeout_seconds:
+                    logging.warning(f"[{self.name}] ⏰ 限价单 {order_id} 等待超时 ({timeout_seconds}s)，取消订单")
+                    # 尝试取消订单
+                    try:
+                        await self.client.futures_cancel_order(symbol=symbol, orderId=order_id)
+                        logging.info(f"[{self.name}] 已取消未成交限价单 {order_id}")
+                    except Exception as cancel_err:
+                        logging.warning(f"[{self.name}] 取消订单失败（可能已成交）: {cancel_err}")
+                    
+                    # 再次查询最终状态
+                    final_order = await self.get_order_status(symbol, order_id)
+                    if final_order.get("status") == "FILLED":
+                        return final_order
+                    
+                    raise TimeoutError(f"限价单 {order_id} 超时未成交")
+                
+                await asyncio.sleep(poll_interval)
+                
+            except Exception as e:
+                if "TimeoutError" in str(type(e).__name__):
+                    raise
+                logging.error(f"[{self.name}] 查询订单状态失败: {e}")
+                await asyncio.sleep(poll_interval)

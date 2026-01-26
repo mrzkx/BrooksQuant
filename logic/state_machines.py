@@ -70,6 +70,34 @@ class H2StateMachine:
         """标记为强趋势背景"""
         self.is_strong_trend = True
     
+    def _validate_state(self) -> bool:
+        """
+        验证状态一致性（问题8修复）
+        
+        确保状态和相关变量的一致性，防止Outside Bar等边缘情况导致的状态混乱
+        """
+        if self.state == HState.WAITING_FOR_PULLBACK:
+            # 等待回调状态：h1_high 应该为 None
+            if self.h1_high is not None:
+                self.h1_high = None
+                return False
+        elif self.state == HState.IN_PULLBACK:
+            # 回调中状态：pullback_start_low 必须有值
+            if self.pullback_start_low is None:
+                self.state = HState.WAITING_FOR_PULLBACK
+                return False
+        elif self.state == HState.H1_DETECTED:
+            # H1已检测状态：h1_high 必须有值
+            if self.h1_high is None:
+                self.state = HState.WAITING_FOR_PULLBACK
+                return False
+        elif self.state == HState.WAITING_FOR_H2:
+            # 等待H2状态：h1_high 必须有值
+            if self.h1_high is None:
+                self.state = HState.WAITING_FOR_PULLBACK
+                return False
+        return True
+    
     def update(
         self, close: float, high: float, low: float, ema: float,
         atr: Optional[float], df: pd.DataFrame, i: int,
@@ -90,6 +118,9 @@ class H2StateMachine:
             H2Signal 或 None
         """
         signal = None
+        
+        # 问题8修复：验证状态一致性
+        self._validate_state()
         
         if close > ema:
             if self.state == HState.WAITING_FOR_PULLBACK:
@@ -194,6 +225,34 @@ class L2StateMachine:
         """标记为强趋势背景"""
         self.is_strong_trend = True
     
+    def _validate_state(self) -> bool:
+        """
+        验证状态一致性（问题8修复）
+        
+        确保状态和相关变量的一致性，防止Outside Bar等边缘情况导致的状态混乱
+        """
+        if self.state == LState.WAITING_FOR_BOUNCE:
+            # 等待反弹状态：l1_low 应该为 None
+            if self.l1_low is not None:
+                self.l1_low = None
+                return False
+        elif self.state == LState.IN_BOUNCE:
+            # 反弹中状态：bounce_start_high 必须有值
+            if self.bounce_start_high is None:
+                self.state = LState.WAITING_FOR_BOUNCE
+                return False
+        elif self.state == LState.L1_DETECTED:
+            # L1已检测状态：l1_low 必须有值
+            if self.l1_low is None:
+                self.state = LState.WAITING_FOR_BOUNCE
+                return False
+        elif self.state == LState.WAITING_FOR_L2:
+            # 等待L2状态：l1_low 必须有值
+            if self.l1_low is None:
+                self.state = LState.WAITING_FOR_BOUNCE
+                return False
+        return True
+    
     def update(
         self, close: float, high: float, low: float, ema: float,
         atr: Optional[float], df: pd.DataFrame, i: int,
@@ -203,6 +262,9 @@ class L2StateMachine:
         更新状态机并检测信号
         """
         signal = None
+        
+        # 问题8修复：验证状态一致性
+        self._validate_state()
         
         if close < ema:
             if self.state == LState.WAITING_FOR_BOUNCE:

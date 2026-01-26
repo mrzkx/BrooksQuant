@@ -77,6 +77,12 @@ class Trade(Base):
     # Breakeven 状态
     breakeven_moved = Column(Boolean, default=False)
     
+    # 追踪止损持久化（问题3修复）
+    trailing_stop_price = Column(Float, nullable=True)  # 当前追踪止损价格
+    trailing_stop_activated = Column(Boolean, default=False)  # 是否已激活追踪止损
+    trailing_max_profit_r = Column(Float, nullable=True)  # 最大盈利（以R为单位）
+    original_stop_loss = Column(Float, nullable=True)  # 原始止损价（用于计算R）
+    
     # 市场上下文
     market_state = Column(String(50), nullable=True)
     tight_channel_score = Column(Float, nullable=True)
@@ -237,6 +243,12 @@ class TradeLogger:
                     tp2_price=tp2_price,
                     remaining_quantity=quantity,
                     breakeven_moved=False,
+                    # 追踪止损初始化（问题3修复）
+                    original_stop_loss=stop_loss,  # 保存原始止损
+                    trailing_stop_price=None,
+                    trailing_stop_activated=False,
+                    trailing_max_profit_r=None,
+                    # 市场上下文
                     market_state=market_state,
                     tight_channel_score=tight_channel_score,
                     signal_strength=signal_strength,
@@ -352,14 +364,30 @@ class TradeLogger:
                 
                 profit_in_r = current_profit / initial_risk if initial_risk > 0 else 0
                 
-                # ========== Al Brooks 追踪止损逻辑 ==========
+                # ========== Al Brooks 追踪止损逻辑（问题3修复：持久化）==========
                 if user not in self._trailing_stop:
-                    self._trailing_stop[user] = {
-                        "trailing_stop": float(trade.stop_loss),
-                        "original_stop_loss": float(trade.stop_loss),  # 保存原始止损用于计算 R
-                        "max_profit": 0.0,
-                        "activated": False
-                    }
+                    # 优先从数据库恢复追踪止损状态
+                    if trade.trailing_stop_activated and trade.trailing_stop_price:
+                        self._trailing_stop[user] = {
+                            "trailing_stop": float(trade.trailing_stop_price),
+                            "original_stop_loss": float(trade.original_stop_loss or trade.stop_loss),
+                            "max_profit": float(trade.trailing_max_profit_r or 0.0),
+                            "activated": True
+                        }
+                        logging.info(f"[{user}] 从数据库恢复追踪止损状态: {self._trailing_stop[user]}")
+                    else:
+                        # 初始化新的追踪止损状态
+                        original_sl = float(trade.original_stop_loss or trade.stop_loss)
+                        self._trailing_stop[user] = {
+                            "trailing_stop": float(trade.stop_loss),
+                            "original_stop_loss": original_sl,
+                            "max_profit": 0.0,
+                            "activated": False
+                        }
+                        # 保存原始止损到数据库
+                        if not trade.original_stop_loss:
+                            trade.original_stop_loss = original_sl
+                            session.merge(trade)
                 
                 ts_state = self._trailing_stop[user]
                 
@@ -385,6 +413,12 @@ class TradeLogger:
                     else:
                         ts_state["trailing_stop"] = float(trade.entry_price) - current_profit + trailing_distance
                     
+                    # 问题3修复：持久化追踪止损状态
+                    trade.trailing_stop_activated = True
+                    trade.trailing_stop_price = ts_state["trailing_stop"]
+                    trade.trailing_max_profit_r = profit_in_r
+                    session.merge(trade)
+                    
                     logging.info(
                         f"📈 [{user}] 追踪止损已激活！盈利={profit_in_r:.2f}R, "
                         f"追踪止损={ts_state['trailing_stop']:.2f}"
@@ -393,19 +427,30 @@ class TradeLogger:
                 # 更新追踪止损（只向有利方向移动）
                 if ts_state["activated"]:
                     trailing_distance = original_risk * self.TRAILING_DISTANCE_R
+                    ts_updated = False
+                    
                     if trade.side == "buy":
                         new_trailing_stop = current_price - trailing_distance
                         if new_trailing_stop > ts_state["trailing_stop"]:
                             ts_state["trailing_stop"] = new_trailing_stop
-                            # 同步更新 trade 的止损
-                            trade.stop_loss = new_trailing_stop
-                            session.merge(trade)
+                            ts_updated = True
                     else:
                         new_trailing_stop = current_price + trailing_distance
                         if new_trailing_stop < ts_state["trailing_stop"]:
                             ts_state["trailing_stop"] = new_trailing_stop
-                            trade.stop_loss = new_trailing_stop
-                            session.merge(trade)
+                            ts_updated = True
+                    
+                    # 更新最大盈利
+                    if profit_in_r > ts_state["max_profit"]:
+                        ts_state["max_profit"] = profit_in_r
+                        ts_updated = True
+                    
+                    # 问题3修复：持久化追踪止损更新
+                    if ts_updated:
+                        trade.stop_loss = ts_state["trailing_stop"]
+                        trade.trailing_stop_price = ts_state["trailing_stop"]
+                        trade.trailing_max_profit_r = ts_state["max_profit"]
+                        session.merge(trade)
                 
                 # ========== TP1 触发（阶段0 → 1）==========
                 if trade.exit_stage == 0 and trade.tp1_price:
@@ -446,7 +491,16 @@ class TradeLogger:
                         if trade.tp2_price:
                             self._tp2_order_placed[user] = False
                         
-                        return None
+                        # 问题2修复：返回TP1操作信息，让user_worker立即执行
+                        # 返回字典包含 action 类型和平仓数量
+                        return {
+                            "action": "tp1",
+                            "trade": trade,
+                            "close_quantity": half_qty,
+                            "close_price": float(trade.tp1_price),
+                            "new_stop_loss": float(trade.entry_price),
+                            "tp2_price": float(trade.tp2_price) if trade.tp2_price else None,
+                        }
                 
                 # ========== TP2 触发（阶段1 → 2）==========
                 if trade.exit_stage == 1 and trade.tp2_price:
@@ -535,25 +589,42 @@ class TradeLogger:
             self._tp2_order_placed[user] = True
 
     def increment_kline(self):
-        """递增 K 线计数器"""
+        """递增 K 线计数器（保留用于兼容）"""
         self.kline_count += 1
 
     def is_in_cooldown(self, user: str) -> bool:
-        """检查用户是否在冷却期"""
+        """
+        检查用户是否在冷却期（问题4修复：使用时间戳）
+        """
+        import time
         cooldown_end = self.cooldown_until.get(user)
         if not cooldown_end:
             return False
         
-        if self.kline_count < cooldown_end:
+        current_time = time.time()
+        if current_time < cooldown_end:
+            remaining = int(cooldown_end - current_time)
+            # 每60秒打印一次（避免日志过多）
+            if remaining % 60 == 0:
+                logging.debug(f"[{user}] 冷却期剩余: {remaining}秒")
             return True
         
         self.cooldown_until[user] = None
         return False
     
-    def set_cooldown(self, user: str, cooldown_bars: int = 3):
-        """设置冷却期"""
-        self.cooldown_until[user] = self.kline_count + cooldown_bars
-        logging.info(f"⏳ [{user}] 启动冷却期: {cooldown_bars} 根K线")
+    def set_cooldown(self, user: str, cooldown_bars: int = 3, kline_interval_seconds: int = 300):
+        """
+        设置冷却期（问题4修复：使用时间戳）
+        
+        Args:
+            user: 用户名
+            cooldown_bars: 冷却K线数（默认3根）
+            kline_interval_seconds: K线周期秒数（默认5分钟=300秒）
+        """
+        import time
+        cooldown_seconds = cooldown_bars * kline_interval_seconds
+        self.cooldown_until[user] = time.time() + cooldown_seconds
+        logging.info(f"⏳ [{user}] 启动冷却期: {cooldown_bars} 根K线 ({cooldown_seconds}秒)")
     
     def should_allow_reversal(
         self, user: str, new_signal_strength: float, reversal_threshold: float = 1.2
@@ -575,14 +646,16 @@ class TradeLogger:
         
         直接在数据库层计算统计数据，避免将大量记录加载到内存
         
+        问题7修复：包含 partial 状态的交易（TP1 已触发但 TP2 尚未触发）
+        
         Args:
             user: 用户名（可选）
             is_observe: 过滤模式（True=观察模式，False=实盘模式，None=全部）
         """
         with self.session_scope() as session:
             try:
-                # 构建基础查询
-                base_filter = Trade.status == 'closed'
+                # 构建基础查询（包含 closed 和 partial 状态）
+                base_filter = Trade.status.in_(['closed', 'partial'])
                 if user:
                     base_filter = base_filter & (Trade.user == user)
                 if is_observe is not None:

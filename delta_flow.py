@@ -150,10 +150,11 @@ class DeltaAnalyzer:
         self._kline_interval = kline_interval
         
         # 动态计算 deque 大小（基于窗口和预估 TPS）
-        # 使用极端 TPS 作为上限，确保不会溢出
+        # 问题9修复：增加上限以应对极端市场条件
+        # 极端情况（10,000 TPS × 300秒 = 300万条）
         self.MAX_TRADES = min(
             self.WINDOW_SECONDS * self.EXTREME_TPS,  # 基于极端 TPS
-            2_000_000  # 硬上限：200 万条 ≈ 80 MB
+            3_500_000  # 硬上限：350 万条 ≈ 140 MB，确保5分钟窗口不溢出
         )
         
         logging.info(
