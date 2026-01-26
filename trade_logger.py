@@ -82,6 +82,9 @@ class Trade(Base):
     tight_channel_score = Column(Float, nullable=True)
     signal_strength = Column(Float, nullable=True)
     
+    # 交易模式：区分观察模式和实盘模式
+    is_observe = Column(Boolean, nullable=False, default=True, index=True)
+    
     # 时间戳（使用 DateTime，无冗余字符串字段）
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -201,6 +204,7 @@ class TradeLogger:
         tp2_price: Optional[float] = None,
         market_state: Optional[str] = None,
         tight_channel_score: Optional[float] = None,
+        is_observe: bool = True,  # 默认为观察模式
     ) -> Trade:
         """开仓并持久化（线程安全）"""
         # 将 numpy 类型转换为 Python 原生类型（PostgreSQL 不支持 np.float64）
@@ -236,6 +240,7 @@ class TradeLogger:
                     market_state=market_state,
                     tight_channel_score=tight_channel_score,
                     signal_strength=signal_strength,
+                    is_observe=is_observe,  # 记录交易模式
                 )
 
                 session.add(trade)
@@ -564,11 +569,15 @@ class TradeLogger:
         
         return new_signal_strength >= current_strength * reversal_threshold
 
-    def get_statistics(self, user: Optional[str] = None) -> Dict:
+    def get_statistics(self, user: Optional[str] = None, is_observe: Optional[bool] = None) -> Dict:
         """
         获取交易统计（使用 SQL 聚合函数优化）
         
         直接在数据库层计算统计数据，避免将大量记录加载到内存
+        
+        Args:
+            user: 用户名（可选）
+            is_observe: 过滤模式（True=观察模式，False=实盘模式，None=全部）
         """
         with self.session_scope() as session:
             try:
@@ -576,6 +585,8 @@ class TradeLogger:
                 base_filter = Trade.status == 'closed'
                 if user:
                     base_filter = base_filter & (Trade.user == user)
+                if is_observe is not None:
+                    base_filter = base_filter & (Trade.is_observe == is_observe)
                 
                 # 使用 SQL 聚合函数一次性获取所有统计
                 stats = session.query(
@@ -615,9 +626,32 @@ class TradeLogger:
                     'max_loss': 0.0,
                 }
 
-    def get_user_stats(self, user: str) -> Dict:
-        """获取用户统计（兼容旧接口）"""
-        return self.get_statistics(user)
+    def get_user_stats(self, user: str, is_observe: Optional[bool] = None) -> Dict:
+        """
+        获取用户统计（兼容旧接口）
+        
+        Args:
+            user: 用户名
+            is_observe: 过滤模式（True=观察模式，False=实盘模式，None=全部）
+        """
+        return self.get_statistics(user, is_observe)
+    
+    def get_mode_stats(self, user: str) -> Dict:
+        """
+        获取用户在不同模式下的统计
+        
+        Returns:
+            {
+                'observe': {...},  # 观察模式统计
+                'live': {...},     # 实盘模式统计
+                'total': {...}     # 总计
+            }
+        """
+        return {
+            'observe': self.get_statistics(user, is_observe=True),
+            'live': self.get_statistics(user, is_observe=False),
+            'total': self.get_statistics(user, is_observe=None),
+        }
 
     def print_statistics(self):
         """打印统计信息"""

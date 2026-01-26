@@ -344,7 +344,8 @@ def load_user_credentials() -> List[UserCredentials]:
         cred = UserCredentials(api_key=key, api_secret=secret)
         
         if not cred.is_valid:
-            logging.warning(f"USER{idx} 凭证未配置或不完整")
+            logging.warning(f"USER{idx} 凭证未配置或不完整，跳过该用户")
+            continue  # 跳过无效凭证，不添加到列表
         
         creds.append(cred)
     

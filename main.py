@@ -4,7 +4,12 @@ import os
 from typing import Dict, List, Optional
 
 import pandas as pd
-from binance import AsyncClient, BinanceSocketManager
+
+# ⚠️ 关键：必须在导入 BinanceSocketManager 之前设置队列大小
+from binance import BinanceSocketManager
+BinanceSocketManager.QUEUE_SIZE = 10000  # 默认 100 太小，aggTrade 高频流需要更大队列
+
+from binance import AsyncClient
 from binance.exceptions import ReadLoopClosed
 
 from config import (
@@ -848,6 +853,7 @@ async def user_worker(
                     tp2_price=tp2_price,
                     market_state=market_state_val,
                     tight_channel_score=tight_channel_score_val,
+                    is_observe=True,  # 观察模式
                 )
                 
                 # 计算持仓价值
@@ -1009,6 +1015,7 @@ async def user_worker(
                         tp2_price=tp2_price,
                         market_state=market_state_val,
                         tight_channel_score=tight_channel_score_val,
+                        is_observe=False,  # 实盘模式
                     )
                     
                     # 日志输出
