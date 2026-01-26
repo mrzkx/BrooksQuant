@@ -8,10 +8,10 @@ BrooksQuant 配置管理模块
 2. .env 文件
 3. 无默认值（强制配置）
 
-必需的环境变量：
+必需的环境变量（生产环境强制）：
 - DATABASE_URL 或 (DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD)
 - REDIS_URL 或 (REDIS_HOST, REDIS_PORT)
-- USER1_API_KEY, USER1_API_SECRET (Binance 凭证)
+- USER1_API_KEY, USER1_API_SECRET (Binance 凭证，观察模式可选)
 """
 
 import logging
@@ -20,6 +20,7 @@ import sys
 from datetime import datetime
 from dataclasses import dataclass
 from typing import List, Optional
+from urllib.parse import urlparse, urlunparse
 
 from dotenv import load_dotenv
 from binance import AsyncClient
@@ -27,6 +28,14 @@ from binance import AsyncClient
 
 # 加载 .env 文件
 load_dotenv()
+
+
+# ============================================================================
+# 运行模式检测
+# ============================================================================
+
+# 观察模式：设置为 True 时只模拟交易，不实际下单
+OBSERVE_MODE = os.getenv("OBSERVE_MODE", "true").lower() == "true"
 
 
 # ============================================================================
@@ -55,8 +64,29 @@ def _get_env(key: str, default: str = "") -> str:
     return os.getenv(key, default)
 
 
+def _mask_url_password(url: str) -> str:
+    """
+    安全地脱敏 URL 中的密码
+    
+    例如: postgresql://user:secret@host:5432/db -> postgresql://user:***@host:5432/db
+    """
+    try:
+        parsed = urlparse(url)
+        if parsed.password:
+            # 替换密码为 ***
+            netloc = f"{parsed.username}:***@{parsed.hostname}"
+            if parsed.port:
+                netloc += f":{parsed.port}"
+            masked = parsed._replace(netloc=netloc)
+            return urlunparse(masked)
+        return url
+    except Exception:
+        # 解析失败时，使用简单的 @ 分割
+        return url.split("@")[-1] if "@" in url else url
+
+
 # ============================================================================
-# 数据库配置
+# 数据库配置（生产环境强制）
 # ============================================================================
 
 def get_database_url() -> str:
@@ -68,13 +98,13 @@ def get_database_url() -> str:
     2. DB_URL 环境变量
     3. 从独立环境变量组装：DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD
     
-    注意：不再提供硬编码的 localhost 默认值
+    生产环境强制配置：未配置时抛出异常，不允许降级到 SQLite 内存
     """
     db_url = os.getenv("DATABASE_URL") or os.getenv("DB_URL")
     
     if db_url:
-        # 隐藏密码用于日志
-        safe_url = db_url.split("@")[-1] if "@" in db_url else db_url
+        # 安全地脱敏密码用于日志
+        safe_url = _mask_url_password(db_url)
         logging.info(f"数据库配置: {safe_url}")
         return db_url
     
@@ -83,23 +113,26 @@ def get_database_url() -> str:
     db_port = os.getenv("DB_PORT", "5432")
     db_name = os.getenv("DB_NAME")
     db_user = os.getenv("DB_USER")
-    db_password = os.getenv("DB_PASSWORD")
+    db_password = os.getenv("DB_PASSWORD", "")
     
     if db_host and db_name and db_user:
         db_url = f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
         logging.info(f"数据库配置: {db_host}:{db_port}/{db_name}")
         return db_url
     
-    # 未配置数据库，使用内存占位（仅用于测试）
-    logging.warning(
-        "⚠️ 数据库未配置！请设置 DATABASE_URL 或 DB_HOST/DB_NAME/DB_USER 环境变量。"
-        "当前使用 SQLite 内存数据库（数据不会持久化）"
+    # 生产环境强制配置：未配置数据库时抛出异常
+    error_msg = (
+        "❌ 数据库未配置！生产环境强制要求配置 PostgreSQL 数据库。\n"
+        "请设置以下环境变量之一：\n"
+        "  方式1: DATABASE_URL=postgresql://user:password@host:5432/dbname\n"
+        "  方式2: DB_HOST, DB_NAME, DB_USER, DB_PASSWORD"
     )
-    return "sqlite:///:memory:"
+    logging.critical(error_msg)
+    raise RuntimeError(error_msg)
 
 
 # ============================================================================
-# Redis 配置
+# Redis 配置（生产环境强制）
 # ============================================================================
 
 def get_redis_url() -> str:
@@ -110,12 +143,12 @@ def get_redis_url() -> str:
     1. REDIS_URL 环境变量（完整连接字符串）
     2. 从独立环境变量组装：REDIS_HOST, REDIS_PORT, REDIS_PASSWORD, REDIS_DB
     
-    注意：不再提供硬编码的 localhost 默认值
+    生产环境强制配置：未配置时抛出异常，Delta 订单流分析依赖 Redis
     """
     redis_url = os.getenv("REDIS_URL")
     
     if redis_url:
-        safe_url = redis_url.split("@")[-1] if "@" in redis_url else redis_url
+        safe_url = _mask_url_password(redis_url)
         logging.info(f"Redis 配置: {safe_url}")
         return redis_url
     
@@ -134,12 +167,16 @@ def get_redis_url() -> str:
         logging.info(f"Redis 配置: {redis_host}:{redis_port}/{redis_db}")
         return redis_url
     
-    # 未配置 Redis，OBI 过滤将被禁用
-    logging.warning(
-        "⚠️ Redis 未配置！请设置 REDIS_URL 或 REDIS_HOST 环境变量。"
-        "OBI（订单簿不平衡）过滤功能将被禁用。"
+    # 生产环境强制配置：未配置 Redis 时抛出异常
+    error_msg = (
+        "❌ Redis 未配置！生产环境强制要求配置 Redis。\n"
+        "Delta 订单流分析功能依赖 Redis 进行数据缓存。\n"
+        "请设置以下环境变量之一：\n"
+        "  方式1: REDIS_URL=redis://host:6379/0\n"
+        "  方式2: REDIS_HOST (可选: REDIS_PORT, REDIS_DB, REDIS_PASSWORD)"
     )
-    return ""
+    logging.critical(error_msg)
+    raise RuntimeError(error_msg)
 
 
 # ============================================================================
@@ -165,18 +202,42 @@ def get_trading_config() -> dict:
     - SYMBOL: 交易对，默认 BTCUSDT
     - INTERVAL: K线周期，默认 5m
     """
+    # 使用默认值避免空字符串导致的转换异常
+    observe_balance_str = os.getenv("OBSERVE_BALANCE", "10000")
+    position_size_str = os.getenv("POSITION_SIZE_PERCENT", "20")
+    leverage_str = os.getenv("LEVERAGE", "20")
+    symbol_str = os.getenv("SYMBOL", "BTCUSDT")
+    interval_str = os.getenv("INTERVAL", "5m")
+    
+    try:
+        observe_balance = float(observe_balance_str) if observe_balance_str else 10000.0
+        position_size_percent = float(position_size_str) if position_size_str else 20.0
+        leverage = int(leverage_str) if leverage_str else 20
+    except ValueError as e:
+        logging.error(f"交易参数配置格式错误: {e}")
+        raise RuntimeError(f"交易参数配置格式错误: {e}")
+    
+    # 参数范围验证
+    if observe_balance <= 0:
+        raise RuntimeError(f"OBSERVE_BALANCE 必须大于 0，当前值: {observe_balance}")
+    if not (0 < position_size_percent <= 100):
+        raise RuntimeError(f"POSITION_SIZE_PERCENT 必须在 (0, 100] 范围内，当前值: {position_size_percent}")
+    if not (1 <= leverage <= 125):
+        raise RuntimeError(f"LEVERAGE 必须在 [1, 125] 范围内，当前值: {leverage}")
+    
     config = {
-        "observe_balance": float(os.getenv("OBSERVE_BALANCE", "")),
-        "position_size_percent": float(os.getenv("POSITION_SIZE_PERCENT", "")),
-        "leverage": int(os.getenv("LEVERAGE", "")),
-        "symbol": os.getenv("SYMBOL", ""),
-        "interval": os.getenv("INTERVAL", ""),
+        "observe_balance": observe_balance,
+        "position_size_percent": position_size_percent,
+        "leverage": leverage,
+        "symbol": symbol_str or "BTCUSDT",
+        "interval": interval_str or "5m",
     }
     
     logging.info(
         f"交易参数: 模拟资金={config['observe_balance']} USDT, "
         f"仓位={config['position_size_percent']}%, "
-        f"杠杆={config['leverage']}x"
+        f"杠杆={config['leverage']}x, "
+        f"交易对={config['symbol']}, K线周期={config['interval']}"
     )
     
     return config
@@ -306,19 +367,28 @@ async def create_async_client_for_user(user: UserCredentials) -> AsyncClient:
 # ============================================================================
 
 def validate_config():
-    """验证关键配置是否已设置"""
+    """
+    验证关键配置是否已设置
+    
+    生产环境强制要求：
+    - PostgreSQL 数据库（已在 get_database_url 中强制）
+    - Redis（已在 get_redis_url 中强制）
+    - Binance API 凭证（非观察模式下强制）
+    """
     warnings = []
+    errors = []
     
-    if DATABASE_URL == "sqlite:///:memory:":
-        warnings.append("数据库未配置，交易记录不会持久化")
-    
-    if not REDIS_URL:
-        warnings.append("Redis 未配置，OBI 过滤将被禁用")
-    
+    # 检查 Binance API 凭证
     creds = load_user_credentials()
-    if not any(c.is_valid for c in creds):
-        warnings.append("无有效的 Binance API 凭证")
+    valid_creds = [c for c in creds if c.is_valid]
     
+    if not valid_creds:
+        if OBSERVE_MODE:
+            warnings.append("无有效的 Binance API 凭证（观察模式下可选）")
+        else:
+            errors.append("实盘模式需要有效的 Binance API 凭证")
+    
+    # 打印警告
     if warnings:
         logging.warning("=" * 60)
         logging.warning("⚠️ 配置警告:")
@@ -326,7 +396,14 @@ def validate_config():
             logging.warning(f"  - {w}")
         logging.warning("=" * 60)
     
-    return len(warnings) == 0
+    # 如果有错误，抛出异常
+    if errors:
+        error_msg = "配置验证失败:\n" + "\n".join(f"  - {e}" for e in errors)
+        logging.critical(error_msg)
+        raise RuntimeError(error_msg)
+    
+    logging.info("✅ 配置验证通过")
+    return True
 
 
 # 启动时验证配置

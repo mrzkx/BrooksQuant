@@ -2,12 +2,10 @@ import asyncio
 import logging
 import os
 from typing import Dict, List, Optional
-import json
 
 import pandas as pd
 from binance import AsyncClient, BinanceSocketManager
 from binance.exceptions import ReadLoopClosed
-import redis.asyncio as aioredis
 
 from config import (
     load_user_credentials, 
@@ -21,6 +19,9 @@ from config import (
 from strategy import AlBrooksStrategy
 from trade_logger import TradeLogger
 from user_manager import TradingUser
+
+# 动态订单流模块
+from delta_flow import aggtrade_worker
 
 # 尝试导入 websockets 异常（如果可用）
 try:
@@ -40,7 +41,14 @@ OBSERVE_MODE = os.getenv("OBSERVE_MODE", "true").lower() == "true"
 
 def calculate_order_quantity(current_price: float) -> float:
     """
-    计算下单数量
+    计算下单数量（仅用于观察模式）
+    
+    ⚠️ 注意：此函数仅用于观察模式，使用配置文件中的 OBSERVE_BALANCE
+    实盘模式下使用 TradingUser.calculate_order_quantity()，它会：
+    1. 从 Binance API 获取真实余额
+    2. 根据余额动态计算仓位比例：
+       - 余额 <= 1000 USDT: 100% 仓位（全仓）
+       - 余额 > 1000 USDT: 20% 仓位
     
     公式: 下单数量 = (总资金 × 仓位百分比 × 杠杆) / 当前价格
     
@@ -72,10 +80,29 @@ def calculate_order_quantity(current_price: float) -> float:
     return max(quantity, 0.001)
 
 
+# K线周期对应的毫秒数
+KLINE_INTERVAL_MS = {
+    "1m": 60 * 1000,
+    "3m": 3 * 60 * 1000,
+    "5m": 5 * 60 * 1000,
+    "15m": 15 * 60 * 1000,
+    "30m": 30 * 60 * 1000,
+    "1h": 60 * 60 * 1000,
+    "2h": 2 * 60 * 60 * 1000,
+    "4h": 4 * 60 * 60 * 1000,
+    "1d": 24 * 60 * 60 * 1000,
+}
+
+
 async def _load_historical_klines(
     client: AsyncClient, history: List[Dict], limit: int = 200
-) -> None:
-    """加载历史K线数据到history列表"""
+) -> Optional[int]:
+    """
+    加载历史K线数据到history列表
+    
+    返回: 最后一根K线的开盘时间戳（毫秒），用于后续补全
+    """
+    last_timestamp = None
     try:
         logging.info(f"正在下载历史K线数据（{SYMBOL} {INTERVAL}，{limit}根）...")
         historical_klines = await client.get_historical_klines(
@@ -90,287 +117,134 @@ async def _load_historical_klines(
         for kline in historical_klines:
             history.append(
                 {
+                    "timestamp": int(kline[0]),  # K线开盘时间戳（毫秒）
                     "open": float(kline[1]),
                     "high": float(kline[2]),
                     "low": float(kline[3]),
                     "close": float(kline[4]),
                 }
             )
+        
+        if history:
+            last_timestamp = history[-1]["timestamp"]
+            
         logging.info(f"历史数据已加载到内存，共 {len(history)} 根K线")
     except Exception as e:
         logging.error(f"下载历史K线数据失败: {e}", exc_info=True)
         if len(history) == 0:
             logging.warning("历史数据为空，需要等待K线数据积累")
+    
+    return last_timestamp
 
 
 async def _fill_missing_klines(
     client: AsyncClient, history: List[Dict], last_timestamp: Optional[int] = None
-) -> None:
-    """补全缺失的K线数据（重连后使用）"""
+) -> Optional[int]:
+    """
+    补全缺失的K线数据（重连后使用）
+    
+    基于时间戳精确补全，避免重复或遗漏：
+    1. 根据 last_timestamp 和当前时间计算缺失的 K 线数量
+    2. 使用 start_time 参数精确获取缺失的 K 线
+    3. 按时间戳去重合并
+    
+    返回: 补全后最后一根K线的时间戳
+    """
+    import time
+    
     try:
         if len(history) == 0:
             # 如果没有历史数据，直接加载
-            await _load_historical_klines(client, history)
-            return
+            return await _load_historical_klines(client, history)
 
-        # 获取最后一根K线的时间戳（如果提供）
+        # 获取 K 线周期的毫秒数
+        interval_ms = KLINE_INTERVAL_MS.get(KLINE_INTERVAL, 5 * 60 * 1000)  # 默认 5 分钟
+        
+        # 获取历史数据中最后一根 K 线的时间戳
         if last_timestamp is None:
-            # 如果没有提供，尝试从历史数据估算
-            # 5分钟K线，估算缺失的数量（最多补100根）
+            last_timestamp = history[-1].get("timestamp")
+        
+        if last_timestamp is None:
+            # 没有时间戳信息，回退到简单补全
+            logging.warning("历史数据无时间戳，使用简单补全模式")
             limit = min(100, 500 - len(history))
+            missing_klines = await client.get_historical_klines(
+                symbol=SYMBOL,
+                interval=INTERVAL,
+                limit=limit,
+            )
         else:
-            # 根据时间戳计算需要补多少根
-            # 简化处理：补最近100根
-            limit = 100
-
-        logging.info(f"正在补全缺失的K线数据（最多{limit}根）...")
-        missing_klines = await client.get_historical_klines(
-            symbol=SYMBOL,
-            interval=INTERVAL,
-            limit=limit,
-        )
+            # 基于时间戳精确计算缺失的 K 线数量
+            current_time_ms = int(time.time() * 1000)
+            time_gap_ms = current_time_ms - last_timestamp
+            missing_count = time_gap_ms // interval_ms
+            
+            if missing_count <= 0:
+                logging.info("没有缺失的K线数据")
+                return last_timestamp
+            
+            # 限制最大补全数量（避免一次请求过多）
+            missing_count = min(missing_count + 1, 200)  # +1 确保包含边界
+            
+            logging.info(
+                f"正在补全缺失的K线数据（从 {last_timestamp} 开始，预计 {missing_count} 根）..."
+            )
+            
+            # 使用 start_time 参数精确获取缺失的 K 线
+            missing_klines = await client.get_historical_klines(
+                symbol=SYMBOL,
+                interval=INTERVAL,
+                start_str=str(last_timestamp),  # 从断开时的最后一根开始
+                limit=missing_count,
+            )
 
         if not missing_klines:
-            return
+            logging.info("没有新的K线数据需要补全")
+            return last_timestamp
 
-        # 获取现有历史数据的最后一根K线时间戳
-        existing_last_close = history[-1]["close"] if history else None
-
-        # 将新数据转换为统一格式
+        # 构建时间戳到K线的映射（用于去重）
+        existing_timestamps = {kline.get("timestamp") for kline in history if kline.get("timestamp")}
+        
+        # 将新数据转换为统一格式，并按时间戳去重
         new_klines = []
         for kline in missing_klines:
+            kline_timestamp = int(kline[0])
+            
+            # 跳过已存在的 K 线
+            if kline_timestamp in existing_timestamps:
+                continue
+            
             kline_data = {
+                "timestamp": kline_timestamp,
                 "open": float(kline[1]),
                 "high": float(kline[2]),
                 "low": float(kline[3]),
                 "close": float(kline[4]),
             }
             new_klines.append(kline_data)
+            existing_timestamps.add(kline_timestamp)
 
-        # 去重：如果新数据的最后一根与现有数据的最后一根相同，跳过
-        if existing_last_close is not None and new_klines:
-            if abs(new_klines[-1]["close"] - existing_last_close) < 0.01:
-                # 最后一根相同，移除它
-                new_klines.pop()
-
-        # 合并数据，按时间顺序
+        # 合并并按时间戳排序
         if new_klines:
-            # 简单合并（实际应该按时间戳排序去重）
             history.extend(new_klines)
-            history = history[-500:]  # 保留最近500根
+            # 按时间戳排序
+            history.sort(key=lambda x: x.get("timestamp", 0))
+            # 保留最近 500 根
+            while len(history) > 500:
+                history.pop(0)
+            
+            new_last_timestamp = history[-1].get("timestamp") if history else None
             logging.info(
-                f"已补全 {len(new_klines)} 根K线，当前历史数据: {len(history)} 根"
+                f"✅ 已补全 {len(new_klines)} 根K线，当前历史数据: {len(history)} 根"
             )
+            return new_last_timestamp
+        else:
+            logging.info("所有K线数据已是最新")
+            return history[-1].get("timestamp") if history else None
+            
     except Exception as e:
         logging.error(f"补全K线数据失败: {e}", exc_info=True)
-
-
-async def orderbook_worker(symbol: str = SYMBOL) -> None:
-    """
-    订单簿深度监控工作线程
-    
-    功能：
-    1. 订阅 Binance WebSocket depth20 数据流（20档深度，更难被操纵）
-    2. 实时计算 OBI（Order Book Imbalance）
-    3. 将结果存入 Redis，10秒过期
-    
-    OBI 计算公式：
-    OBI = (sum(bids_qty) - sum(asks_qty)) / (sum(bids_qty) + sum(asks_qty))
-    
-    OBI 解读：
-    - OBI > 0.3: 买盘占优，强势
-    - OBI < -0.3: 卖盘占优，弱势
-    - -0.3 <= OBI <= 0.3: 均衡
-    """
-    redis_client: Optional[aioredis.Redis] = None
-    client: Optional[AsyncClient] = None
-    reconnect_attempt = 0
-    max_reconnect_attempts = 10
-    base_delay = 1
-    
-    while reconnect_attempt < max_reconnect_attempts:
-        try:
-            logging.info(
-                f"正在连接 Redis 和 Binance WebSocket (订单簿深度)..."
-                + (
-                    f" (重连尝试 {reconnect_attempt + 1}/{max_reconnect_attempts})"
-                    if reconnect_attempt > 0
-                    else ""
-                )
-            )
-            
-            # 连接 Redis
-            try:
-                redis_client = await aioredis.from_url(
-                    REDIS_URL,
-                    encoding="utf-8",
-                    decode_responses=True,
-                    socket_connect_timeout=5,
-                )
-                # 测试连接
-                await redis_client.ping()
-                logging.info(f"✅ Redis 连接成功: {REDIS_URL.split('@')[-1] if '@' in REDIS_URL else 'localhost'}")
-            except Exception as e:
-                logging.error(f"❌ Redis 连接失败: {e}")
-                logging.warning("订单簿深度监控将被禁用（不影响主策略）")
-                # Redis 连接失败不影响主系统，直接返回
-                return
-            
-            # 创建 Binance 客户端
-            try:
-                if client is not None:
-                    try:
-                        await client.close_connection()
-                    except:
-                        pass
-                client = await AsyncClient.create()
-                logging.info("✅ Binance WebSocket 客户端创建成功")
-            except Exception as e:
-                logging.error(f"❌ Binance 客户端创建失败: {e}")
-                raise
-            
-            # 创建 WebSocket 管理器
-            bsm = BinanceSocketManager(client)
-            
-            # 订阅 depth20 数据流（20档深度，更难被操纵）
-            depth_socket = bsm.depth_socket(symbol, depth=BinanceSocketManager.WEBSOCKET_DEPTH_20)
-            
-            # OBI 历史记录（用于计算滑动平均和变化率）
-            obi_history: List[float] = []
-            OBI_HISTORY_SIZE = 30  # 保留最近30个OBI值（约30秒）
-            
-            async with depth_socket as stream:
-                logging.info(f"🔄 订单簿深度监控已启动: {symbol} (depth20, 增强OBI分析)")
-                reconnect_attempt = 0  # 重置重连计数
-                
-                while True:
-                    try:
-                        msg = await asyncio.wait_for(stream.recv(), timeout=30.0)
-                        
-                        if msg is None:
-                            logging.warning("订单簿数据流返回 None，可能连接断开")
-                            break
-                        
-                        # 解析订单簿数据
-                        if "bids" not in msg or "asks" not in msg:
-                            continue
-                        
-                        # 计算买卖盘总量
-                        bids = msg["bids"]  # [[price, qty], ...]
-                        asks = msg["asks"]  # [[price, qty], ...]
-                        
-                        total_bid_qty = sum(float(bid[1]) for bid in bids)
-                        total_ask_qty = sum(float(ask[1]) for ask in asks)
-                        
-                        # 计算 OBI
-                        total_qty = total_bid_qty + total_ask_qty
-                        if total_qty > 0:
-                            obi = (total_bid_qty - total_ask_qty) / total_qty
-                        else:
-                            obi = 0.0
-                        
-                        # 更新 OBI 历史记录
-                        obi_history.append(obi)
-                        if len(obi_history) > OBI_HISTORY_SIZE:
-                            obi_history.pop(0)
-                        
-                        # 计算增强 OBI 指标
-                        obi_avg = sum(obi_history) / len(obi_history) if obi_history else obi
-                        
-                        # 计算 OBI 变化率（Delta OBI）：最近10个 vs 前10个
-                        obi_delta = 0.0
-                        if len(obi_history) >= 20:
-                            recent_avg = sum(obi_history[-10:]) / 10
-                            older_avg = sum(obi_history[-20:-10]) / 10
-                            obi_delta = recent_avg - older_avg
-                        elif len(obi_history) >= 5:
-                            # 数据不足时用简化计算
-                            obi_delta = obi - obi_history[0]
-                        
-                        # 计算 OBI 趋势方向
-                        obi_trend = "neutral"
-                        if obi_delta > 0.05:
-                            obi_trend = "bullish"  # 买盘增强
-                        elif obi_delta < -0.05:
-                            obi_trend = "bearish"  # 卖盘增强
-                        
-                        # 存入 Redis，10秒过期（增强版数据）
-                        redis_key = f"cache:obi:{symbol}"
-                        await redis_client.setex(
-                            redis_key,
-                            10,  # 10秒过期
-                            json.dumps({
-                                "obi": round(obi, 4),           # 瞬时OBI
-                                "obi_avg": round(obi_avg, 4),   # 滑动平均OBI
-                                "obi_delta": round(obi_delta, 4),  # OBI变化率
-                                "obi_trend": obi_trend,         # OBI趋势方向
-                                "bid_qty": round(total_bid_qty, 4),
-                                "ask_qty": round(total_ask_qty, 4),
-                                "timestamp": msg.get("E", 0),
-                            })
-                        )
-                        
-                        # 定期日志（每50次更新记录一次）
-                        if int(msg.get("E", 0)) % 50000 < 1000:  # 约每50秒
-                            status = "买盘占优" if obi_avg > 0.3 else "卖盘占优" if obi_avg < -0.3 else "均衡"
-                            logging.debug(
-                                f"📊 OBI更新: 瞬时={obi:.4f}, 平均={obi_avg:.4f}, Delta={obi_delta:.4f} ({obi_trend}), "
-                                f"买盘={total_bid_qty:.2f}, 卖盘={total_ask_qty:.2f}"
-                            )
-                    
-                    except ReadLoopClosed:
-                        # WebSocket 读取循环已关闭，需要重连
-                        logging.warning("WebSocket 读取循环已关闭，准备重连...")
-                        break  # 退出内层循环，触发外层重连逻辑
-                    except asyncio.TimeoutError:
-                        logging.warning("订单簿数据流超时，尝试重连...")
-                        break
-                    except Exception as e:
-                        # 其他异常，记录但继续尝试（可能是临时错误）
-                        logging.error(f"处理订单簿数据失败: {e}", exc_info=True)
-                        await asyncio.sleep(1)
-        
-        except ReadLoopClosed:
-            reconnect_attempt += 1
-            delay = min(base_delay * (2 ** reconnect_attempt), 60)
-            logging.warning(
-                f"订单簿 WebSocket 读取循环已关闭，"
-                f"{delay}秒后重连 ({reconnect_attempt}/{max_reconnect_attempts})"
-            )
-            await asyncio.sleep(delay)
-        except ConnectionClosed as e:
-            reconnect_attempt += 1
-            delay = min(base_delay * (2 ** reconnect_attempt), 60)
-            logging.warning(
-                f"订单簿 WebSocket 连接关闭: {e}，"
-                f"{delay}秒后重连 ({reconnect_attempt}/{max_reconnect_attempts})"
-            )
-            await asyncio.sleep(delay)
-        
-        except Exception as e:
-            reconnect_attempt += 1
-            delay = min(base_delay * (2 ** reconnect_attempt), 60)
-            logging.error(
-                f"订单簿监控异常: {e}，"
-                f"{delay}秒后重连 ({reconnect_attempt}/{max_reconnect_attempts})",
-                exc_info=True
-            )
-            await asyncio.sleep(delay)
-        
-        finally:
-            # 清理资源
-            if client is not None:
-                try:
-                    await client.close_connection()
-                except:
-                    pass
-            if redis_client is not None:
-                try:
-                    await redis_client.aclose()
-                except:
-                    pass
-    
-    logging.error(f"订单簿监控达到最大重连次数 ({max_reconnect_attempts})，已停止")
+        return last_timestamp
 
 
 async def kline_producer(
@@ -379,7 +253,7 @@ async def kline_producer(
     trade_logger: TradeLogger,
 ) -> None:
     """订阅 K 线，生成策略信号并分发给所有用户队列，同时检查止损止盈。
-    支持自动重连和指数退避机制。
+    支持自动重连和指数退避机制，基于时间戳精确补全缺失的 K 线。
     """
     history: List[Dict] = []
     kline_count = 0
@@ -387,6 +261,7 @@ async def kline_producer(
     max_reconnect_attempts = 10  # 最大重连次数
     base_delay = 1  # 基础延迟（秒）
     client: Optional[AsyncClient] = None  # 在外部定义，避免未绑定错误
+    last_kline_timestamp: Optional[int] = None  # 跟踪最后一根 K 线的时间戳
 
     while reconnect_attempt < max_reconnect_attempts:
         try:
@@ -415,10 +290,11 @@ async def kline_producer(
             # 加载或补全历史K线数据
             if reconnect_attempt == 0:
                 # 首次连接，加载历史数据
-                await _load_historical_klines(client, history)
+                last_kline_timestamp = await _load_historical_klines(client, history)
             else:
-                # 重连后，补全缺失的数据
-                await _fill_missing_klines(client, history)
+                # 重连后，基于时间戳精确补全缺失的数据
+                logging.info(f"重连后补全数据，上次最后K线时间戳: {last_kline_timestamp}")
+                last_kline_timestamp = await _fill_missing_klines(client, history, last_kline_timestamp)
 
             # 如果有足够的历史数据，进行一次信号扫描
             if len(history) >= 50:
@@ -485,19 +361,27 @@ async def kline_producer(
 
                             # 已收盘的 K 线
                             kline_count += 1
+                            kline_open_time = int(k.get("t", 0))  # K线开盘时间戳
                             logging.info(
                                 f"📊 K线收盘 #{kline_count}: O={float(k['o']):.2f} H={float(k['h']):.2f} L={float(k['l']):.2f} C={float(k['c']):.2f}"
                             )
 
-                            # 提取 OHLC
+                            # 提取 OHLC（包含时间戳，用于重连后补全）
                             kline_data = {
+                                "timestamp": kline_open_time,
                                 "open": float(k["o"]),
                                 "high": float(k["h"]),
                                 "low": float(k["l"]),
                                 "close": float(k["c"]),
                             }
+                            
+                            # 更新最后 K 线时间戳（用于重连后精确补全）
+                            last_kline_timestamp = kline_open_time
+                            
                             history.append(kline_data)
-                            history = history[-500:]  # 保留最近 500 根
+                            # 保留最近 500 根
+                            while len(history) > 500:
+                                history.pop(0)
 
                             # 只有当有足够的历史数据时才生成信号
                             if len(history) < 50:
@@ -755,10 +639,72 @@ async def user_worker(
         logging.info(f"正在为用户 [{user.name}] 连接 Binance API...")
         await user.connect()
         logging.info(f"用户 [{user.name}] 已连接 Binance API")
+        
+        # 获取交易规则（stepSize, tickSize）
+        try:
+            filters = await user.get_symbol_filters(SYMBOL)
+            logging.info(
+                f"[{user.name}] 获取交易规则: stepSize={filters['stepSize']}, "
+                f"minQty={filters['minQty']}, tickSize={filters['tickSize']}"
+            )
+        except Exception as e:
+            logging.warning(f"[{user.name}] 获取交易规则失败: {e}，将使用默认值")
+        
+        # 设置杠杆（实盘模式下首次设置）
+        leverage_ok = await user.set_leverage(SYMBOL, leverage=LEVERAGE)
+        if not leverage_ok:
+            logging.error(f"[{user.name}] 设置杠杆失败，交易可能使用错误的杠杆倍数！")
+        
+        # 获取并显示初始余额
+        try:
+            initial_balance = await user.get_futures_balance()
+            position_pct = user.calculate_position_size_percent(initial_balance)
+            logging.info(
+                f"[{user.name}] 实盘模式: 余额={initial_balance:.2f} USDT, "
+                f"仓位比例={position_pct:.0f}%, 杠杆={LEVERAGE}x"
+            )
+            print(
+                f"[{user.name}] 实盘模式: 余额={initial_balance:.2f} USDT, "
+                f"仓位比例={position_pct:.0f}% ({'全仓' if position_pct == 100 else '20%仓位'}), "
+                f"杠杆={LEVERAGE}x"
+            )
+        except Exception as e:
+            logging.error(f"[{user.name}] 获取初始余额失败: {e}")
 
     signal_count = 0
     while True:
         try:
+            # 检查是否需要挂 TP2 订单（TP1 已触发但 TP2 未挂单）
+            if not OBSERVE_MODE and trade_logger.needs_tp2_order(user.name):
+                trade = trade_logger.positions.get(user.name)
+                if trade:
+                    try:
+                        tp2_qty = trade.remaining_quantity or (trade.quantity * 0.5)
+                        tp2_qty = max(round(float(tp2_qty), 3), 0.001)
+                        
+                        stop_side = "SELL" if trade.side == "buy" else "BUY"
+                        
+                        tp2_response = await user.create_take_profit_market_order(
+                            symbol=SYMBOL,
+                            side=stop_side,
+                            quantity=tp2_qty,
+                            stop_price=round(float(trade.tp2_price), 2),
+                            reduce_only=True,
+                        )
+                        tp2_order_id = tp2_response.get("orderId")
+                        trade_logger.mark_tp2_order_placed(user.name)  # 标记已挂单
+                        
+                        logging.info(
+                            f"[{user.name}] ✅ TP2止盈单已设置: ID={tp2_order_id}, "
+                            f"触发价={trade.tp2_price:.2f}, 数量={tp2_qty:.4f} BTC (剩余50%)"
+                        )
+                        print(
+                            f"[{user.name}] ✅ TP2止盈单已设置: 触发价={trade.tp2_price:.2f}, "
+                            f"数量={tp2_qty:.4f} BTC"
+                        )
+                    except Exception as tp2_err:
+                        logging.error(f"[{user.name}] ⚠️ TP2止盈单设置失败: {tp2_err}")
+            
             signal: Dict = await queue.get()
             signal_count += 1
             logging.info(
@@ -796,7 +742,22 @@ async def user_worker(
                 continue
 
             # 根据当前价格动态计算下单数量
-            order_qty = calculate_order_quantity(signal["price"])
+            if OBSERVE_MODE:
+                # 观察模式：使用配置的模拟资金
+                order_qty = calculate_order_quantity(signal["price"])
+            else:
+                # 实盘模式：获取真实余额，动态计算仓位（使用 stepSize 规则）
+                try:
+                    real_balance = await user.get_futures_balance(force_refresh=True)
+                    order_qty = user.calculate_order_quantity(
+                        balance=real_balance,
+                        current_price=signal["price"],
+                        leverage=LEVERAGE,
+                        symbol=SYMBOL
+                    )
+                except Exception as e:
+                    logging.error(f"[{user.name}] 获取余额失败，跳过信号: {e}")
+                    continue
             
             if OBSERVE_MODE:
                 # 观察模式：只记录模拟交易（支持分批止盈）
@@ -847,38 +808,168 @@ async def user_worker(
                         f"止损={signal['stop_loss']:.2f}, 止盈={signal['take_profit']:.2f}"
                     )
             else:
-                # 实际下单模式
-                order_params = {
-                    "symbol": SYMBOL,
-                    "side": signal["side"].upper(),
-                    "type": "MARKET",
-                    "quantity": order_qty,
-                }
+                # ========== 实盘下单模式（Al Brooks 理念）==========
+                # 策略：
+                # 1. 突破型信号（Spike/Failed Breakout/Climax）→ 市价入场（快速成交）
+                # 2. 回撤型信号（H2/L2/Wedge/Spike_Entry）→ 限价入场（等待更优价位）
+                # 3. 止损使用市价单（确保触发时能成交）
+                # 4. 止盈不预挂，通过 K 线监控动态退出（Al Brooks 核心理念）
+                
+                tp1_price = signal.get("tp1_price")
+                tp2_price = signal.get("tp2_price")
+                market_state_val = signal.get("market_state")
+                tight_channel_score_val = signal.get("tight_channel_score", 0.0)
+                
+                # 计算持仓价值
+                position_value = order_qty * signal["price"]
+                
+                # 确定止损方向（与开仓相反）
+                stop_side = "SELL" if signal["side"].lower() == "buy" else "BUY"
+                
+                # 根据信号类型决定入场方式（Al Brooks 理念）
+                signal_type = signal["signal"]
+                
+                # 突破型信号：需要快速入场，使用市价单
+                BREAKOUT_SIGNALS = ["Spike_Buy", "Spike_Sell", 
+                                    "Failed_Breakout_Buy", "Failed_Breakout_Sell",
+                                    "Climax_Buy", "Climax_Sell"]
+                
+                # 回撤型信号：可以等待更好价位，使用限价单
+                PULLBACK_SIGNALS = ["H2_Buy", "H2_Sell", "L2_Buy", "L2_Sell",
+                                    "Wedge_Buy", "Wedge_Sell",
+                                    "Spike_Entry_Buy", "Spike_Entry_Sell"]
+                
+                is_breakout_signal = signal_type in BREAKOUT_SIGNALS
+                
                 try:
-                    logging.info(f"[{user.name}] 正在执行订单: {order_params}")
-                    await user.create_order(**order_params)
-                    # 同时记录到交易日志（包含信号强度）
+                    if is_breakout_signal:
+                        # ===== 突破型信号：市价入场 =====
+                        logging.info(
+                            f"[{user.name}] 🚀 执行市价入场（突破型）: "
+                            f"{signal_type} {signal['side'].upper()} @ 市价, 数量={order_qty:.4f} BTC, "
+                            f"持仓价值≈{position_value:.2f} USDT"
+                        )
+                        
+                        entry_response = await user.create_market_order(
+                            symbol=SYMBOL,
+                            side=signal["side"].upper(),
+                            quantity=order_qty,
+                            reduce_only=False,
+                        )
+                        
+                        order_id = entry_response.get("orderId")
+                        order_status = entry_response.get("status", "FILLED")
+                        
+                        logging.info(f"[{user.name}] 市价开仓单已成交: ID={order_id}, 状态={order_status}")
+                    else:
+                        # ===== 回撤型信号：限价入场 =====
+                        limit_price = user.calculate_limit_price(
+                            current_price=signal["price"],
+                            side=signal["side"],
+                            slippage_pct=0.05,  # 0.05% 滑点
+                            symbol=SYMBOL
+                        )
+                        
+                        logging.info(
+                            f"[{user.name}] 🎯 执行限价入场（回撤型）: "
+                            f"{signal_type} {signal['side'].upper()} @ {limit_price:.2f}, 数量={order_qty:.4f} BTC, "
+                            f"持仓价值≈{position_value:.2f} USDT"
+                        )
+                        
+                        entry_response = await user.create_limit_order(
+                            symbol=SYMBOL,
+                            side=signal["side"].upper(),
+                            quantity=order_qty,
+                            price=limit_price,
+                            time_in_force="GTC",  # 撤销前有效
+                        )
+                        
+                        order_id = entry_response.get("orderId")
+                        order_status = entry_response.get("status", "NEW")
+                        
+                        logging.info(f"[{user.name}] 限价开仓单已提交: ID={order_id}, 状态={order_status}")
+                    
+                    # Step 2: 创建止损市价单（Al Brooks：止损必须确定性执行）
+                    stop_order_id = None
+                    try:
+                        stop_response = await user.create_stop_market_order(
+                            symbol=SYMBOL,
+                            side=stop_side,
+                            quantity=order_qty,
+                            stop_price=round(signal["stop_loss"], 2),
+                            reduce_only=True,
+                        )
+                        stop_order_id = stop_response.get("orderId")
+                        logging.info(f"[{user.name}] ✅ 止损市价单已设置: ID={stop_order_id}, 触发价={signal['stop_loss']:.2f}")
+                    except Exception as stop_err:
+                        logging.error(f"[{user.name}] ⚠️ 止损单设置失败: {stop_err}")
+                        print(f"[{user.name}] ⚠️ 止损单设置失败，请手动设置止损！")
+                    
+                    # ===== Al Brooks 理念：不预挂止盈单 =====
+                    # 止盈通过 K 线监控动态退出：
+                    # 1. 检测反转信号 / Climax / 通道触及时退出
+                    # 2. 使用追踪止损保护利润
+                    # 3. 由 trade_logger.check_stop_loss_take_profit() 实时检测
+                    logging.info(
+                        f"[{user.name}] 📊 Al Brooks 动态退出模式: "
+                        f"TP1={tp1_price:.2f if tp1_price else 0:.2f}, TP2={tp2_price:.2f if tp2_price else 0:.2f}, "
+                        f"将通过 K 线监控触发平仓"
+                    )
+                    
+                    # 获取实际成交信息
+                    if is_breakout_signal:
+                        # 市价单立即成交，取平均成交价
+                        actual_price = float(entry_response.get("avgPrice", signal["price"]))
+                    else:
+                        # 限价单可能未立即成交
+                        actual_price = float(entry_response.get("price", limit_price if 'limit_price' in dir() else signal["price"]))
+                    actual_qty = float(entry_response.get("origQty", order_qty))
+                    executed_qty = float(entry_response.get("executedQty", 0))
+                    
+                    # 同时记录到交易日志（包含分批止盈参数）
                     trade = trade_logger.open_position(
                         user=user.name,
                         signal=signal["signal"],
                         side=signal["side"],
-                        entry_price=signal["price"],
-                        quantity=order_qty,
+                        entry_price=actual_price,
+                        quantity=actual_qty,
                         stop_loss=signal["stop_loss"],
                         take_profit=signal["take_profit"],
                         signal_strength=signal_strength,
+                        tp1_price=tp1_price,
+                        tp2_price=tp2_price,
+                        market_state=market_state_val,
+                        tight_channel_score=tight_channel_score_val,
                     )
-                    logging.info(
-                        f"[{user.name}] ✅ 订单执行成功: {signal['signal']} {signal['side']} @ {signal['price']:.2f}, "
-                        f"数量={order_qty:.4f} BTC"
-                    )
-                    print(
-                        f"[{user.name}] ✅ 已执行 {signal['signal']} 信号，方向={signal['side']}, "
-                        f"价格={signal['price']:.2f}, 数量={order_qty:.4f} BTC, "
-                        f"止损={signal['stop_loss']:.2f}, 止盈={signal['take_profit']:.2f}"
-                    )
+                    
+                    # 日志输出
+                    status_emoji = "✅" if order_status == "FILLED" else "📝"
+                    order_type_text = "市价单" if is_breakout_signal else "限价单"
+                    status_text = "已成交" if order_status == "FILLED" else f"挂单中({order_status})"
+                    
+                    if tp1_price and tp2_price:
+                        logging.info(
+                            f"[{user.name}] {status_emoji} 实盘{order_type_text}{status_text}: {signal['signal']} {signal['side']} @ {actual_price:.2f}, "
+                            f"数量={actual_qty:.4f} BTC, 止损={signal['stop_loss']:.2f}, "
+                            f"TP1={tp1_price:.2f}(50%), TP2={tp2_price:.2f}(50%) [K线动态退出]"
+                        )
+                        print(
+                            f"[{user.name}] {status_emoji} 实盘{order_type_text}{status_text}: {signal['signal']} {signal['side']} @ {actual_price:.2f}, "
+                            f"数量={actual_qty:.4f} BTC, 止损={signal['stop_loss']:.2f}"
+                        )
+                    else:
+                        logging.info(
+                            f"[{user.name}] {status_emoji} 实盘{order_type_text}{status_text}: {signal['signal']} {signal['side']} @ {actual_price:.2f}, "
+                            f"数量={actual_qty:.4f} BTC, 止损={signal['stop_loss']:.2f}, 止盈={signal['take_profit']:.2f} [K线动态退出]"
+                        )
+                        print(
+                            f"[{user.name}] {status_emoji} 实盘{order_type_text}{status_text}: {signal['signal']} {signal['side']} @ {actual_price:.2f}, "
+                            f"数量={actual_qty:.4f} BTC, 止损={signal['stop_loss']:.2f}, 止盈={signal['take_profit']:.2f}"
+                        )
+                        
                 except Exception as exc:
-                    logging.exception(f"[{user.name}] ❌ 下单失败: {exc}")
+                    logging.exception(f"[{user.name}] ❌ 实盘下单失败: {exc}")
+                    print(f"[{user.name}] ❌ 实盘下单失败: {exc}")
 
             queue.task_done()
         except asyncio.CancelledError:
@@ -971,11 +1062,14 @@ async def main() -> None:
 
     queues = [asyncio.Queue() for _ in users]
     
-    # 初始化策略（异步版本）
-    strategy = AlBrooksStrategy(redis_url=REDIS_URL)
-    # 异步连接 Redis
+    # 初始化策略（异步版本，Delta 窗口与 K 线周期对齐）
+    strategy = AlBrooksStrategy(redis_url=REDIS_URL, kline_interval=KLINE_INTERVAL)
+    # 异步连接 Redis（可选，用于 Delta 缓存）
     redis_connected = await strategy.connect_redis()
-    logging.info(f"策略已初始化: EMA周期={strategy.ema_period}, Redis OBI过滤={'启用' if redis_connected else '禁用'}")
+    logging.info(
+        f"策略已初始化: EMA周期={strategy.ema_period}, "
+        f"K线周期={KLINE_INTERVAL}, Delta窗口={strategy.delta_analyzer.WINDOW_SECONDS}秒"
+    )
 
     trade_logger = TradeLogger()
     logging.info(f"交易日志器已初始化")
@@ -983,11 +1077,11 @@ async def main() -> None:
     logging.info("正在启动所有任务...")
     tasks = [
         kline_producer(queues, strategy, trade_logger),
-        orderbook_worker(SYMBOL),  # 订单簿深度监控（OBI）
+        aggtrade_worker(SYMBOL, REDIS_URL, KLINE_INTERVAL),  # 动态订单流监控（Delta窗口与K线周期对齐）
         *[user_worker(user, q, trade_logger) for user, q in zip(users, queues)],
         print_stats_periodically(trade_logger, users),
     ]
-    logging.info(f"已创建 {len(tasks)} 个任务（含订单簿深度监控）")
+    logging.info(f"已创建 {len(tasks)} 个任务（含动态订单流监控，Delta窗口={KLINE_INTERVAL}）")
 
     try:
         logging.info("所有任务已启动，程序运行中...")

@@ -108,16 +108,25 @@ class H2StateMachine:
                         self.is_strong_trend = False
             
             elif self.state == HState.H1_DETECTED:
-                if high > self.h1_high:
+                # Outside Bar 处理：优先检测突破失败（低点突破）
+                # 因为失败信号比延续信号更重要
+                if self.pullback_start_low is not None and low < self.pullback_start_low:
+                    # 突破失败：低点跌破回调起点 -> 重置状态机
+                    self.state = HState.WAITING_FOR_PULLBACK
+                    self.trend_high = high if self.trend_high is None or high > self.trend_high else self.trend_high
+                    self.pullback_start_low = None
+                    self.h1_high = None
+                elif high > self.h1_high:
+                    # 延续上涨：更新高点
                     self.h1_high = high
-                elif low < self.h1_high:
+                elif self.h1_high is not None and low < self.h1_high:
+                    # 开始回调：进入等待 H2 状态
                     if self.pullback_start_low is not None and low >= self.pullback_start_low:
                         self.state = HState.WAITING_FOR_H2
-                    elif self.pullback_start_low is not None and low < self.pullback_start_low:
-                        self.state = HState.WAITING_FOR_PULLBACK
-                        self.trend_high = high if self.trend_high is None or high > self.trend_high else self.trend_high
-                        self.pullback_start_low = None
-                        self.h1_high = None
+                    elif self.pullback_start_low is None:
+                        # 防护：如果 pullback_start_low 未设置，设置当前低点
+                        self.pullback_start_low = low
+                        self.state = HState.WAITING_FOR_H2
             
             elif self.state == HState.WAITING_FOR_H2:
                 if self.h1_high is not None and high > self.h1_high:
@@ -212,16 +221,25 @@ class L2StateMachine:
                         self.is_strong_trend = False
             
             elif self.state == LState.L1_DETECTED:
-                if low < self.l1_low:
+                # Outside Bar 处理：优先检测突破失败（高点突破）
+                # 因为失败信号比延续信号更重要
+                if self.bounce_start_high is not None and high > self.bounce_start_high:
+                    # 突破失败：高点突破反弹起点 -> 重置状态机
+                    self.state = LState.WAITING_FOR_BOUNCE
+                    self.trend_low = low if self.trend_low is None or low < self.trend_low else self.trend_low
+                    self.bounce_start_high = None
+                    self.l1_low = None
+                elif low < self.l1_low:
+                    # 延续下跌：更新低点
                     self.l1_low = low
-                elif high > self.l1_low:
+                elif self.l1_low is not None and high > self.l1_low:
+                    # 开始反弹：进入等待 L2 状态
                     if self.bounce_start_high is not None and high <= self.bounce_start_high:
                         self.state = LState.WAITING_FOR_L2
-                    elif self.bounce_start_high is not None and high > self.bounce_start_high:
-                        self.state = LState.WAITING_FOR_BOUNCE
-                        self.trend_low = low if self.trend_low is None or low < self.trend_low else self.trend_low
-                        self.bounce_start_high = None
-                        self.l1_low = None
+                    elif self.bounce_start_high is None:
+                        # 防护：如果 bounce_start_high 未设置，设置当前高点
+                        self.bounce_start_high = high
+                        self.state = LState.WAITING_FOR_L2
             
             elif self.state == LState.WAITING_FOR_L2:
                 if self.l1_low is not None and low < self.l1_low:

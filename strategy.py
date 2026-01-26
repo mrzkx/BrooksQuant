@@ -11,6 +11,9 @@ Al Brooks 价格行为策略 - 核心入口
 - logic/market_analyzer.py: 市场状态识别
 - logic/patterns.py: 模式检测
 - logic/state_machines.py: H2/L2 状态机
+
+订单流过滤：
+- delta_flow.py: 动态订单流 Delta 分析（替代静态 OBI）
 """
 
 import json
@@ -25,30 +28,55 @@ from logic.market_analyzer import MarketState, MarketAnalyzer
 from logic.patterns import PatternDetector
 from logic.state_machines import HState, LState, H2StateMachine, L2StateMachine
 
+# 导入动态订单流模块
+from delta_flow import (
+    DeltaAnalyzer, 
+    DeltaSnapshot, 
+    DeltaTrend,
+    DeltaSignalModifier, 
+    get_delta_analyzer
+)
+
 
 class AlBrooksStrategy:
     """
     Al Brooks 价格行为策略（异步版本）
     
     通过组合各模块实现完整的交易信号生成
+    
+    订单流过滤：
+    - 使用动态订单流 Delta 分析（基于 aggTrade）替代静态 OBI
+    - Delta 分析能够区分：主动买入、主动卖出、流动性撤离、吸收
+    - Delta 窗口与 K 线周期对齐，确保信号同步
     """
 
-    def __init__(self, ema_period: int = 20, lookback_period: int = 20, redis_url: Optional[str] = None):
+    def __init__(
+        self, 
+        ema_period: int = 20, 
+        lookback_period: int = 20, 
+        redis_url: Optional[str] = None,
+        kline_interval: str = "5m"
+    ):
         self.ema_period = ema_period
         self.lookback_period = lookback_period
+        self.kline_interval = kline_interval
         
         # 初始化模块化组件
         self.market_analyzer = MarketAnalyzer(ema_period=ema_period)
         self.pattern_detector = PatternDetector(lookback_period=lookback_period)
         
-        # Redis 客户端（用于 OBI 过滤）
+        # Redis 客户端（用于 Delta 数据缓存，可选）
         self.redis_client: Optional[aioredis.Redis] = None
         self.redis_url = redis_url
         self._redis_connected = False
+        
+        # Delta 分析器（从全局获取，与 aggtrade_worker 共享，窗口与 K 线周期对齐）
+        self.delta_analyzer: DeltaAnalyzer = get_delta_analyzer(kline_interval=kline_interval)
     
     async def connect_redis(self) -> bool:
-        """异步连接 Redis"""
+        """异步连接 Redis（可选，用于 Delta 数据缓存）"""
         if not self.redis_url:
+            logging.info("✅ 策略已初始化（Delta 分析使用内存模式）")
             return False
         
         try:
@@ -60,10 +88,10 @@ class AlBrooksStrategy:
             )
             await self.redis_client.ping()
             self._redis_connected = True
-            logging.info("✅ 策略已连接 Redis（用于 OBI 过滤）")
+            logging.info("✅ 策略已连接 Redis（用于 Delta 缓存）")
             return True
         except Exception as e:
-            logging.warning(f"⚠️ 策略无法连接 Redis: {e}，OBI 过滤将被禁用")
+            logging.warning(f"⚠️ 策略无法连接 Redis: {e}，Delta 数据将使用内存模式")
             self.redis_client = None
             self._redis_connected = False
             return False
@@ -95,106 +123,77 @@ class AlBrooksStrategy:
         tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
         return tr.ewm(span=period, adjust=False).mean()
     
-    async def _get_obi(self, symbol: str = "BTCUSDT") -> Optional[dict]:
+    async def _get_delta_snapshot(self, symbol: str = "BTCUSDT") -> Optional[DeltaSnapshot]:
         """
-        从 Redis 异步获取增强版 OBI 数据
+        获取动态订单流 Delta 快照
         
-        返回:
-        {
-            "obi": float,        # 瞬时OBI
-            "obi_avg": float,    # 滑动平均OBI
-            "obi_delta": float,  # OBI变化率
-            "obi_trend": str,    # OBI趋势: bullish/bearish/neutral
-        }
+        优先从内存获取（与 aggtrade_worker 共享），
+        如果 Redis 可用也可以从 Redis 获取备用数据。
+        
+        Returns:
+            DeltaSnapshot: 包含 Delta 分析结果的快照
         """
-        if self.redis_client is None or not self._redis_connected:
-            return None
-        
+        # 优先从全局 Delta 分析器获取（实时数据）
         try:
-            data = await self.redis_client.get(f"cache:obi:{symbol}")
-            if data is None:
-                return None
-            parsed = json.loads(data)
-            return {
-                "obi": parsed.get("obi", 0.0),
-                "obi_avg": parsed.get("obi_avg", parsed.get("obi", 0.0)),
-                "obi_delta": parsed.get("obi_delta", 0.0),
-                "obi_trend": parsed.get("obi_trend", "neutral"),
-            }
+            snapshot = await self.delta_analyzer.get_snapshot(symbol)
+            if snapshot.trade_count > 0:
+                return snapshot
         except Exception as e:
-            logging.debug(f"获取 OBI 失败: {e}")
-            return None
+            logging.debug(f"从 Delta 分析器获取快照失败: {e}")
+        
+        # 备用：从 Redis 获取缓存数据
+        if self.redis_client and self._redis_connected:
+            try:
+                data = await self.redis_client.get(f"cache:delta:{symbol}")
+                if data:
+                    parsed = json.loads(data)
+                    return DeltaSnapshot(
+                        cumulative_delta=parsed.get("cumulative_delta", 0.0),
+                        buy_volume=parsed.get("buy_volume", 0.0),
+                        sell_volume=parsed.get("sell_volume", 0.0),
+                        delta_ratio=parsed.get("delta_ratio", 0.0),
+                        delta_avg=parsed.get("delta_avg", 0.0),
+                        delta_acceleration=parsed.get("delta_acceleration", 0.0),
+                        delta_trend=DeltaTrend(parsed.get("delta_trend", "neutral")),
+                        is_absorption=parsed.get("is_absorption", False),
+                        is_climax_buy=parsed.get("is_climax_buy", False),
+                        is_climax_sell=parsed.get("is_climax_sell", False),
+                        trade_count=parsed.get("trade_count", 0),
+                        timestamp=parsed.get("timestamp", 0),
+                    )
+            except Exception as e:
+                logging.debug(f"从 Redis 获取 Delta 缓存失败: {e}")
+        
+        return None
     
-    def _calculate_obi_signal_modifier(
-        self, obi_data: dict, side: str
+    def _calculate_delta_signal_modifier(
+        self, snapshot: DeltaSnapshot, side: str, price_change_pct: float = 0.0
     ) -> Tuple[float, str]:
         """
-        计算 OBI 对信号的调节作用
+        计算动态订单流 Delta 对信号的调节作用
         
-        返回: (modifier, reason)
-        - modifier > 1.0: 增强信号
-        - modifier = 1.0: 不调整
-        - modifier < 1.0: 减弱信号
-        - modifier = 0.0: 完全阻止信号
+        核心逻辑（基于 Al Brooks 价格行为）：
         
-        逻辑：
-        1. 使用平均OBI（更稳定）
-        2. 考虑OBI趋势（动量）
-        3. 只在极端情况下阻止信号
+        1. 买单吃进 (Aggressive Buying)：
+           - Delta 为正且趋势看涨 → 增强买入信号
+           - 这是真正的"Spike"，有机构资金支撑
+        
+        2. 卖单撤离 (Liquidity Withdrawal)：
+           - 价格上涨但 Delta 不匹配 → 减弱买入信号
+           - 这是"假突破"的典型特征
+        
+        3. 吸收 (Absorption)：
+           - Delta 很大但价格不动 → 强烈减弱信号
+           - 隐藏的大单在悄悄出货/吸筹
+        
+        Returns:
+            (modifier, reason)
+            - modifier > 1.0: 增强信号（订单流确认）
+            - modifier = 1.0: 不调整
+            - modifier < 1.0: 减弱信号（订单流不支持）
+            - modifier = 0.0: 阻止信号（强烈反向订单流）
         """
-        obi_avg = obi_data.get("obi_avg", 0.0)
-        obi_delta = obi_data.get("obi_delta", 0.0)
-        obi_trend = obi_data.get("obi_trend", "neutral")
-        
-        modifier = 1.0
-        reasons = []
-        
-        if side == "buy":
-            # 买入信号
-            if obi_avg > 0.3:
-                modifier *= 1.2  # 买盘占优，增强信号
-                reasons.append(f"买盘占优(OBI={obi_avg:.2f})")
-            elif obi_avg < -0.3:
-                modifier *= 0.7  # 卖盘占优，减弱信号
-                reasons.append(f"卖盘占优(OBI={obi_avg:.2f})")
-            
-            # 趋势调节
-            if obi_trend == "bullish":
-                modifier *= 1.1  # 买盘增强，加分
-                reasons.append("OBI上升趋势")
-            elif obi_trend == "bearish":
-                modifier *= 0.9  # 买盘减弱，减分
-                reasons.append("OBI下降趋势")
-            
-            # 极端情况：卖盘强势且持续增强 -> 完全阻止
-            if obi_avg < -0.5 and obi_trend == "bearish":
-                modifier = 0.0
-                reasons = [f"极端卖压(OBI={obi_avg:.2f}, 趋势=bearish)"]
-        
-        else:  # sell
-            # 卖出信号
-            if obi_avg < -0.3:
-                modifier *= 1.2  # 卖盘占优，增强信号
-                reasons.append(f"卖盘占优(OBI={obi_avg:.2f})")
-            elif obi_avg > 0.3:
-                modifier *= 0.7  # 买盘占优，减弱信号
-                reasons.append(f"买盘占优(OBI={obi_avg:.2f})")
-            
-            # 趋势调节
-            if obi_trend == "bearish":
-                modifier *= 1.1  # 卖盘增强，加分
-                reasons.append("OBI下降趋势")
-            elif obi_trend == "bullish":
-                modifier *= 0.9  # 卖盘减弱，减分
-                reasons.append("OBI上升趋势")
-            
-            # 极端情况：买盘强势且持续增强 -> 完全阻止
-            if obi_avg > 0.5 and obi_trend == "bullish":
-                modifier = 0.0
-                reasons = [f"极端买压(OBI={obi_avg:.2f}, 趋势=bullish)"]
-        
-        reason = ", ".join(reasons) if reasons else "OBI中性"
-        return (modifier, reason)
+        return DeltaSignalModifier.calculate_modifier(snapshot, side, price_change_pct)
     
     def _calculate_tp1_tp2(
         self, entry_price: float, stop_loss: float, side: str, 
@@ -234,7 +233,11 @@ class AlBrooksStrategy:
         - stop_loss, risk_reward_ratio: 风险管理
         - base_height, tp1_price, tp2_price: 止盈目标
         - tight_channel_score: 紧凑通道评分
-        - obi_modifier: OBI调节因子 (>1增强, <1减弱, None未启用)
+        - delta_modifier: Delta调节因子 (>1增强, <1减弱, None未启用)
+          基于动态订单流分析（aggTrade），可识别：
+          - 主动买入/卖出（真实突破）
+          - 流动性撤离（假突破）
+          - 吸收（隐藏大单出货/吸筹）
         """
         data = df.copy()
         data["ema"] = self._compute_ema(data)
@@ -254,7 +257,7 @@ class AlBrooksStrategy:
         tp1_prices: List[Optional[float]] = [None] * len(data)
         tp2_prices: List[Optional[float]] = [None] * len(data)
         tight_channel_scores: List[Optional[float]] = [None] * len(data)
-        obi_modifiers: List[Optional[float]] = [None] * len(data)  # OBI调节因子
+        delta_modifiers: List[Optional[float]] = [None] * len(data)  # Delta调节因子
 
         # Spike 回撤入场状态
         pending_spike: Optional[Tuple[str, str, float, float, float, int]] = None
@@ -378,31 +381,37 @@ class AlBrooksStrategy:
                 if limit_price is not None:
                     pending_spike = (signal_type, side, stop_loss, limit_price, base_height, i)
                 else:
-                    # 增强版 OBI 过滤（使用调节因子）
-                    obi_modifier = 1.0
-                    obi_reason = "OBI未启用"
+                    # 动态订单流 Delta 过滤（替代静态 OBI）
+                    delta_modifier = 1.0
+                    delta_reason = "Delta未启用"
+                    
+                    # 计算 K 线价格变化百分比
+                    kline_open = data.iloc[i]["open"]
+                    price_change_pct = ((close - kline_open) / kline_open * 100) if kline_open > 0 else 0.0
                     
                     if market_state == MarketState.BREAKOUT:
-                        obi_data = await self._get_obi("BTCUSDT")
-                        if obi_data is not None:
-                            obi_modifier, obi_reason = self._calculate_obi_signal_modifier(obi_data, side)
+                        delta_snapshot = await self._get_delta_snapshot("BTCUSDT")
+                        if delta_snapshot is not None and delta_snapshot.trade_count > 0:
+                            delta_modifier, delta_reason = self._calculate_delta_signal_modifier(
+                                delta_snapshot, side, price_change_pct
+                            )
                             
-                            # 只在最新K线打印OBI日志
+                            # 只在最新K线打印Delta日志
                             if is_latest_bar:
-                                if obi_modifier == 0.0:
-                                    logging.info(f"🚫 OBI阻止: {signal_type} {side} - {obi_reason}")
-                                elif obi_modifier < 1.0:
-                                    logging.info(f"⚠️ OBI减弱: {signal_type} {side} (调节={obi_modifier:.2f}) - {obi_reason}")
-                                elif obi_modifier > 1.0:
-                                    logging.info(f"✅ OBI增强: {signal_type} {side} (调节={obi_modifier:.2f}) - {obi_reason}")
+                                if delta_modifier == 0.0:
+                                    logging.info(f"🚫 Delta阻止: {signal_type} {side} - {delta_reason}")
+                                elif delta_modifier < 1.0:
+                                    logging.info(f"⚠️ Delta减弱: {signal_type} {side} (调节={delta_modifier:.2f}) - {delta_reason}")
+                                elif delta_modifier > 1.0:
+                                    logging.info(f"✅ Delta增强: {signal_type} {side} (调节={delta_modifier:.2f}) - {delta_reason}")
                     
-                    if obi_modifier > 0:
+                    if delta_modifier > 0:
                         signals[i] = signal_type
                         sides[i] = side
                         stops[i] = stop_loss
                         base_heights[i] = base_height
                         risk_reward_ratios[i] = 2.0
-                        obi_modifiers[i] = obi_modifier  # 记录OBI调节因子
+                        delta_modifiers[i] = delta_modifier  # 记录Delta调节因子
                         tp1, tp2 = self._calculate_tp1_tp2(close, stop_loss, side, base_height, atr)
                         tp1_prices[i], tp2_prices[i] = tp1, tp2
                         if side == "buy":
@@ -509,6 +518,6 @@ class AlBrooksStrategy:
         data["tp1_price"] = tp1_prices
         data["tp2_price"] = tp2_prices
         data["tight_channel_score"] = tight_channel_scores
-        data["obi_modifier"] = obi_modifiers  # OBI调节因子
+        data["delta_modifier"] = delta_modifiers  # Delta调节因子
         
         return data

@@ -6,9 +6,11 @@
 - 统一使用 SQLAlchemy 处理数据
 - 使用 SQL 聚合函数优化统计查询
 - 移除废弃的 dataclass 转换逻辑
+- 添加并发锁保护内存缓存
 """
 
 import logging
+import threading
 from datetime import datetime
 from typing import Dict, Optional
 from contextlib import contextmanager
@@ -118,8 +120,22 @@ class TradeLogger:
         db_display = self.db_url.split('@')[-1] if '@' in self.db_url else 'localhost'
         logging.info(f"✅ 数据库连接成功: {db_display}")
         
+        # 并发锁（保护内存缓存）
+        self._lock = threading.RLock()
+        
         # 内存缓存
         self.positions: Dict[str, Optional[Trade]] = {}
+        
+        # TP2 订单状态跟踪（实盘模式下，TP1 触发后需要挂 TP2 订单）
+        self._tp2_order_placed: Dict[str, bool] = {}
+        
+        # Al Brooks 追踪止损状态
+        # 格式: {user: {"trailing_stop": float, "max_profit": float, "activated": bool}}
+        self._trailing_stop: Dict[str, Dict] = {}
+        
+        # 追踪止损参数（Al Brooks 理念）
+        self.TRAILING_ACTIVATION_R = 1.0  # 激活追踪止损的盈利倍数（1R = 风险的1倍）
+        self.TRAILING_DISTANCE_R = 0.5    # 追踪距离（0.5R = 风险的一半）
         
         # 冷却期管理
         self.cooldown_until: Dict[str, Optional[int]] = {}
@@ -186,11 +202,7 @@ class TradeLogger:
         market_state: Optional[str] = None,
         tight_channel_score: Optional[float] = None,
     ) -> Trade:
-        """开仓并持久化"""
-        # 已有持仓则先平仓
-        if self.positions.get(user):
-            self.close_position(user, float(entry_price), "manual", "新信号开仓")
-
+        """开仓并持久化（线程安全）"""
         # 将 numpy 类型转换为 Python 原生类型（PostgreSQL 不支持 np.float64）
         entry_price = float(entry_price)
         quantity = float(quantity)
@@ -201,43 +213,58 @@ class TradeLogger:
         tp2_price = float(tp2_price) if tp2_price is not None else None
         tight_channel_score = float(tight_channel_score) if tight_channel_score is not None else None
 
-        with self.session_scope() as session:
-            trade = Trade(
-                user=user,
-                signal=signal,
-                side=side,
-                entry_price=entry_price,
-                quantity=quantity,
-                stop_loss=stop_loss,
-                take_profit=take_profit,
-                status="open",
-                exit_stage=0,
-                tp1_price=tp1_price,
-                tp2_price=tp2_price,
-                remaining_quantity=quantity,
-                breakeven_moved=False,
-                market_state=market_state,
-                tight_channel_score=tight_channel_score,
-                signal_strength=signal_strength,
-            )
+        with self._lock:
+            # 已有持仓则先平仓（注意：close_position 内部也会获取锁，使用 RLock 避免死锁）
+            if self.positions.get(user):
+                self._close_position_unlocked(user, entry_price, "manual", "新信号开仓")
 
-            session.add(trade)
-            session.flush()
-            session.expunge(trade)
+            with self.session_scope() as session:
+                trade = Trade(
+                    user=user,
+                    signal=signal,
+                    side=side,
+                    entry_price=entry_price,
+                    quantity=quantity,
+                    stop_loss=stop_loss,
+                    take_profit=take_profit,
+                    status="open",
+                    exit_stage=0,
+                    tp1_price=tp1_price,
+                    tp2_price=tp2_price,
+                    remaining_quantity=quantity,
+                    breakeven_moved=False,
+                    market_state=market_state,
+                    tight_channel_score=tight_channel_score,
+                    signal_strength=signal_strength,
+                )
 
-            self.positions[user] = trade
+                session.add(trade)
+                session.flush()
+                session.expunge(trade)
 
-            logging.info(
-                f"用户 {user} 开仓 [ID={trade.id}]: {signal} {side} @ {entry_price:.2f}, "
-                f"止损={stop_loss:.2f}, TP1={tp1_price or take_profit:.2f}, TP2={tp2_price or take_profit:.2f}"
-            )
-            
-            return trade
+                self.positions[user] = trade
+                
+                # 重置 TP2 订单标记（新开仓）
+                self._tp2_order_placed[user] = False
+
+                logging.info(
+                    f"用户 {user} 开仓 [ID={trade.id}]: {signal} {side} @ {entry_price:.2f}, "
+                    f"止损={stop_loss:.2f}, TP1={tp1_price or take_profit:.2f}, TP2={tp2_price or take_profit:.2f}"
+                )
+                
+                return trade
 
     def close_position(
         self, user: str, exit_price: float, exit_reason: str, note: str = ""
     ) -> Optional[Trade]:
-        """平仓并持久化"""
+        """平仓并持久化（线程安全）"""
+        with self._lock:
+            return self._close_position_unlocked(user, exit_price, exit_reason, note)
+    
+    def _close_position_unlocked(
+        self, user: str, exit_price: float, exit_reason: str, note: str = ""
+    ) -> Optional[Trade]:
+        """平仓内部方法（需在持有锁的情况下调用）"""
         trade = self.positions.get(user)
         if not trade:
             return None
@@ -289,80 +316,203 @@ class TradeLogger:
             return trade
 
     def check_stop_loss_take_profit(self, user: str, current_price: float) -> Optional[Trade]:
-        """检查止损止盈（支持分批止盈）"""
-        trade = self.positions.get(user)
-        if not trade:
-            return None
-
+        """
+        检查止损止盈（Al Brooks 动态退出模式）
+        
+        Al Brooks 理念：
+        1. 不预挂固定止盈单，通过 K 线监控动态退出
+        2. 使用追踪止损保护利润
+        3. 盈利 1R 后激活追踪止损
+        4. TP1 触发后止损移至入场价（保本）
+        """
         # 将 numpy 类型转换为 Python 原生类型
         current_price = float(current_price)
+        
+        with self._lock:
+            trade = self.positions.get(user)
+            if not trade:
+                return None
 
-        with self.session_scope() as session:
-            # TP1 触发（阶段0 → 1）
-            if trade.exit_stage == 0 and trade.tp1_price:
-                tp1_hit = (trade.side == "buy" and current_price >= trade.tp1_price) or \
-                          (trade.side == "sell" and current_price <= trade.tp1_price)
+            with self.session_scope() as session:
+                # 计算风险（R）= 入场价到止损的距离
+                initial_risk = abs(float(trade.entry_price) - float(trade.stop_loss))
+                if initial_risk == 0:
+                    initial_risk = float(trade.entry_price) * 0.01  # 默认 1%
                 
-                if tp1_hit:
-                    half_qty = trade.quantity * 0.5
-                    trade.remaining_quantity = trade.quantity - half_qty
-                    trade.exit_stage = 1
-                    trade.status = "partial"
-                    trade.stop_loss = trade.entry_price
-                    trade.breakeven_moved = True
-                    
-                    session.merge(trade)
-                    
+                # 计算当前盈利（以 R 为单位）
+                if trade.side == "buy":
+                    current_profit = current_price - float(trade.entry_price)
+                else:
+                    current_profit = float(trade.entry_price) - current_price
+                
+                profit_in_r = current_profit / initial_risk if initial_risk > 0 else 0
+                
+                # ========== Al Brooks 追踪止损逻辑 ==========
+                if user not in self._trailing_stop:
+                    self._trailing_stop[user] = {
+                        "trailing_stop": float(trade.stop_loss),
+                        "max_profit": 0.0,
+                        "activated": False
+                    }
+                
+                ts_state = self._trailing_stop[user]
+                
+                # 更新最大盈利
+                if profit_in_r > ts_state["max_profit"]:
+                    ts_state["max_profit"] = profit_in_r
+                
+                # 激活追踪止损条件：盈利超过 TRAILING_ACTIVATION_R 倍风险
+                if not ts_state["activated"] and profit_in_r >= self.TRAILING_ACTIVATION_R:
+                    ts_state["activated"] = True
+                    # 初始追踪止损 = 入场价 + (当前盈利 - 追踪距离)
+                    trailing_distance = initial_risk * self.TRAILING_DISTANCE_R
                     if trade.side == "buy":
-                        tp1_pnl = (trade.tp1_price - trade.entry_price) * half_qty
+                        ts_state["trailing_stop"] = float(trade.entry_price) + current_profit - trailing_distance
                     else:
-                        tp1_pnl = (trade.entry_price - trade.tp1_price) * half_qty
+                        ts_state["trailing_stop"] = float(trade.entry_price) - current_profit + trailing_distance
                     
                     logging.info(
-                        f"🎯 [{user}] TP1触发！平仓50% @ {trade.tp1_price:.2f}, "
-                        f"盈利={tp1_pnl:.4f}, 止损移至入场价"
+                        f"📈 [{user}] 追踪止损已激活！盈利={profit_in_r:.2f}R, "
+                        f"追踪止损={ts_state['trailing_stop']:.2f}"
                     )
-                    return None
-            
-            # TP2 触发（阶段1 → 2）
-            if trade.exit_stage == 1 and trade.tp2_price:
-                tp2_hit = (trade.side == "buy" and current_price >= trade.tp2_price) or \
-                          (trade.side == "sell" and current_price <= trade.tp2_price)
                 
-                if tp2_hit:
-                    return self.close_position(user, trade.tp2_price, "tp2")
-
-            # Breakeven 逻辑（无 TP1 时）
-            if not trade.tp1_price and not trade.breakeven_moved:
-                risk = abs(trade.entry_price - trade.stop_loss)
+                # 更新追踪止损（只向有利方向移动）
+                if ts_state["activated"]:
+                    trailing_distance = initial_risk * self.TRAILING_DISTANCE_R
+                    if trade.side == "buy":
+                        new_trailing_stop = current_price - trailing_distance
+                        if new_trailing_stop > ts_state["trailing_stop"]:
+                            ts_state["trailing_stop"] = new_trailing_stop
+                            # 同步更新 trade 的止损
+                            trade.stop_loss = new_trailing_stop
+                            session.merge(trade)
+                    else:
+                        new_trailing_stop = current_price + trailing_distance
+                        if new_trailing_stop < ts_state["trailing_stop"]:
+                            ts_state["trailing_stop"] = new_trailing_stop
+                            trade.stop_loss = new_trailing_stop
+                            session.merge(trade)
                 
-                breakeven_hit = (trade.side == "buy" and current_price >= trade.entry_price + risk) or \
-                                (trade.side == "sell" and current_price <= trade.entry_price - risk)
-                
-                if breakeven_hit:
-                    trade.stop_loss = trade.entry_price
-                    trade.breakeven_moved = True
-                    session.merge(trade)
+                # ========== TP1 触发（阶段0 → 1）==========
+                if trade.exit_stage == 0 and trade.tp1_price:
+                    tp1_hit = (trade.side == "buy" and current_price >= float(trade.tp1_price)) or \
+                              (trade.side == "sell" and current_price <= float(trade.tp1_price))
                     
-                    logging.info(f"💡 [{user}] Breakeven触发！止损移至入场价: {trade.entry_price:.2f}")
-
-            # 止损检查
-            stop_hit = (trade.side == "buy" and current_price <= trade.stop_loss) or \
-                       (trade.side == "sell" and current_price >= trade.stop_loss)
-            
-            if stop_hit:
-                reason = "breakeven_stop" if trade.breakeven_moved and trade.stop_loss == trade.entry_price else "stop_loss"
-                return self.close_position(user, trade.stop_loss, reason)
-            
-            # 传统止盈（无 TP1 时）
-            if not trade.tp1_price:
-                tp_hit = (trade.side == "buy" and current_price >= trade.take_profit) or \
-                         (trade.side == "sell" and current_price <= trade.take_profit)
+                    if tp1_hit:
+                        half_qty = float(trade.quantity) * 0.5
+                        trade.remaining_quantity = float(trade.quantity) - half_qty
+                        trade.exit_stage = 1
+                        trade.status = "partial"
+                        trade.stop_loss = float(trade.entry_price)  # 移至入场价（保本）
+                        trade.breakeven_moved = True
+                        
+                        session.merge(trade)
+                        
+                        # 更新追踪止损状态
+                        ts_state["trailing_stop"] = float(trade.entry_price)
+                        ts_state["activated"] = True
+                        
+                        if trade.side == "buy":
+                            tp1_pnl = (float(trade.tp1_price) - float(trade.entry_price)) * half_qty
+                        else:
+                            tp1_pnl = (float(trade.entry_price) - float(trade.tp1_price)) * half_qty
+                        
+                        logging.info(
+                            f"🎯 [{user}] TP1触发！平仓50% @ {float(trade.tp1_price):.2f}, "
+                            f"盈利={tp1_pnl:.4f}, 止损移至入场价（保本）"
+                        )
+                        
+                        # 标记需要通知实盘平仓（如果存在 TP2）
+                        if trade.tp2_price:
+                            self._tp2_order_placed[user] = False
+                        
+                        return None
                 
-                if tp_hit:
-                    return self.close_position(user, trade.take_profit, "take_profit")
+                # ========== TP2 触发（阶段1 → 2）==========
+                if trade.exit_stage == 1 and trade.tp2_price:
+                    tp2_hit = (trade.side == "buy" and current_price >= float(trade.tp2_price)) or \
+                              (trade.side == "sell" and current_price <= float(trade.tp2_price))
+                    
+                    if tp2_hit:
+                        # 清理追踪止损状态
+                        if user in self._trailing_stop:
+                            del self._trailing_stop[user]
+                        return self._close_position_unlocked(user, float(trade.tp2_price), "tp2")
 
-            return None
+                # ========== Breakeven 逻辑（无 TP1 时）==========
+                if not trade.tp1_price and not trade.breakeven_moved:
+                    breakeven_hit = (trade.side == "buy" and current_price >= float(trade.entry_price) + initial_risk) or \
+                                    (trade.side == "sell" and current_price <= float(trade.entry_price) - initial_risk)
+                    
+                    if breakeven_hit:
+                        trade.stop_loss = float(trade.entry_price)
+                        trade.breakeven_moved = True
+                        session.merge(trade)
+                        
+                        # 更新追踪止损状态
+                        ts_state["trailing_stop"] = float(trade.entry_price)
+                        
+                        logging.info(f"💡 [{user}] Breakeven触发！止损移至入场价: {float(trade.entry_price):.2f}")
+
+                # ========== 止损检查（包含追踪止损）==========
+                effective_stop = ts_state["trailing_stop"] if ts_state["activated"] else float(trade.stop_loss)
+                
+                stop_hit = (trade.side == "buy" and current_price <= effective_stop) or \
+                           (trade.side == "sell" and current_price >= effective_stop)
+                
+                if stop_hit:
+                    if ts_state["activated"] and ts_state["max_profit"] > 0:
+                        reason = "trailing_stop"
+                    elif trade.breakeven_moved and float(trade.stop_loss) == float(trade.entry_price):
+                        reason = "breakeven_stop"
+                    else:
+                        reason = "stop_loss"
+                    
+                    # 清理追踪止损状态
+                    if user in self._trailing_stop:
+                        del self._trailing_stop[user]
+                    
+                    return self._close_position_unlocked(user, effective_stop, reason)
+                
+                # ========== 传统止盈（无 TP1 时）==========
+                if not trade.tp1_price:
+                    tp_hit = (trade.side == "buy" and current_price >= float(trade.take_profit)) or \
+                             (trade.side == "sell" and current_price <= float(trade.take_profit))
+                    
+                    if tp_hit:
+                        # 清理追踪止损状态
+                        if user in self._trailing_stop:
+                            del self._trailing_stop[user]
+                        return self._close_position_unlocked(user, float(trade.take_profit), "take_profit")
+
+                return None
+
+    def needs_tp2_order(self, user: str) -> bool:
+        """
+        检查是否需要挂 TP2 订单
+        
+        Returns:
+            bool: True 表示需要挂 TP2 订单
+        """
+        with self._lock:
+            trade = self.positions.get(user)
+            if not trade:
+                return False
+            
+            # 需要挂 TP2 的条件：
+            # 1. TP1 已触发（exit_stage == 1）
+            # 2. 存在 TP2 价格
+            # 3. 尚未挂 TP2 订单
+            if (trade.exit_stage == 1 and trade.tp2_price and 
+                not self._tp2_order_placed.get(user, False)):
+                return True
+            
+            return False
+    
+    def mark_tp2_order_placed(self, user: str):
+        """标记 TP2 订单已挂"""
+        with self._lock:
+            self._tp2_order_placed[user] = True
 
     def increment_kline(self):
         """递增 K 线计数器"""

@@ -39,18 +39,18 @@ class PatternDetector:
         买入信号：收盘价必须在K线顶部25%区域
         卖出信号：收盘价必须在K线底部25%区域
         """
-        high = row["high"]
-        low = row["low"]
-        close = row["close"]
+        high = float(row["high"])
+        low = float(row["low"])
+        close = float(row["close"])
         
         kline_range = high - low
         if kline_range == 0:
             return False
         
         if side == "buy":
-            return (close - low) / kline_range >= 0.75
+            return bool((close - low) / kline_range >= 0.75)
         else:
-            return (high - close) / kline_range >= 0.75
+            return bool((high - close) / kline_range >= 0.75)
     
     @staticmethod
     def calculate_unified_stop_loss(
@@ -434,18 +434,33 @@ class PatternDetector:
         """
         检测 Wedge Reversal（楔形反转，三次推进）
         
-        条件：
-        1. 第1次和第3次推进之间至少相隔15根K线
-        2. 相邻推进间隔至少3根K线
-        3. 实体缩减
-        4. 第3次推进显示疲软
+        Al Brooks 定义：
+        - 三次推进形成收敛的楔形
+        - 每次推进的动能递减（实体缩小）
+        - 第三次推进显示疲软（影线增加）
+        
+        优化条件（适配加密货币市场）：
+        1. 第1次和第3次推进之间至少相隔 8-20 根 K 线（动态调整）
+        2. 相邻推进间隔至少 2 根 K 线
+        3. 实体缩减（第三次 < 第一次）
+        4. 第3次推进显示疲软（阴线或长影线）
         
         返回: (signal_type, side, stop_loss, base_height) 或 None
         """
-        if i < 20:
+        # 动态调整最小间隔：根据 ATR 判断市场波动性
+        # 高波动市场（大 ATR）允许更短的间隔
+        if atr and atr > 0:
+            # 波动性越高，允许的最小间隔越短
+            min_total_span = max(8, min(15, int(300 / atr)))  # 8-15 根 K 线
+            min_leg_span = 2  # 相邻推进至少 2 根
+        else:
+            min_total_span = 12  # 默认值
+            min_leg_span = 2
+        
+        if i < 15:
             return None
         
-        lookback_start = max(0, i - 30)
+        lookback_start = max(0, i - 25)  # 减少回看以更敏感
         recent_data = df.iloc[lookback_start : i + 1]
         
         # 检测 High 3（上升楔形）
@@ -465,9 +480,10 @@ class PatternDetector:
                 if (peak_values[0] < peak_values[1] < peak_values[2] and 
                     (peak_values[1] - peak_values[0]) > (peak_values[2] - peak_values[1])):
                     
-                    if peak_indices[2] - peak_indices[0] < 15:
+                    # 使用动态计算的间隔阈值
+                    if peak_indices[2] - peak_indices[0] < min_total_span:
                         pass
-                    elif peak_indices[1] - peak_indices[0] < 3 or peak_indices[2] - peak_indices[1] < 3:
+                    elif peak_indices[1] - peak_indices[0] < min_leg_span or peak_indices[2] - peak_indices[1] < min_leg_span:
                         pass
                     elif self.compute_body_size(df.iloc[peak_indices[2]]) >= self.compute_body_size(df.iloc[peak_indices[0]]):
                         pass
@@ -504,9 +520,10 @@ class PatternDetector:
                 if (trough_values[0] > trough_values[1] > trough_values[2] and 
                     (trough_values[0] - trough_values[1]) > (trough_values[1] - trough_values[2])):
                     
-                    if trough_indices[2] - trough_indices[0] < 15:
+                    # 使用动态计算的间隔阈值
+                    if trough_indices[2] - trough_indices[0] < min_total_span:
                         pass
-                    elif trough_indices[1] - trough_indices[0] < 3 or trough_indices[2] - trough_indices[1] < 3:
+                    elif trough_indices[1] - trough_indices[0] < min_leg_span or trough_indices[2] - trough_indices[1] < min_leg_span:
                         pass
                     elif self.compute_body_size(df.iloc[trough_indices[2]]) >= self.compute_body_size(df.iloc[trough_indices[0]]):
                         pass
