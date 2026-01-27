@@ -57,27 +57,65 @@ class PatternDetector:
         df: pd.DataFrame, i: int, side: str, entry_price: float, atr: Optional[float] = None
     ) -> float:
         """
-        统一止损计算
+        Al Brooks 风格止损计算（优化版）
         
-        买入：min(前两根K线最低价, 入场价 - 2*ATR)
-        卖出：max(前两根K线最高价, 入场价 + 2*ATR)
+        核心原则：止损放在 Signal Bar（前一根K线）的极值外
+        
+        Al Brooks: "如果市场回到 Signal Bar 之外，说明你的判断错了"
+        
+        优化：
+        1. 止损至少要有 1.5 * ATR 的距离（防止太紧被噪音打出）
+        2. 止损最多 3 * ATR（防止太宽亏损过大）
+        3. 使用前两根 K 线的极值（提供更多缓冲）
         """
         if i < 2:
             return entry_price * (0.98 if side == "buy" else 1.02)
         
-        prev_bar_1 = df.iloc[i - 1]
-        prev_bar_2 = df.iloc[i - 2]
+        signal_bar = df.iloc[i - 1]  # Signal Bar = 前一根 K 线
+        prev_bar = df.iloc[i - 2]    # 前两根 K 线
+        
+        # Buffer = 0.15 * ATR 或最小 0.15%
+        if atr and atr > 0:
+            buffer = atr * 0.15
+        else:
+            buffer = entry_price * 0.0015
         
         if side == "buy":
-            two_bar_low = min(prev_bar_1["low"], prev_bar_2["low"])
+            # 买入：止损在前两根 K 线低点下方（取较低者）
+            two_bar_low = min(signal_bar["low"], prev_bar["low"])
+            signal_bar_stop = two_bar_low - buffer
+            
             if atr and atr > 0:
-                return min(two_bar_low, entry_price - (2 * atr))
-            return two_bar_low
+                # 最小距离：至少 1.5 * ATR
+                min_stop_distance = atr * 1.5
+                min_stop = entry_price - min_stop_distance
+                if signal_bar_stop > min_stop:
+                    signal_bar_stop = min_stop
+                
+                # 最大距离：不超过 3 * ATR
+                max_stop_distance = atr * 3
+                floor_stop = entry_price - max_stop_distance
+                signal_bar_stop = max(signal_bar_stop, floor_stop)
+            
+            return signal_bar_stop
         else:
-            two_bar_high = max(prev_bar_1["high"], prev_bar_2["high"])
+            # 卖出：止损在前两根 K 线高点上方（取较高者）
+            two_bar_high = max(signal_bar["high"], prev_bar["high"])
+            signal_bar_stop = two_bar_high + buffer
+            
             if atr and atr > 0:
-                return max(two_bar_high, entry_price + (2 * atr))
-            return two_bar_high
+                # 最小距离：至少 1.5 * ATR
+                min_stop_distance = atr * 1.5
+                max_stop = entry_price + min_stop_distance
+                if signal_bar_stop < max_stop:
+                    signal_bar_stop = max_stop
+                
+                # 最大距离：不超过 3 * ATR
+                max_stop_distance = atr * 3
+                ceiling_stop = entry_price + max_stop_distance
+                signal_bar_stop = min(signal_bar_stop, ceiling_stop)
+            
+            return signal_bar_stop
     
     def calculate_measured_move(
         self, df: pd.DataFrame, i: int, side: str, 
@@ -150,25 +188,25 @@ class PatternDetector:
         market_state: Optional[MarketState] = None
     ) -> Optional[Tuple[str, str, float, Optional[float], float]]:
         """
-        检测 Strong Spike（强突破入场）
+        检测 Strong Spike（强突破入场）- 优化版
         
-        Al Brooks 核心原则：
+        Al Brooks 核心原则（严格版）：
         1. 严禁在 TRADING_RANGE 中做突破单
-        2. 只在 BREAKOUT/CHANNEL/TIGHT_CHANNEL 状态下交易
-        3. 连续性检查：过去2根K线必须同向
+        2. 只在 BREAKOUT 状态下交易（收紧条件）
+        3. 连续性检查：过去 3 根K线必须同向（从 2 根提高到 3 根）
+        4. 实体大小：当前K线实体 > 3倍平均实体（从 2 倍提高到 3 倍）
+        5. 突破确认：必须突破前 10 根 K 线的高/低点
         
         返回: (signal_type, side, stop_loss, limit_price, base_height) 或 None
         """
-        if i < 2:
+        if i < 10:  # 需要更多历史数据
             return None
         
-        if market_state == MarketState.TRADING_RANGE:
+        # 只在 BREAKOUT 状态下触发（收紧：移除 CHANNEL 和 STRONG_TREND）
+        if market_state not in [MarketState.BREAKOUT]:
             return None
         
-        # STRONG_TREND 中允许顺势 Spike，方向由 strategy.py 过滤
-        if market_state not in [MarketState.BREAKOUT, MarketState.CHANNEL, MarketState.TIGHT_CHANNEL, MarketState.STRONG_TREND]:
-            return None
-        
+        # ===== 条件1: 实体大小（从 2x 提高到 3x）=====
         recent_bodies = [
             self.compute_body_size(df.iloc[j]) for j in range(max(0, i - 10), i)
         ]
@@ -178,7 +216,8 @@ class PatternDetector:
         avg_body = sum(recent_bodies) / len(recent_bodies)
         current_body = self.compute_body_size(df.iloc[i])
         
-        if avg_body == 0 or current_body < avg_body * 2:
+        # 实体阈值从 2x 提高到 3x
+        if avg_body == 0 or current_body < avg_body * 3:
             return None
         
         close = df.iloc[i]["close"]
@@ -186,19 +225,37 @@ class PatternDetector:
         low = df.iloc[i]["low"]
         open_price = df.iloc[i]["open"]
         
-        prev_bar = df.iloc[i - 1]
-        prev_prev_bar = df.iloc[i - 2]
+        # ===== 条件2: 连续同向 K 线（从 2 根提高到 3 根）=====
+        prev_bar_1 = df.iloc[i - 1]
+        prev_bar_2 = df.iloc[i - 2]
+        prev_bar_3 = df.iloc[i - 3]
         
-        # ATR 过滤：Climax 不追涨（优化：阈值从 3.5 降到 2.5）
+        # ATR 过滤：Climax 不追涨
         if atr is not None and atr > 0:
             if (high - low) > atr * 2.5:
                 return None
+        
+        # ===== 条件3: 突破前 10 根 K 线的高/低点 =====
+        lookback_highs = [df.iloc[j]["high"] for j in range(max(0, i - 10), i)]
+        lookback_lows = [df.iloc[j]["low"] for j in range(max(0, i - 10), i)]
+        max_lookback_high = max(lookback_highs) if lookback_highs else high
+        min_lookback_low = min(lookback_lows) if lookback_lows else low
         
         # 向上突破
         if close > ema and close > open_price:
             body_ratio = (close - low) / (high - low) if (high - low) > 0 else 0
             if body_ratio > 0.8:
-                if not (prev_bar["close"] > prev_bar["open"] and prev_prev_bar["close"] > prev_prev_bar["open"]):
+                # 检查连续 3 根同向 K 线
+                is_consecutive_bullish = (
+                    prev_bar_1["close"] > prev_bar_1["open"] and
+                    prev_bar_2["close"] > prev_bar_2["open"] and
+                    prev_bar_3["close"] > prev_bar_3["open"]
+                )
+                if not is_consecutive_bullish:
+                    return None
+                
+                # 必须突破前 10 根 K 线的最高点
+                if high <= max_lookback_high:
                     return None
                 
                 stop_loss = self.calculate_unified_stop_loss(df, i, "buy", close, atr)
@@ -206,8 +263,8 @@ class PatternDetector:
                 
                 distance_from_ema = abs(close - ema)
                 if atr is not None and atr > 0 and distance_from_ema > atr * 3:
-                    prev_body_mid = (prev_bar["open"] + prev_bar["close"]) / 2
-                    limit_price = max(prev_body_mid, prev_bar["close"])
+                    prev_body_mid = (prev_bar_1["open"] + prev_bar_1["close"]) / 2
+                    limit_price = max(prev_body_mid, prev_bar_1["close"])
                     return ("Spike_Buy", "buy", stop_loss, limit_price, base_height)
                 
                 return ("Spike_Buy", "buy", stop_loss, None, base_height)
@@ -216,7 +273,17 @@ class PatternDetector:
         elif close < ema and close < open_price:
             body_ratio = (high - close) / (high - low) if (high - low) > 0 else 0
             if body_ratio > 0.8:
-                if not (prev_bar["close"] < prev_bar["open"] and prev_prev_bar["close"] < prev_prev_bar["open"]):
+                # 检查连续 3 根同向 K 线
+                is_consecutive_bearish = (
+                    prev_bar_1["close"] < prev_bar_1["open"] and
+                    prev_bar_2["close"] < prev_bar_2["open"] and
+                    prev_bar_3["close"] < prev_bar_3["open"]
+                )
+                if not is_consecutive_bearish:
+                    return None
+                
+                # 必须突破前 10 根 K 线的最低点
+                if low >= min_lookback_low:
                     return None
                 
                 stop_loss = self.calculate_unified_stop_loss(df, i, "sell", close, atr)
@@ -224,8 +291,8 @@ class PatternDetector:
                 
                 distance_from_ema = abs(ema - close)
                 if atr is not None and atr > 0 and distance_from_ema > atr * 3:
-                    prev_body_mid = (prev_bar["open"] + prev_bar["close"]) / 2
-                    limit_price = min(prev_body_mid, prev_bar["close"])
+                    prev_body_mid = (prev_bar_1["open"] + prev_bar_1["close"]) / 2
+                    limit_price = min(prev_body_mid, prev_bar_1["close"])
                     return ("Spike_Sell", "sell", stop_loss, limit_price, base_height)
                 
                 return ("Spike_Sell", "sell", stop_loss, None, base_height)

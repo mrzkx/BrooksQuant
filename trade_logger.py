@@ -142,9 +142,10 @@ class TradeLogger:
         # 格式: {user: {"trailing_stop": float, "max_profit": float, "activated": bool}}
         self._trailing_stop: Dict[str, Dict] = {}
         
-        # 追踪止损参数（Al Brooks 理念）
-        self.TRAILING_ACTIVATION_R = 1.0  # 激活追踪止损的盈利倍数（1R = 风险的1倍）
-        self.TRAILING_DISTANCE_R = 0.5    # 追踪距离（0.5R = 风险的一半）
+        # 追踪止损参数（Al Brooks 理念优化）
+        # Al Brooks: "让利润奔跑，但要保护已有利润"
+        self.TRAILING_ACTIVATION_R = 0.8  # 激活阈值：盈利 0.8R 时激活（提前保护）
+        self.TRAILING_DISTANCE_R = 0.5    # 追踪距离：保护盈利的一半（0.5R）
         
         # 冷却期管理
         self.cooldown_until: Dict[str, Optional[int]] = {}

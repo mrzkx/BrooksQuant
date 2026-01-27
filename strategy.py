@@ -19,7 +19,7 @@ Al Brooks 价格行为策略 - 核心入口
 import json
 import logging
 import pandas as pd
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 
 import redis.asyncio as aioredis
 
@@ -40,7 +40,7 @@ from delta_flow import (
 
 class AlBrooksStrategy:
     """
-    Al Brooks 价格行为策略（异步版本）
+    Al Brooks 价格行为策略（异步版本）- 优化版
     
     通过组合各模块实现完整的交易信号生成
     
@@ -48,6 +48,11 @@ class AlBrooksStrategy:
     - 使用动态订单流 Delta 分析（基于 aggTrade）替代静态 OBI
     - Delta 分析能够区分：主动买入、主动卖出、流动性撤离、吸收
     - Delta 窗口与 K 线周期对齐，确保信号同步
+    
+    优化措施：
+    - 信号冷却期：同一类型信号至少间隔 5 根 K 线
+    - 严格逆势过滤：StrongTrend 中完全禁止逆势交易
+    - 收紧 Spike 条件：3 根同向 K 线 + 3 倍平均实体 + 突破确认
     """
 
     def __init__(
@@ -65,6 +70,10 @@ class AlBrooksStrategy:
         self.market_analyzer = MarketAnalyzer(ema_period=ema_period)
         self.pattern_detector = PatternDetector(lookback_period=lookback_period)
         
+        # 信号冷却期管理（同一类型信号至少间隔 5 根 K 线）
+        self.SIGNAL_COOLDOWN_BARS = 5
+        self._last_signal_bar: Dict[str, int] = {}  # {"Spike_Buy": 100, "Spike_Sell": 95, ...}
+        
         # Redis 客户端（用于 Delta 数据缓存，可选）
         self.redis_client: Optional[aioredis.Redis] = None
         self.redis_url = redis_url
@@ -72,6 +81,17 @@ class AlBrooksStrategy:
         
         # Delta 分析器（从全局获取，与 aggtrade_worker 共享，窗口与 K 线周期对齐）
         self.delta_analyzer: DeltaAnalyzer = get_delta_analyzer(kline_interval=kline_interval)
+    
+    def _is_signal_in_cooldown(self, signal_type: str, current_bar: int) -> bool:
+        """检查信号是否在冷却期内"""
+        last_bar = self._last_signal_bar.get(signal_type)
+        if last_bar is None:
+            return False
+        return (current_bar - last_bar) < self.SIGNAL_COOLDOWN_BARS
+    
+    def _update_signal_cooldown(self, signal_type: str, current_bar: int) -> None:
+        """更新信号冷却期记录"""
+        self._last_signal_bar[signal_type] = current_bar
     
     async def connect_redis(self) -> bool:
         """异步连接 Redis（可选，用于 Delta 数据缓存）"""
@@ -195,30 +215,77 @@ class AlBrooksStrategy:
         """
         return DeltaSignalModifier.calculate_modifier(snapshot, side, price_change_pct)
     
+    # Al Brooks 风格：根据信号类型的动态盈亏比
+    # 高胜率信号用较低盈亏比，低胜率信号需要更高盈亏比
+    SIGNAL_RR_RATIO = {
+        # Spike 信号：低胜率（40-50%），需要高盈亏比
+        "Spike_Buy": {"tp1_r": 1.0, "tp2_r": 2.5},
+        "Spike_Sell": {"tp1_r": 1.0, "tp2_r": 2.5},
+        
+        # FailedBreakout：高胜率（60-70%），可用较低盈亏比
+        "FailedBreakout_Buy": {"tp1_r": 0.8, "tp2_r": 1.5},
+        "FailedBreakout_Sell": {"tp1_r": 0.8, "tp2_r": 1.5},
+        
+        # Climax 反转：低胜率（35-45%），需要高盈亏比
+        "Climax_Buy": {"tp1_r": 1.2, "tp2_r": 3.0},
+        "Climax_Sell": {"tp1_r": 1.2, "tp2_r": 3.0},
+        
+        # Wedge 反转：中等胜率（40-50%）
+        "Wedge_Buy": {"tp1_r": 1.0, "tp2_r": 2.5},
+        "Wedge_Sell": {"tp1_r": 1.0, "tp2_r": 2.5},
+        
+        # H2/L2 回调：中高胜率（50-60%）
+        "H2_Buy": {"tp1_r": 0.8, "tp2_r": 2.0},
+        "L2_Sell": {"tp1_r": 0.8, "tp2_r": 2.0},
+        "H1_Buy": {"tp1_r": 0.8, "tp2_r": 1.8},
+        "L1_Sell": {"tp1_r": 0.8, "tp2_r": 1.8},
+    }
+    
+    # 默认盈亏比
+    DEFAULT_RR = {"tp1_r": 1.0, "tp2_r": 2.0}
+    
     def _calculate_tp1_tp2(
         self, entry_price: float, stop_loss: float, side: str, 
-        base_height: float, atr: Optional[float] = None
+        base_height: float, atr: Optional[float] = None,
+        signal_type: Optional[str] = None
     ) -> Tuple[float, float]:
         """
-        计算分批止盈目标位
+        Al Brooks 风格分批止盈目标位
         
-        TP1: 1R 距离（50% 仓位）
-        TP2: Measured Move 或 2R（剩余 50%）
+        根据信号类型动态调整盈亏比：
+        - 高胜率信号（FailedBreakout, H2/L2）：较低盈亏比（1:1.5 ~ 1:2）
+        - 低胜率信号（Spike, Climax）：较高盈亏比（1:2.5 ~ 1:3）
+        
+        TP1: 部分止盈，同时止损移至入场价（保本）
+        TP2: 最终目标，结合 Measured Move
         """
         risk = abs(entry_price - stop_loss)
         
+        # 获取该信号类型的盈亏比
+        rr_config = self.SIGNAL_RR_RATIO.get(signal_type, self.DEFAULT_RR)
+        tp1_multiplier = rr_config["tp1_r"]
+        tp2_multiplier = rr_config["tp2_r"]
+        
         if side == "buy":
-            tp1 = entry_price + risk
-            measured_move = entry_price + base_height if base_height > 0 else entry_price + (risk * 2)
-            tp2 = max(measured_move, entry_price + (risk * 2))
-            if base_height < risk * 1.5:
-                tp2 = max(tp2, entry_price + (risk * 3))
+            tp1 = entry_price + (risk * tp1_multiplier)
+            
+            # TP2: 取 Measured Move 和 R 倍数中较大者
+            measured_move = entry_price + base_height if base_height > 0 else entry_price + (risk * tp2_multiplier)
+            tp2 = max(measured_move, entry_price + (risk * tp2_multiplier))
+            
+            # 如果 base_height 太小，使用更保守的目标
+            if base_height > 0 and base_height < risk * 1.5:
+                tp2 = max(tp2, entry_price + (risk * (tp2_multiplier + 0.5)))
         else:
-            tp1 = entry_price - risk
-            measured_move = entry_price - base_height if base_height > 0 else entry_price - (risk * 2)
-            tp2 = min(measured_move, entry_price - (risk * 2))
-            if base_height < risk * 1.5:
-                tp2 = min(tp2, entry_price - (risk * 3))
+            tp1 = entry_price - (risk * tp1_multiplier)
+            
+            # TP2: 取 Measured Move 和 R 倍数中较大者
+            measured_move = entry_price - base_height if base_height > 0 else entry_price - (risk * tp2_multiplier)
+            tp2 = min(measured_move, entry_price - (risk * tp2_multiplier))
+            
+            # 如果 base_height 太小，使用更保守的目标
+            if base_height > 0 and base_height < risk * 1.5:
+                tp2 = min(tp2, entry_price - (risk * (tp2_multiplier + 0.5)))
         
         return (tp1, tp2)
 
@@ -317,7 +384,7 @@ class AlBrooksStrategy:
                     stops[i] = stop_loss
                     base_heights[i] = base_height
                     risk_reward_ratios[i] = 2.0
-                    tp1, tp2 = self._calculate_tp1_tp2(limit_price, stop_loss, side, base_height, atr)
+                    tp1, tp2 = self._calculate_tp1_tp2(limit_price, stop_loss, side, base_height, atr, signal_type)
                     tp1_prices[i], tp2_prices[i] = tp1, tp2
                     pending_spike = None
                     h2_machine.set_strong_trend()
@@ -328,7 +395,7 @@ class AlBrooksStrategy:
                     stops[i] = stop_loss
                     base_heights[i] = base_height
                     risk_reward_ratios[i] = 2.0
-                    tp1, tp2 = self._calculate_tp1_tp2(limit_price, stop_loss, side, base_height, atr)
+                    tp1, tp2 = self._calculate_tp1_tp2(limit_price, stop_loss, side, base_height, atr, signal_type)
                     tp1_prices[i], tp2_prices[i] = tp1, tp2
                     pending_spike = None
                     l2_machine.set_strong_trend()
@@ -359,7 +426,7 @@ class AlBrooksStrategy:
                     stops[i] = stop_loss
                     base_heights[i] = base_height
                     risk_reward_ratios[i] = 1.0
-                    tp1, tp2 = self._calculate_tp1_tp2(close, stop_loss, side, base_height, atr)
+                    tp1, tp2 = self._calculate_tp1_tp2(close, stop_loss, side, base_height, atr, signal_type)
                     tp1_prices[i], tp2_prices[i] = tp1, tp2
                     continue
 
@@ -368,6 +435,24 @@ class AlBrooksStrategy:
             spike_result = self.pattern_detector.detect_strong_spike(data, i, ema, atr, market_state)
             if spike_result:
                 signal_type, side, stop_loss, limit_price, base_height = spike_result
+                
+                # ⭐ 新增：信号冷却期检查（同一类型信号至少间隔 5 根 K 线）
+                if self._is_signal_in_cooldown(signal_type, i):
+                    if is_latest_bar:
+                        logging.debug(f"⏳ 信号冷却中: {signal_type} (需间隔 {self.SIGNAL_COOLDOWN_BARS} 根K线)")
+                    continue
+                
+                # ⭐ 新增：严格逆势过滤 - StrongTrend 中完全禁止逆势
+                # 即使趋势强度不足 0.7，只要是 StrongTrend 状态也禁止
+                if market_state == MarketState.STRONG_TREND:
+                    if trend_direction == "up" and side == "sell":
+                        if is_latest_bar:
+                            logging.info(f"🚫 StrongTrend禁止做空: {signal_type} - 上涨趋势中禁止卖出")
+                        continue
+                    if trend_direction == "down" and side == "buy":
+                        if is_latest_bar:
+                            logging.info(f"🚫 StrongTrend禁止做多: {signal_type} - 下跌趋势中禁止买入")
+                        continue
                 
                 # 检查是否符合允许的方向
                 if allowed_side is not None and side != allowed_side:
@@ -412,8 +497,10 @@ class AlBrooksStrategy:
                         base_heights[i] = base_height
                         risk_reward_ratios[i] = 2.0
                         delta_modifiers[i] = delta_modifier  # 记录Delta调节因子
-                        tp1, tp2 = self._calculate_tp1_tp2(close, stop_loss, side, base_height, atr)
+                        tp1, tp2 = self._calculate_tp1_tp2(close, stop_loss, side, base_height, atr, signal_type)
                         tp1_prices[i], tp2_prices[i] = tp1, tp2
+                        # 更新信号冷却期
+                        self._update_signal_cooldown(signal_type, i)
                         if side == "buy":
                             h2_machine.set_strong_trend()
                         else:
@@ -445,7 +532,7 @@ class AlBrooksStrategy:
                     stops[i] = stop_loss
                     base_heights[i] = base_height
                     risk_reward_ratios[i] = 2.0
-                    tp1, tp2 = self._calculate_tp1_tp2(close, stop_loss, side, base_height, atr)
+                    tp1, tp2 = self._calculate_tp1_tp2(close, stop_loss, side, base_height, atr, signal_type)
                     tp1_prices[i], tp2_prices[i] = tp1, tp2
                     continue
 
@@ -473,7 +560,7 @@ class AlBrooksStrategy:
                     stops[i] = stop_loss
                     base_heights[i] = base_height
                     risk_reward_ratios[i] = 2.0
-                    tp1, tp2 = self._calculate_tp1_tp2(close, stop_loss, side, base_height, atr)
+                    tp1, tp2 = self._calculate_tp1_tp2(close, stop_loss, side, base_height, atr, signal_type)
                     tp1_prices[i], tp2_prices[i] = tp1, tp2
                     continue
 
@@ -490,7 +577,7 @@ class AlBrooksStrategy:
                     stops[i] = h2_signal.stop_loss
                     base_heights[i] = h2_signal.base_height
                     risk_reward_ratios[i] = 2.0
-                    tp1, tp2 = self._calculate_tp1_tp2(close, h2_signal.stop_loss, h2_signal.side, h2_signal.base_height, atr)
+                    tp1, tp2 = self._calculate_tp1_tp2(close, h2_signal.stop_loss, h2_signal.side, h2_signal.base_height, atr, h2_signal.signal_type)
                     tp1_prices[i], tp2_prices[i] = tp1, tp2
 
             # ⭐ L2 是顺势做空信号，在强趋势中只在下降趋势允许
@@ -505,7 +592,7 @@ class AlBrooksStrategy:
                     stops[i] = l2_signal.stop_loss
                     base_heights[i] = l2_signal.base_height
                     risk_reward_ratios[i] = 2.0
-                    tp1, tp2 = self._calculate_tp1_tp2(close, l2_signal.stop_loss, l2_signal.side, l2_signal.base_height, atr)
+                    tp1, tp2 = self._calculate_tp1_tp2(close, l2_signal.stop_loss, l2_signal.side, l2_signal.base_height, atr, l2_signal.signal_type)
                     tp1_prices[i], tp2_prices[i] = tp1, tp2
 
         # 写入结果

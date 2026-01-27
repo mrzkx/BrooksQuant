@@ -7,6 +7,7 @@
 
 import asyncio
 import logging
+from decimal import Decimal, ROUND_DOWN
 from typing import Dict, Optional
 
 from config import LEVERAGE, SYMBOL as CONFIG_SYMBOL
@@ -14,6 +15,32 @@ from trade_logger import TradeLogger
 from user_manager import TradingUser
 
 SYMBOL = CONFIG_SYMBOL
+
+
+def round_quantity_to_step_size(quantity: float, step_size: float = 0.001) -> float:
+    """
+    将数量按 stepSize 截断（向下取整）
+    
+    BTCUSDT 的 stepSize = 0.001，所以数量必须是 0.001 的整数倍
+    
+    Args:
+        quantity: 原始数量
+        step_size: 步长（默认 0.001）
+    
+    Returns:
+        按步长截断后的数量
+    """
+    if step_size <= 0:
+        step_size = 0.001
+    
+    # 使用 Decimal 确保精度
+    qty_decimal = Decimal(str(quantity))
+    step_decimal = Decimal(str(step_size))
+    
+    # 向下取整到最近的 step_size
+    rounded = (qty_decimal / step_decimal).quantize(Decimal('1'), rounding=ROUND_DOWN) * step_decimal
+    
+    return max(float(rounded), step_size)  # 确保至少是最小数量
 
 
 async def execute_observe_order(
@@ -287,7 +314,8 @@ async def handle_close_request(
             # TP1触发：执行50%平仓并更新止损
             logging.info(f"[{user.name}] 🎯 执行TP1: 平仓50%")
             
-            tp1_qty = close_request["close_quantity"]
+            # 按 stepSize 截断数量（修复精度问题）
+            tp1_qty = round_quantity_to_step_size(close_request["close_quantity"])
             await user.close_position_market(
                 symbol=SYMBOL,
                 side=close_request["side"],
@@ -304,14 +332,15 @@ async def handle_close_request(
             await user.cancel_all_orders(SYMBOL)
             
             # 设置新的止损单（保本价）
-            remaining_qty = close_request["remaining_quantity"]
+            # 按 stepSize 截断数量（修复精度问题）
+            remaining_qty = round_quantity_to_step_size(close_request["remaining_quantity"])
             stop_side = "SELL" if close_request["side"] == "buy" else "BUY"
             
             try:
                 await user.create_stop_market_order(
                     symbol=SYMBOL,
                     side=stop_side,
-                    quantity=float(remaining_qty),
+                    quantity=remaining_qty,
                     stop_price=round(close_request["new_stop_loss"], 2),
                     reduce_only=True,
                 )
@@ -325,10 +354,11 @@ async def handle_close_request(
             # 挂TP2止盈单
             if close_request.get("tp2_price"):
                 try:
+                    # remaining_qty 已经被截断，直接使用
                     await user.create_take_profit_market_order(
                         symbol=SYMBOL,
                         side=stop_side,
-                        quantity=float(remaining_qty),
+                        quantity=remaining_qty,
                         stop_price=round(close_request["tp2_price"], 2),
                         reduce_only=True,
                     )
@@ -345,10 +375,12 @@ async def handle_close_request(
             # 完全平仓
             logging.info(f"[{user.name}] 🔴 执行平仓: {close_request}")
             
+            # 按 stepSize 截断数量（修复精度问题）
+            close_qty = round_quantity_to_step_size(close_request["quantity"])
             await user.close_position_market(
                 symbol=SYMBOL,
                 side=close_request["side"],
-                quantity=close_request["quantity"],
+                quantity=close_qty,
             )
             
             logging.info(
