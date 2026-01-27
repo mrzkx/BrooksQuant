@@ -6,7 +6,14 @@ from typing import Any, Dict, Optional
 
 from binance import AsyncClient
 
-from config import UserCredentials, create_async_client_for_user
+from config import (
+    UserCredentials, 
+    create_async_client_for_user,
+    LARGE_BALANCE_THRESHOLD,
+    LARGE_BALANCE_POSITION_PCT,
+    POSITION_SIZE_PERCENT,
+    LEVERAGE,
+)
 
 
 class TradingUser:
@@ -16,14 +23,14 @@ class TradingUser:
     实盘功能：
     - 获取合约账户余额
     - 设置杠杆倍数
-    - 动态仓位计算
+    - 动态仓位计算（基于 .env 配置）
     """
 
-    # 仓位配置常量
-    SMALL_ACCOUNT_THRESHOLD = 1000.0  # 小资金阈值（USDT）
-    SMALL_ACCOUNT_POSITION_PCT = 100.0  # 小资金仓位比例（100%）
-    LARGE_ACCOUNT_POSITION_PCT = 20.0   # 大资金仓位比例（20%）
-    DEFAULT_LEVERAGE = 20  # 默认杠杆倍数
+    # 仓位配置从 config.py 导入（可通过 .env 配置）
+    SMALL_ACCOUNT_THRESHOLD = LARGE_BALANCE_THRESHOLD  # 小资金阈值（USDT）
+    SMALL_ACCOUNT_POSITION_PCT = POSITION_SIZE_PERCENT  # 小资金仓位比例
+    LARGE_ACCOUNT_POSITION_PCT = LARGE_BALANCE_POSITION_PCT  # 大资金仓位比例
+    DEFAULT_LEVERAGE = LEVERAGE  # 默认杠杆倍数
 
     def __init__(self, name: str, credentials: UserCredentials):
         self.name = name
@@ -656,7 +663,7 @@ class TradingUser:
         side: str, 
         slippage_pct: float = 0.05,
         symbol: str = "BTCUSDT",
-        atr: float = None,
+        atr: Optional[float] = None,
     ) -> float:
         """
         计算限价单价格（带滑点容忍度，符合 tickSize 规则）

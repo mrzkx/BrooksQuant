@@ -16,6 +16,8 @@ from config import (
     LEVERAGE,
     SYMBOL as CONFIG_SYMBOL,
     KLINE_INTERVAL,
+    LARGE_BALANCE_THRESHOLD,
+    LARGE_BALANCE_POSITION_PCT,
 )
 
 # 交易参数
@@ -36,22 +38,53 @@ KLINE_INTERVAL_MS = {
 }
 
 
-def calculate_order_quantity(current_price: float) -> float:
+def get_position_size_percent(balance: float) -> float:
+    """
+    根据资金量动态计算仓位百分比（可通过 .env 配置）
+    
+    规则：
+    - 余额 <= LARGE_BALANCE_THRESHOLD: 使用 POSITION_SIZE_PERCENT（小资金仓位）
+    - 余额 > LARGE_BALANCE_THRESHOLD: 使用 LARGE_BALANCE_POSITION_PCT（大资金仓位）
+    
+    Returns:
+        float: 仓位百分比（0-100）
+    """
+    if balance <= LARGE_BALANCE_THRESHOLD:
+        return POSITION_SIZE_PERCENT
+    else:
+        return LARGE_BALANCE_POSITION_PCT
+
+
+def calculate_order_quantity(current_price: float, balance: float = None) -> float:
     """
     计算下单数量（仅用于观察模式）
     
-    ⚠️ 注意：此函数仅用于观察模式，使用配置文件中的 OBSERVE_BALANCE
+    ⚠️ 注意：此函数仅用于观察模式
     实盘模式下使用 TradingUser.calculate_order_quantity()
     
+    动态仓位规则（可通过 .env 配置）：
+    - 余额 <= LARGE_BALANCE_THRESHOLD: 使用 POSITION_SIZE_PERCENT
+    - 余额 > LARGE_BALANCE_THRESHOLD: 使用 LARGE_BALANCE_POSITION_PCT
+    
     公式: 下单数量 = (总资金 × 仓位百分比 × 杠杆) / 当前价格
+    
+    Args:
+        current_price: 当前价格
+        balance: 账户余额（默认使用 OBSERVE_BALANCE）
     
     返回: BTC 数量（保留3位小数）
     """
     if current_price <= 0:
         return 0.001  # 默认最小值
     
+    # 使用传入的余额或默认的观察模式余额
+    actual_balance = balance if balance is not None else OBSERVE_BALANCE
+    
+    # 动态仓位百分比
+    position_pct = get_position_size_percent(actual_balance)
+    
     # 开仓金额 = 总资金 × 仓位百分比
-    position_value = OBSERVE_BALANCE * (POSITION_SIZE_PERCENT / 100)
+    position_value = actual_balance * (position_pct / 100)
     
     # 实际购买力 = 开仓金额 × 杠杆
     buying_power = position_value * LEVERAGE

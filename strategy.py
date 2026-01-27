@@ -26,7 +26,7 @@ import redis.asyncio as aioredis
 # 导入模块化组件
 from logic.market_analyzer import MarketState, MarketAnalyzer
 from logic.patterns import PatternDetector
-from logic.state_machines import HState, LState, H2StateMachine, L2StateMachine
+from logic.state_machines import H2StateMachine, L2StateMachine
 from logic.interval_params import get_interval_params, IntervalParams
 from logic.htf_filter import get_htf_filter, HTFFilter, HTFTrend
 from logic.talib_patterns import (
@@ -378,35 +378,30 @@ class AlBrooksStrategy:
                 tp2_multiplier = max(tp2_multiplier, 1.2)  # 最低 RR 1.2:1
                 logging.debug(f"📦 TradingRange: TP2 限制在区间边缘 {tp2_multiplier:.1f}R")
         
-        # ========== 计算 TP1 和 TP2 ==========
-        if side == "buy":
-            tp1 = entry_price + (risk * tp1_multiplier)
-            
-            # TP2: 取 Measured Move 和 R 倍数中较大者
-            measured_move = entry_price + base_height if base_height > 0 else entry_price + (risk * tp2_multiplier)
-            tp2 = max(measured_move, entry_price + (risk * tp2_multiplier))
-            
-            # TradingRange 时强制限制
-            if market_state == "TradingRange" and base_height > 0:
-                tp2 = min(tp2, entry_price + base_height)
-            
-            # 如果 base_height 太小，使用更保守的目标
-            if base_height > 0 and base_height < risk * 1.5 and market_state != "TradingRange":
-                tp2 = max(tp2, entry_price + (risk * (tp2_multiplier + 0.5)))
-        else:
-            tp1 = entry_price - (risk * tp1_multiplier)
-            
-            # TP2: 取 Measured Move 和 R 倍数中较大者
-            measured_move = entry_price - base_height if base_height > 0 else entry_price - (risk * tp2_multiplier)
-            tp2 = min(measured_move, entry_price - (risk * tp2_multiplier))
-            
-            # TradingRange 时强制限制
-            if market_state == "TradingRange" and base_height > 0:
-                tp2 = max(tp2, entry_price - base_height)
-            
-            # 如果 base_height 太小，使用更保守的目标
-            if base_height > 0 and base_height < risk * 1.5 and market_state != "TradingRange":
-                tp2 = min(tp2, entry_price - (risk * (tp2_multiplier + 0.5)))
+        # ========== 计算 TP1 和 TP2（使用方向因子消除重复）==========
+        # 方向因子：buy = +1, sell = -1
+        direction = 1 if side == "buy" else -1
+        
+        # TP1 计算
+        tp1 = entry_price + direction * (risk * tp1_multiplier)
+        
+        # TP2: 取 Measured Move 和 R 倍数中较有利者
+        measured_move = entry_price + direction * base_height if base_height > 0 else entry_price + direction * (risk * tp2_multiplier)
+        r_based_tp2 = entry_price + direction * (risk * tp2_multiplier)
+        
+        # buy 取 max（更远的目标），sell 取 min（更远的目标）
+        tp2 = max(measured_move, r_based_tp2) if side == "buy" else min(measured_move, r_based_tp2)
+        
+        # TradingRange 时强制限制在区间边缘
+        if market_state == "TradingRange" and base_height > 0:
+            range_limit = entry_price + direction * base_height
+            # buy 取 min（不超过上边缘），sell 取 max（不超过下边缘）
+            tp2 = min(tp2, range_limit) if side == "buy" else max(tp2, range_limit)
+        
+        # 如果 base_height 太小，使用更保守的目标
+        if base_height > 0 and base_height < risk * 1.5 and market_state != "TradingRange":
+            conservative_tp2 = entry_price + direction * (risk * (tp2_multiplier + 0.5))
+            tp2 = max(tp2, conservative_tp2) if side == "buy" else min(tp2, conservative_tp2)
         
         return (tp1, tp2, tp1_close_ratio, is_climax)
 

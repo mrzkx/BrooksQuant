@@ -21,10 +21,6 @@ import asyncio
 import logging
 import os
 
-# 注意：BinanceSocketManager 队列大小需要在创建实例时通过 max_queue_size 参数设置
-# 类属性设置在新版 binance 库中无效，已在 delta_flow.py 和 kline_producer.py 中修复
-from binance import BinanceSocketManager
-
 from config import (
     load_user_credentials, 
     REDIS_URL,

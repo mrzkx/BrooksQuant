@@ -10,7 +10,7 @@ Al Brooks H2/L2 回调策略：
 
 import pandas as pd
 from enum import Enum
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional
 from dataclasses import dataclass
 
 

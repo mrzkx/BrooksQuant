@@ -14,7 +14,7 @@ Al Brooks 核心市场状态：
 import logging
 import pandas as pd
 from enum import Enum
-from typing import Optional, Tuple
+from typing import Optional
 
 from .interval_params import get_interval_params, IntervalParams
 

@@ -24,8 +24,8 @@ import logging
 import json
 import time
 from collections import deque
-from dataclasses import dataclass, field
-from typing import Optional, Tuple, Dict, List
+from dataclasses import dataclass
+from typing import Optional, Tuple, List
 from enum import Enum
 
 import numpy as np
@@ -527,27 +527,6 @@ class DeltaAnalyzer:
                 is_withdrawal = True
         
         return (is_climax_buy, is_climax_sell, is_absorption, is_withdrawal)
-    
-    # ========== 兼容旧版本的方法 ==========
-    def _determine_trend(self, delta_ratio: float, acceleration: float) -> DeltaTrend:
-        """确定 Delta 趋势方向（兼容旧版本）"""
-        return self._determine_trend_enhanced(delta_ratio, acceleration, 0.0, 1.0)
-    
-    def _detect_anomalies(
-        self, buy_vol: float, sell_vol: float, price_change_pct: float, total_vol: float
-    ) -> Tuple[bool, bool, bool]:
-        """检测异常模式（兼容旧版本）"""
-        delta_ratio = (buy_vol - sell_vol) / total_vol if total_vol > 0 else 0.0
-        is_climax_buy, is_climax_sell, is_absorption, _ = self._detect_anomalies_enhanced(
-            buy_vol, sell_vol, price_change_pct, total_vol, delta_ratio
-        )
-        return (is_climax_buy, is_climax_sell, is_absorption)
-    
-    def _cleanup_old_trades(self, current_ts_ms: int):
-        """清理过期数据（兼容旧版本，但不推荐直接调用）"""
-        cutoff = current_ts_ms - (self.WINDOW_SECONDS * 1000)
-        while self._trades and self._trades[0][0] < cutoff:
-            self._trades.popleft()
 
 
 class DeltaSignalModifier:

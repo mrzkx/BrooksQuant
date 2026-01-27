@@ -197,22 +197,36 @@ def get_trading_config() -> dict:
     
     环境变量：
     - OBSERVE_BALANCE: 观察模式的模拟总资金（USDT），默认 10000
-    - POSITION_SIZE_PERCENT: 开仓使用资金百分比，默认 20（即 20%）
+    - POSITION_SIZE_PERCENT: 开仓使用资金百分比（小资金时），默认 100（即 100%）
     - LEVERAGE: 杠杆倍数，默认 20
     - SYMBOL: 交易对，默认 BTCUSDT
     - INTERVAL: K线周期，默认 5m
+    
+    动态仓位配置（资金管理）：
+    - LARGE_BALANCE_THRESHOLD: 大资金阈值（USDT），默认 1000
+    - LARGE_BALANCE_POSITION_PCT: 大资金时的仓位百分比，默认 50（即 50%）
+    
+    规则：
+    - 余额 <= LARGE_BALANCE_THRESHOLD: 使用 POSITION_SIZE_PERCENT
+    - 余额 > LARGE_BALANCE_THRESHOLD: 使用 LARGE_BALANCE_POSITION_PCT
     """
     # 使用默认值避免空字符串导致的转换异常
     observe_balance_str = os.getenv("OBSERVE_BALANCE", "10000")
-    position_size_str = os.getenv("POSITION_SIZE_PERCENT", "20")
+    position_size_str = os.getenv("POSITION_SIZE_PERCENT", "100")  # 小资金默认 100%
     leverage_str = os.getenv("LEVERAGE", "20")
     symbol_str = os.getenv("SYMBOL", "BTCUSDT")
     interval_str = os.getenv("INTERVAL", "5m")
     
+    # 动态仓位配置
+    large_balance_threshold_str = os.getenv("LARGE_BALANCE_THRESHOLD", "1000")
+    large_balance_position_pct_str = os.getenv("LARGE_BALANCE_POSITION_PCT", "50")
+    
     try:
         observe_balance = float(observe_balance_str) if observe_balance_str else 10000.0
-        position_size_percent = float(position_size_str) if position_size_str else 20.0
+        position_size_percent = float(position_size_str) if position_size_str else 100.0
         leverage = int(leverage_str) if leverage_str else 20
+        large_balance_threshold = float(large_balance_threshold_str) if large_balance_threshold_str else 1000.0
+        large_balance_position_pct = float(large_balance_position_pct_str) if large_balance_position_pct_str else 50.0
     except ValueError as e:
         logging.error(f"交易参数配置格式错误: {e}")
         raise RuntimeError(f"交易参数配置格式错误: {e}")
@@ -224,18 +238,26 @@ def get_trading_config() -> dict:
         raise RuntimeError(f"POSITION_SIZE_PERCENT 必须在 (0, 100] 范围内，当前值: {position_size_percent}")
     if not (1 <= leverage <= 125):
         raise RuntimeError(f"LEVERAGE 必须在 [1, 125] 范围内，当前值: {leverage}")
+    if large_balance_threshold < 0:
+        raise RuntimeError(f"LARGE_BALANCE_THRESHOLD 必须 >= 0，当前值: {large_balance_threshold}")
+    if not (0 < large_balance_position_pct <= 100):
+        raise RuntimeError(f"LARGE_BALANCE_POSITION_PCT 必须在 (0, 100] 范围内，当前值: {large_balance_position_pct}")
     
     config = {
         "observe_balance": observe_balance,
-        "position_size_percent": position_size_percent,
+        "position_size_percent": position_size_percent,  # 小资金仓位
         "leverage": leverage,
         "symbol": symbol_str or "BTCUSDT",
         "interval": interval_str or "5m",
+        "large_balance_threshold": large_balance_threshold,
+        "large_balance_position_pct": large_balance_position_pct,
     }
     
     logging.info(
         f"交易参数: 模拟资金={config['observe_balance']} USDT, "
-        f"仓位={config['position_size_percent']}%, "
+        f"小资金仓位={config['position_size_percent']}%, "
+        f"大资金阈值={config['large_balance_threshold']} USDT, "
+        f"大资金仓位={config['large_balance_position_pct']}%, "
         f"杠杆={config['leverage']}x, "
         f"交易对={config['symbol']}, K线周期={config['interval']}"
     )
@@ -252,6 +274,8 @@ POSITION_SIZE_PERCENT = TRADING_CONFIG["position_size_percent"]
 LEVERAGE = TRADING_CONFIG["leverage"]
 SYMBOL = TRADING_CONFIG["symbol"]
 KLINE_INTERVAL = TRADING_CONFIG["interval"]
+LARGE_BALANCE_THRESHOLD = TRADING_CONFIG["large_balance_threshold"]
+LARGE_BALANCE_POSITION_PCT = TRADING_CONFIG["large_balance_position_pct"]
 
 
 # ============================================================================

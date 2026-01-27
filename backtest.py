@@ -26,7 +26,7 @@ from binance import AsyncClient
 # 导入策略模块
 from logic.market_analyzer import MarketState, MarketAnalyzer
 from logic.patterns import PatternDetector
-from logic.state_machines import HState, LState, H2StateMachine, L2StateMachine
+from logic.state_machines import H2StateMachine, L2StateMachine
 from logic.talib_indicators import compute_ema, compute_atr
 
 
@@ -1028,7 +1028,6 @@ def plot_equity_curve(result: BacktestResult, filename: str = "backtest_equity.p
     """绘制权益曲线"""
     try:
         import matplotlib.pyplot as plt
-        import matplotlib.dates as mdates
         
         fig, axes = plt.subplots(2, 1, figsize=(14, 10), gridspec_kw={'height_ratios': [3, 1]})
         

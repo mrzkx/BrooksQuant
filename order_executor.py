@@ -8,13 +8,34 @@
 import asyncio
 import logging
 from decimal import Decimal, ROUND_DOWN
-from typing import Dict, Optional
+from typing import Dict
 
-from config import LEVERAGE, SYMBOL as CONFIG_SYMBOL
+from config import SYMBOL as CONFIG_SYMBOL
 from trade_logger import TradeLogger
 from user_manager import TradingUser
 
 SYMBOL = CONFIG_SYMBOL
+
+
+def _extract_signal_params(signal: Dict) -> Dict:
+    """
+    提取信号中的通用参数（避免重复代码）
+    
+    Args:
+        signal: 信号字典
+    
+    Returns:
+        提取的参数字典
+    """
+    return {
+        "tp1_price": signal.get("tp1_price"),
+        "tp2_price": signal.get("tp2_price"),
+        "market_state": signal.get("market_state", "Unknown"),
+        "tight_channel_score": signal.get("tight_channel_score", 0.0),
+        "signal_strength": signal.get("signal_strength", 0.0),
+        "tp1_close_ratio": signal.get("tp1_close_ratio", 0.5),
+        "is_climax_bar": signal.get("is_climax_bar", False),
+    }
 
 
 def round_quantity_to_step_size(quantity: float, step_size: float = 0.001) -> float:
@@ -62,16 +83,8 @@ async def execute_observe_order(
         trade_logger: 交易日志器
         calculate_order_quantity_func: 计算下单数量的函数
     """
-    # 提取信号参数
-    tp1_price = signal.get("tp1_price")
-    tp2_price = signal.get("tp2_price")
-    market_state_val = signal.get("market_state", "Unknown")
-    tight_channel_score_val = signal.get("tight_channel_score", 0.0)
-    signal_strength = signal.get("signal_strength", 0.0)
-    
-    # 动态分批出场参数
-    tp1_close_ratio = signal.get("tp1_close_ratio", 0.5)
-    is_climax_bar = signal.get("is_climax_bar", False)
+    # 提取信号参数（使用公共函数避免重复）
+    params = _extract_signal_params(signal)
     
     # 记录观察模式交易
     trade = trade_logger.open_position(
@@ -82,26 +95,26 @@ async def execute_observe_order(
         quantity=order_qty,
         stop_loss=signal["stop_loss"],
         take_profit=signal["take_profit"],
-        signal_strength=signal_strength,
-        tp1_price=tp1_price,
-        tp2_price=tp2_price,
-        market_state=market_state_val,
-        tight_channel_score=tight_channel_score_val,
+        signal_strength=params["signal_strength"],
+        tp1_price=params["tp1_price"],
+        tp2_price=params["tp2_price"],
+        market_state=params["market_state"],
+        tight_channel_score=params["tight_channel_score"],
         is_observe=True,
-        tp1_close_ratio=tp1_close_ratio,
-        is_climax_bar=is_climax_bar,
+        tp1_close_ratio=params["tp1_close_ratio"],
+        is_climax_bar=params["is_climax_bar"],
     )
     
     # 日志输出
-    if tp1_price and tp2_price:
+    if params["tp1_price"] and params["tp2_price"]:
         logging.info(
             f"[{user.name}] 📝 观察模式记录: {signal['signal']} {signal['side']} @ {signal['price']:.2f}, "
             f"数量={order_qty:.4f} BTC (≈{position_value:.2f} USDT), 止损={signal['stop_loss']:.2f}, "
-            f"TP1={tp1_price:.2f}(50%), TP2={tp2_price:.2f}(50%)"
+            f"TP1={params['tp1_price']:.2f}(50%), TP2={params['tp2_price']:.2f}(50%)"
         )
         print(
             f"[{user.name}] 📝 观察模式: {signal['signal']} {signal['side']} @ {signal['price']:.2f}, "
-            f"止损={signal['stop_loss']:.2f}, TP1={tp1_price:.2f}(50%), TP2={tp2_price:.2f}(50%)"
+            f"止损={signal['stop_loss']:.2f}, TP1={params['tp1_price']:.2f}(50%), TP2={params['tp2_price']:.2f}(50%)"
         )
     else:
         logging.info(
@@ -136,16 +149,8 @@ async def execute_live_order(
     Returns:
         bool: 是否成功
     """
-    # 提取信号参数
-    tp1_price = signal.get("tp1_price")
-    tp2_price = signal.get("tp2_price")
-    market_state_val = signal.get("market_state", "Unknown")
-    tight_channel_score_val = signal.get("tight_channel_score", 0.0)
-    signal_strength = signal.get("signal_strength", 0.0)
-    
-    # 动态分批出场参数
-    tp1_close_ratio = signal.get("tp1_close_ratio", 0.5)
-    is_climax_bar = signal.get("is_climax_bar", False)
+    # 提取信号参数（使用公共函数避免重复）
+    params = _extract_signal_params(signal)
     
     # 确定止损方向
     stop_side = "SELL" if signal["side"].lower() == "buy" else "BUY"
@@ -264,14 +269,14 @@ async def execute_live_order(
             quantity=actual_qty,
             stop_loss=signal["stop_loss"],
             take_profit=signal["take_profit"],
-            signal_strength=signal_strength,
-            tp1_price=tp1_price,
-            tp2_price=tp2_price,
-            market_state=market_state_val,
-            tight_channel_score=tight_channel_score_val,
+            signal_strength=params["signal_strength"],
+            tp1_price=params["tp1_price"],
+            tp2_price=params["tp2_price"],
+            market_state=params["market_state"],
+            tight_channel_score=params["tight_channel_score"],
             is_observe=False,
-            tp1_close_ratio=tp1_close_ratio,
-            is_climax_bar=is_climax_bar,
+            tp1_close_ratio=params["tp1_close_ratio"],
+            is_climax_bar=params["is_climax_bar"],
         )
         
         # 日志输出
@@ -279,11 +284,11 @@ async def execute_live_order(
         order_type_text = "市价单" if is_breakout_signal else "限价单"
         status_text = "已成交" if order_status == "FILLED" else f"挂单中({order_status})"
         
-        if tp1_price and tp2_price:
+        if params["tp1_price"] and params["tp2_price"]:
             logging.info(
                 f"[{user.name}] {status_emoji} 实盘{order_type_text}{status_text}: {signal['signal']} {signal['side']} @ {actual_price:.2f}, "
                 f"数量={actual_qty:.4f} BTC, 止损={signal['stop_loss']:.2f}, "
-                f"TP1={tp1_price:.2f}(50%), TP2={tp2_price:.2f}(50%) [K线动态退出]"
+                f"TP1={params['tp1_price']:.2f}(50%), TP2={params['tp2_price']:.2f}(50%) [K线动态退出]"
             )
         else:
             logging.info(

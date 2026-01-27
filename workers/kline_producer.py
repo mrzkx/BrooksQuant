@@ -14,7 +14,7 @@ import pandas as pd
 from binance import BinanceSocketManager, AsyncClient
 from binance.exceptions import ReadLoopClosed
 
-from config import SYMBOL as CONFIG_SYMBOL, KLINE_INTERVAL
+from config import SYMBOL as CONFIG_SYMBOL
 from strategy import AlBrooksStrategy
 from trade_logger import TradeLogger
 from workers.helpers import load_historical_klines, fill_missing_klines
