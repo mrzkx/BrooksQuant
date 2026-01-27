@@ -316,7 +316,13 @@ class TradeLogger:
             else:
                 trade.pnl = final_pnl
             
-            trade.pnl_percent = (trade.pnl / (trade.entry_price * trade.quantity)) * 100
+            # 防止除以零
+            cost_basis = (trade.entry_price or 0) * (trade.quantity or 0)
+            if cost_basis > 0:
+                trade.pnl_percent = (trade.pnl / cost_basis) * 100
+            else:
+                trade.pnl_percent = 0.0
+                logging.warning(f"用户 {user} 交易 [ID={trade.id}] 成本为零，无法计算百分比盈亏")
 
             session.merge(trade)
 

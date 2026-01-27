@@ -85,8 +85,8 @@ async def kline_producer(
                 market_state = last.get("market_state", "Unknown")
                 logging.info(f"市场状态扫描完成，当前市场模式: {market_state}")
 
-            # 创建WebSocket流
-            bm = BinanceSocketManager(client)
+            # 创建WebSocket流（必须传入 max_queue_size 防止队列溢出）
+            bm = BinanceSocketManager(client, max_queue_size=10000)
             kline_stream = bm.kline_socket(symbol=SYMBOL, interval=INTERVAL)
             logging.info(f"K线 WebSocket 流已创建: {SYMBOL} {INTERVAL}")
 
