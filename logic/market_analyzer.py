@@ -16,6 +16,8 @@ import pandas as pd
 from enum import Enum
 from typing import Optional, Tuple
 
+from .interval_params import get_interval_params, IntervalParams
+
 
 class MarketState(Enum):
     """市场状态分类"""
@@ -28,21 +30,32 @@ class MarketState(Enum):
 
 class MarketAnalyzer:
     """
-    市场状态分析器
+    市场状态分析器（周期自适应版）
     
     负责检测当前市场处于哪种状态，指导信号生成策略
+    
+    周期自适应：
+    - 参数根据 K 线周期自动调整
+    - 短周期趋势检测更敏感
+    - 长周期趋势检测更稳定
     """
     
-    def __init__(self, ema_period: int = 20):
+    def __init__(self, ema_period: int = 20, kline_interval: str = "5m"):
         self.ema_period = ema_period
+        self.kline_interval = kline_interval
+        
+        # 加载周期自适应参数
+        self._params: IntervalParams = get_interval_params(kline_interval)
+        
         # 趋势方向缓存（用于禁止逆势交易）
         self._trend_direction: Optional[str] = None  # "up" / "down" / None
         self._trend_strength: float = 0.0  # 0-1
-    
-    @staticmethod
-    def compute_body_size(row: pd.Series) -> float:
-        """计算K线实体大小"""
-        return abs(row["close"] - row["open"])
+        
+        logging.info(
+            f"📊 MarketAnalyzer 初始化: 周期={kline_interval}, "
+            f"斜率阈值={self._params.slope_threshold_pct:.2%}, "
+            f"趋势阈值={self._params.strong_trend_threshold}"
+        )
     
     def get_trend_direction(self) -> Optional[str]:
         """获取当前趋势方向"""
@@ -62,7 +75,9 @@ class MarketAnalyzer:
         Returns:
             True 如果是逆势交易（在上涨趋势中做空，或在下跌趋势中做多）
         """
-        if self._trend_direction is None or self._trend_strength < 0.6:
+        # 使用周期自适应的趋势强度阈值
+        trend_threshold = self._params.strong_trend_threshold + 0.1
+        if self._trend_direction is None or self._trend_strength < trend_threshold:
             return False
         
         if self._trend_direction == "up" and side == "sell":
@@ -99,31 +114,28 @@ class MarketAnalyzer:
         if tight_channel_state is not None:
             return tight_channel_state
         
-        # 计算最近20根K线的EMA穿越次数
+        # 计算最近20根K线的EMA穿越次数（向量化）
         recent = df.iloc[max(0, i - 20) : i + 1]
-        ema_crosses = 0
-        prev_above = None
         
-        for idx in recent.index:
-            close = recent.at[idx, "close"]
-            above_ema = close > recent.at[idx, "ema"]
-            if prev_above is not None and prev_above != above_ema:
-                ema_crosses += 1
-            prev_above = above_ema
+        # 使用预计算的 above_ema 列或即时计算
+        if "above_ema" in recent.columns:
+            above_ema_series = recent["above_ema"]
+        else:
+            above_ema_series = recent["close"] > recent["ema"]
+        
+        # 向量化计算穿越次数：检测布尔值变化
+        ema_crosses = int(above_ema_series.astype(int).diff().abs().sum())
         
         # 频繁穿越EMA -> Trading Range
         if ema_crosses >= 4:
             return MarketState.TRADING_RANGE
         
         # 检测强突破（Spike）- 优化：放宽条件
-        if i >= 1:
-            recent_bodies = [
-                self.compute_body_size(df.iloc[j])
-                for j in range(max(0, i - 10), i + 1)
-            ]
-            avg_body = sum(recent_bodies) / len(recent_bodies) if recent_bodies else 0
-            
-            current_body = self.compute_body_size(df.iloc[i])
+        if i >= 1 and "body_size" in df.columns:
+            # 使用预计算的 body_size 列（向量化）
+            recent_bodies = df["body_size"].iloc[max(0, i - 10):i + 1]
+            avg_body = recent_bodies.mean() if len(recent_bodies) > 0 else 0
+            current_body = df.iloc[i]["body_size"]
             
             if avg_body > 0:
                 # 优化：只需当前K线实体 > 1.8倍平均值（原先需要连续两根 > 2倍）
@@ -171,60 +183,47 @@ class MarketAnalyzer:
         if len(recent) < 5:
             return None
         
-        # ========== 指标1: 连续同向K线 ==========
-        bullish_count = 0  # 连续阳线计数
-        bearish_count = 0  # 连续阴线计数
-        max_bullish_streak = 0
-        max_bearish_streak = 0
+        # ========== 指标1: 连续同向K线（向量化）==========
+        # 使用预计算列或即时计算
+        if "is_bullish" in recent.columns:
+            is_bullish = recent["is_bullish"]
+            is_bearish = recent["is_bearish"]
+        else:
+            is_bullish = recent["close"] > recent["open"]
+            is_bearish = recent["close"] < recent["open"]
         
-        for idx in recent.index:
-            close = recent.at[idx, "close"]
-            open_price = recent.at[idx, "open"]
-            
-            if close > open_price:
-                bullish_count += 1
-                bearish_count = 0
-                max_bullish_streak = max(max_bullish_streak, bullish_count)
-            elif close < open_price:
-                bearish_count += 1
-                bullish_count = 0
-                max_bearish_streak = max(max_bearish_streak, bearish_count)
-            else:
-                # Doji 不中断计数
-                pass
+        # 向量化计算最大连续阳线/阴线数
+        def max_consecutive(series):
+            """计算布尔序列中最大连续 True 的数量"""
+            if series.empty:
+                return 0
+            groups = (series != series.shift()).cumsum()
+            return series.groupby(groups).sum().max() if series.any() else 0
         
-        # ========== 指标2: 连续创新高/新低 ==========
-        higher_highs = 0
-        lower_lows = 0
+        max_bullish_streak = max_consecutive(is_bullish)
+        max_bearish_streak = max_consecutive(is_bearish)
         
-        for j in range(1, len(recent)):
-            curr_idx = recent.index[j]
-            prev_idx = recent.index[j - 1]
-            
-            if recent.at[curr_idx, "high"] > recent.at[prev_idx, "high"]:
-                higher_highs += 1
-            if recent.at[curr_idx, "low"] < recent.at[prev_idx, "low"]:
-                lower_lows += 1
+        # ========== 指标2: 连续创新高/新低（向量化）==========
+        higher_highs = int((recent["high"].diff() > 0).sum())
+        lower_lows = int((recent["low"].diff() < 0).sum())
         
-        # ========== 指标3: 持续远离EMA ==========
-        bars_above_ema = 0
-        bars_below_ema = 0
-        avg_distance_pct = 0.0
+        # ========== 指标3: 持续远离EMA（向量化）==========
+        if "ema" in recent.columns:
+            ema_col = recent["ema"]
+        else:
+            ema_col = pd.Series([ema] * len(recent), index=recent.index)
         
-        for idx in recent.index:
-            close = recent.at[idx, "close"]
-            bar_ema = recent.at[idx, "ema"] if "ema" in recent.columns else ema
-            
-            if bar_ema > 0:
-                distance_pct = (close - bar_ema) / bar_ema
-                avg_distance_pct += distance_pct
-                
-                if close > bar_ema:
-                    bars_above_ema += 1
-                else:
-                    bars_below_ema += 1
+        # 使用预计算列或即时计算
+        if "above_ema" in recent.columns:
+            bars_above_ema = int(recent["above_ema"].sum())
+            bars_below_ema = int((~recent["above_ema"]).sum())
+        else:
+            bars_above_ema = int((recent["close"] > ema_col).sum())
+            bars_below_ema = len(recent) - bars_above_ema
         
-        avg_distance_pct = avg_distance_pct / len(recent) if len(recent) > 0 else 0
+        # 平均距离百分比
+        distance_pct_series = (recent["close"] - ema_col) / ema_col.replace(0, float('nan'))
+        avg_distance_pct = distance_pct_series.mean() if not distance_pct_series.isna().all() else 0
         
         # ========== 指标4: 早期趋势检测 - 5 根 K 线快速涨跌 ==========
         recent_5 = df.iloc[max(0, i - 4) : i + 1]
@@ -326,8 +325,8 @@ class MarketAnalyzer:
         self._trend_direction = trend_direction
         self._trend_strength = trend_strength
         
-        # 判断是否达到强趋势状态（优化：阈值从 0.6 降到 0.5）
-        if trend_strength >= 0.5:
+        # 判断是否达到强趋势状态（周期自适应阈值）
+        if trend_strength >= self._params.strong_trend_threshold:
             # 构建 Gap 信息字符串
             gap_info = ""
             if gap_up_count > 0:
@@ -347,19 +346,24 @@ class MarketAnalyzer:
     
     def _detect_tight_channel(self, df: pd.DataFrame, i: int, ema: float) -> Optional[MarketState]:
         """
-        检测紧凑通道（Tight Channel）
+        检测紧凑通道（Tight Channel）- 强单边斜率检测
         
         Al Brooks 核心原则：
         在强劲的单边趋势（紧凑通道）中做反转是"自杀行为"
         
-        条件 A：最近10根K线中，没有任何一根触碰到EMA
-        条件 B：最近5根K线中至少有3根是同向趋势棒
+        BTC 高波动优化 - 三重条件检测：
+        条件 A：最近10根K线中，没有任何一根触碰到EMA（趋势强度）
+        条件 B：最近5根K线中至少有3根是同向趋势棒（方向一致性）
+        条件 C（新增）：斜率检测 - 10根K线的价格变化率 > 0.8%（强单边斜率）
+        
+        符合任意两个条件即判定为 Tight Channel
         """
         if i < 10:
             return None
         
         lookback_10 = df.iloc[max(0, i - 9) : i + 1]
         
+        # ========== 条件 A：EMA 距离检测 ==========
         all_above_ema = True
         all_below_ema = True
         
@@ -373,9 +377,10 @@ class MarketAnalyzer:
             if bar_high >= bar_ema * 0.999:
                 all_below_ema = False
         
-        if not all_above_ema and not all_below_ema:
-            return None
+        condition_a_up = all_above_ema
+        condition_a_down = all_below_ema
         
+        # ========== 条件 B：方向一致性检测 ==========
         lookback_5 = df.iloc[max(0, i - 4) : i + 1]
         
         bullish_bars = 0
@@ -390,10 +395,40 @@ class MarketAnalyzer:
             elif bar_close < bar_open:
                 bearish_bars += 1
         
-        if all_above_ema and bullish_bars >= 3:
+        condition_b_up = bullish_bars >= 3
+        condition_b_down = bearish_bars >= 3
+        
+        # ========== 条件 C（新增）：强单边斜率检测（周期自适应）==========
+        # Al Brooks: "强单边斜率"意味着价格持续向一个方向移动
+        # 斜率阈值根据 K 线周期自动调整
+        SLOPE_THRESHOLD_PCT = self._params.slope_threshold_pct
+        
+        first_close = lookback_10.iloc[0]["close"]
+        last_close = lookback_10.iloc[-1]["close"]
+        slope_pct = (last_close - first_close) / first_close if first_close > 0 else 0
+        
+        condition_c_up = slope_pct > SLOPE_THRESHOLD_PCT
+        condition_c_down = slope_pct < -SLOPE_THRESHOLD_PCT
+        
+        # ========== 综合判断：符合任意两个条件即为 Tight Channel ==========
+        # 上升 Tight Channel
+        up_conditions_met = sum([condition_a_up, condition_b_up, condition_c_up])
+        if up_conditions_met >= 2:
+            logging.debug(
+                f"🔒 Tight Channel(上升): EMA距离={condition_a_up}, "
+                f"方向一致={condition_b_up}(阳线{bullish_bars}/5), "
+                f"斜率={condition_c_up}({slope_pct:.2%})"
+            )
             return MarketState.TIGHT_CHANNEL
         
-        if all_below_ema and bearish_bars >= 3:
+        # 下降 Tight Channel
+        down_conditions_met = sum([condition_a_down, condition_b_down, condition_c_down])
+        if down_conditions_met >= 2:
+            logging.debug(
+                f"🔒 Tight Channel(下降): EMA距离={condition_a_down}, "
+                f"方向一致={condition_b_down}(阴线{bearish_bars}/5), "
+                f"斜率={condition_c_down}({slope_pct:.2%})"
+            )
             return MarketState.TIGHT_CHANNEL
         
         return None

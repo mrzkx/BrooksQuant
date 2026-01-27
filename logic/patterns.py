@@ -14,6 +14,7 @@ import logging
 import pandas as pd
 from typing import Optional, Tuple
 from .market_analyzer import MarketState
+from .interval_params import get_interval_params, IntervalParams
 
 
 class PatternDetector:
@@ -21,20 +22,38 @@ class PatternDetector:
     模式检测器
     
     封装所有 Al Brooks 价格行为模式的检测逻辑
+    
+    周期自适应：
+    - 参数根据 K 线周期自动调整
+    - 短周期更严格，长周期更宽松
     """
     
-    def __init__(self, lookback_period: int = 20):
-        self.lookback_period = lookback_period
+    # ========== 默认参数（5m 周期）==========
+    # 这些默认值仅在未指定周期时使用
+    BTC_MIN_BODY_RATIO = 0.60
+    BTC_CLOSE_POSITION_PCT = 0.20
     
-    @staticmethod
-    def compute_body_size(row: pd.Series) -> float:
-        """计算K线实体大小"""
-        return abs(row["close"] - row["open"])
+    def __init__(self, lookback_period: int = 20, kline_interval: str = "5m"):
+        self.lookback_period = lookback_period
+        self.kline_interval = kline_interval
+        
+        # 加载周期自适应参数
+        self._params: IntervalParams = get_interval_params(kline_interval)
+        
+        # 更新类属性为周期参数
+        self.BTC_MIN_BODY_RATIO = self._params.min_body_ratio
+        self.BTC_CLOSE_POSITION_PCT = self._params.close_position_pct
+        
+        logging.info(
+            f"📐 PatternDetector 初始化: 周期={kline_interval}, "
+            f"实体占比≥{self._params.min_body_ratio:.0%}, "
+            f"收盘位置≤{self._params.close_position_pct:.0%}"
+        )
     
     @staticmethod
     def validate_signal_close(row: pd.Series, side: str) -> bool:
         """
-        验证K线收盘价位置是否符合信号要求
+        验证K线收盘价位置是否符合信号要求（通用版）
         
         买入信号：收盘价必须在K线顶部25%区域
         卖出信号：收盘价必须在K线底部25%区域
@@ -52,20 +71,91 @@ class PatternDetector:
         else:
             return bool((high - close) / kline_range >= 0.75)
     
-    @staticmethod
+    @classmethod
+    def validate_btc_signal_bar(
+        cls, 
+        row: pd.Series, 
+        side: str,
+        min_body_ratio: Optional[float] = None,
+        close_position_pct: Optional[float] = None
+    ) -> tuple[bool, str]:
+        """
+        BTC 专用信号棒质量验证（针对高波动长影线特性）
+        
+        Al Brooks: "信号棒的质量决定了交易的成功率"
+        
+        BTC 特殊要求：
+        1. 实体必须占全长的 60% 以上（过滤长影线噪音）
+        2. 买入信号：收盘价必须在最高 20% 区域（强势收盘）
+        3. 卖出信号：收盘价必须在最低 20% 区域（弱势收盘）
+        4. 信号棒方向必须与交易方向一致（买=阳线，卖=阴线）
+        
+        Args:
+            row: K线数据
+            side: 交易方向 ("buy" 或 "sell")
+            min_body_ratio: 最小实体占比（默认 0.60）
+            close_position_pct: 收盘位置要求（默认 0.20，即顶部/底部 20%）
+        
+        Returns:
+            (is_valid, reason): 是否有效及原因
+        """
+        if min_body_ratio is None:
+            min_body_ratio = cls.BTC_MIN_BODY_RATIO
+        if close_position_pct is None:
+            close_position_pct = cls.BTC_CLOSE_POSITION_PCT
+        
+        high = float(row["high"])
+        low = float(row["low"])
+        close = float(row["close"])
+        open_price = float(row["open"])
+        
+        kline_range = high - low
+        if kline_range == 0:
+            return (False, "K线范围为0")
+        
+        body_size = abs(close - open_price)
+        body_ratio = body_size / kline_range
+        
+        # ========== 条件1: 实体占比检查 ==========
+        if body_ratio < min_body_ratio:
+            return (False, f"实体占比不足({body_ratio:.1%}<{min_body_ratio:.0%})")
+        
+        # ========== 条件2: 信号棒方向检查 ==========
+        is_bullish = close > open_price
+        is_bearish = close < open_price
+        
+        if side == "buy" and not is_bullish:
+            return (False, "买入信号需要阳线")
+        if side == "sell" and not is_bearish:
+            return (False, "卖出信号需要阴线")
+        
+        # ========== 条件3: 收盘价位置检查 ==========
+        if side == "buy":
+            # 买入信号：收盘价必须在顶部 20% 区域
+            close_from_high = (high - close) / kline_range
+            if close_from_high > close_position_pct:
+                return (False, f"收盘价未在顶部{close_position_pct:.0%}区域(距顶{close_from_high:.1%})")
+        else:
+            # 卖出信号：收盘价必须在底部 20% 区域
+            close_from_low = (close - low) / kline_range
+            if close_from_low > close_position_pct:
+                return (False, f"收盘价未在底部{close_position_pct:.0%}区域(距底{close_from_low:.1%})")
+        
+        return (True, "信号棒质量合格")
+    
     def calculate_unified_stop_loss(
-        df: pd.DataFrame, i: int, side: str, entry_price: float, atr: Optional[float] = None
+        self, df: pd.DataFrame, i: int, side: str, entry_price: float, atr: Optional[float] = None
     ) -> float:
         """
-        Al Brooks 风格止损计算（优化版）
+        Al Brooks 风格止损计算（周期自适应版）
         
         核心原则：止损放在 Signal Bar（前一根K线）的极值外
         
         Al Brooks: "如果市场回到 Signal Bar 之外，说明你的判断错了"
         
-        优化：
-        1. 止损至少要有 1.5 * ATR 的距离（防止太紧被噪音打出）
-        2. 止损最多 3 * ATR（防止太宽亏损过大）
+        周期自适应优化：
+        1. 止损最小 ATR 倍数根据周期调整（短周期更宽）
+        2. 止损最大 ATR 倍数根据周期调整
         3. 使用前两根 K 线的极值（提供更多缓冲）
         """
         if i < 2:
@@ -80,20 +170,24 @@ class PatternDetector:
         else:
             buffer = entry_price * 0.0015
         
+        # 使用周期自适应 ATR 倍数
+        atr_stop_min = self._params.atr_stop_min_mult
+        atr_stop_max = self._params.atr_stop_max_mult
+        
         if side == "buy":
             # 买入：止损在前两根 K 线低点下方（取较低者）
             two_bar_low = min(signal_bar["low"], prev_bar["low"])
             signal_bar_stop = two_bar_low - buffer
             
             if atr and atr > 0:
-                # 最小距离：至少 1.5 * ATR
-                min_stop_distance = atr * 1.5
+                # 最小距离：周期自适应
+                min_stop_distance = atr * atr_stop_min
                 min_stop = entry_price - min_stop_distance
                 if signal_bar_stop > min_stop:
                     signal_bar_stop = min_stop
                 
-                # 最大距离：不超过 3 * ATR
-                max_stop_distance = atr * 3
+                # 最大距离：周期自适应
+                max_stop_distance = atr * atr_stop_max
                 floor_stop = entry_price - max_stop_distance
                 signal_bar_stop = max(signal_bar_stop, floor_stop)
             
@@ -104,14 +198,14 @@ class PatternDetector:
             signal_bar_stop = two_bar_high + buffer
             
             if atr and atr > 0:
-                # 最小距离：至少 1.5 * ATR
-                min_stop_distance = atr * 1.5
+                # 最小距离：周期自适应
+                min_stop_distance = atr * atr_stop_min
                 max_stop = entry_price + min_stop_distance
                 if signal_bar_stop < max_stop:
                     signal_bar_stop = max_stop
                 
-                # 最大距离：不超过 3 * ATR
-                max_stop_distance = atr * 3
+                # 最大距离：周期自适应
+                max_stop_distance = atr * atr_stop_max
                 ceiling_stop = entry_price + max_stop_distance
                 signal_bar_stop = min(signal_bar_stop, ceiling_stop)
             
@@ -207,39 +301,43 @@ class PatternDetector:
             return None
         
         # ===== 条件1: 实体大小（从 2x 提高到 3x）=====
-        recent_bodies = [
-            self.compute_body_size(df.iloc[j]) for j in range(max(0, i - 10), i)
-        ]
-        if not recent_bodies:
+        # 使用预计算的 body_size 列（向量化）
+        if "body_size" not in df.columns:
             return None
         
-        avg_body = sum(recent_bodies) / len(recent_bodies)
-        current_body = self.compute_body_size(df.iloc[i])
+        recent_bodies = df["body_size"].iloc[max(0, i - 10):i]
+        if len(recent_bodies) == 0:
+            return None
+        
+        avg_body = recent_bodies.mean()
+        current_body = df.iloc[i]["body_size"]
         
         # 实体阈值从 2x 提高到 3x
         if avg_body == 0 or current_body < avg_body * 3:
             return None
         
-        close = df.iloc[i]["close"]
-        high = df.iloc[i]["high"]
-        low = df.iloc[i]["low"]
-        open_price = df.iloc[i]["open"]
+        # 一次性提取当前行数据（减少多次 iloc 访问）
+        current_row = df.iloc[i]
+        close = current_row["close"]
+        high = current_row["high"]
+        low = current_row["low"]
+        open_price = current_row["open"]
+        kline_range = current_row["kline_range"] if "kline_range" in df.columns else (high - low)
         
-        # ===== 条件2: 连续同向 K 线（从 2 根提高到 3 根）=====
+        # 一次性提取前几根 K 线
         prev_bar_1 = df.iloc[i - 1]
         prev_bar_2 = df.iloc[i - 2]
         prev_bar_3 = df.iloc[i - 3]
         
-        # ATR 过滤：Climax 不追涨
+        # ATR 过滤：Climax 不追涨（周期自适应）
         if atr is not None and atr > 0:
-            if (high - low) > atr * 2.5:
+            if kline_range > atr * self._params.atr_spike_filter_mult:
                 return None
         
-        # ===== 条件3: 突破前 10 根 K 线的高/低点 =====
-        lookback_highs = [df.iloc[j]["high"] for j in range(max(0, i - 10), i)]
-        lookback_lows = [df.iloc[j]["low"] for j in range(max(0, i - 10), i)]
-        max_lookback_high = max(lookback_highs) if lookback_highs else high
-        min_lookback_low = min(lookback_lows) if lookback_lows else low
+        # ===== 条件3: 突破前 10 根 K 线的高/低点（向量化）=====
+        lookback_slice = df.iloc[max(0, i - 10):i]
+        max_lookback_high = lookback_slice["high"].max() if len(lookback_slice) > 0 else high
+        min_lookback_low = lookback_slice["low"].min() if len(lookback_slice) > 0 else low
         
         # 向上突破
         if close > ema and close > open_price:
@@ -329,8 +427,8 @@ class PatternDetector:
         prev_open = prev_bar["open"]
         prev_range = prev_high - prev_low
         
-        # Climax 阈值
-        CLIMAX_ATR_MULTIPLIER = 2.5
+        # Climax 阈值（周期自适应）
+        CLIMAX_ATR_MULTIPLIER = self._params.atr_climax_mult
         
         # 当前 K 线范围（用于尾部影线计算）
         current_range = high - low
@@ -414,37 +512,36 @@ class PatternDetector:
         if market_state != MarketState.TRADING_RANGE:
             return None
         
-        current_high = df.iloc[i]["high"]
-        current_low = df.iloc[i]["low"]
+        # 一次性提取当前行数据（减少多次 iloc 访问）
         current_bar = df.iloc[i]
         close = current_bar["close"]
         open_price = current_bar["open"]
         high = current_bar["high"]
         low = current_bar["low"]
+        current_high = high
+        current_low = low
         
-        # 优化：使用短期回看（10根）找近期高低点
-        lookback_highs = [df.iloc[j]["high"] for j in range(max(0, i - SHORT_LOOKBACK), i)]
-        lookback_lows = [df.iloc[j]["low"] for j in range(max(0, i - SHORT_LOOKBACK), i)]
-        
-        max_lookback_high = max(lookback_highs) if lookback_highs else current_high
-        min_lookback_low = min(lookback_lows) if lookback_lows else current_low
+        # 向量化获取近期高低点
+        lookback_slice = df.iloc[max(0, i - SHORT_LOOKBACK):i]
+        max_lookback_high = lookback_slice["high"].max() if len(lookback_slice) > 0 else current_high
+        min_lookback_low = lookback_slice["low"].min() if len(lookback_slice) > 0 else current_low
         
         # 用更长周期计算区间宽度（用于止盈）
         lookback_range = df.iloc[max(0, i - self.lookback_period) : i + 1]
         range_width = lookback_range["high"].max() - lookback_range["low"].min()
         
-        kline_range = high - low
+        # 使用预计算的 kline_range 列
+        kline_range = current_bar["kline_range"] if "kline_range" in df.columns else (high - low)
         if kline_range == 0:
             return None
         
         # ⭐ 新增：检查最近3根K线是否已经在持续创新高/新低
-        # 如果是，说明这是真突破延续，不是假突破
         recent_3_bars = df.iloc[max(0, i - 2) : i]  # 前2根K线
         
         # 创新高后反转
         if current_high > max_lookback_high:
-            # ⭐ 防误判：检查前2根是否已经在创新高
-            prior_highs_above = sum(1 for j in recent_3_bars.index if recent_3_bars.at[j, "high"] > max_lookback_high * 0.999)
+            # ⭐ 防误判：检查前2根是否已经在创新高（向量化）
+            prior_highs_above = int((recent_3_bars["high"] > max_lookback_high * 0.999).sum())
             if prior_highs_above >= 2:
                 # 之前2根K线都在高位，这是趋势延续不是假突破
                 logging.debug(f"FailedBreakout_Sell 被跳过: 前{prior_highs_above}根K线已在新高，是趋势延续")
@@ -514,15 +611,18 @@ class PatternDetector:
         
         返回: (signal_type, side, stop_loss, base_height) 或 None
         """
-        # 动态调整最小间隔：根据 ATR 判断市场波动性
-        # 高波动市场（大 ATR）允许更短的间隔
+        # 使用周期自适应参数
+        min_total_span = self._params.wedge_min_total_span
+        min_leg_span = self._params.wedge_min_leg_span
+        
+        # 动态调整：根据 ATR 判断市场波动性，高波动允许更短间隔
         if atr and atr > 0:
-            # 波动性越高，允许的最小间隔越短
-            min_total_span = max(8, min(15, int(300 / atr)))  # 8-15 根 K 线
-            min_leg_span = 2  # 相邻推进至少 2 根
-        else:
-            min_total_span = 12  # 默认值
-            min_leg_span = 2
+            # 波动性越高，允许的最小间隔越短（但不低于周期参数的 60%）
+            dynamic_span = max(
+                int(min_total_span * 0.6),
+                min(min_total_span, int(300 / atr))
+            )
+            min_total_span = dynamic_span
         
         if i < 15:
             return None
@@ -552,7 +652,7 @@ class PatternDetector:
                         pass
                     elif peak_indices[1] - peak_indices[0] < min_leg_span or peak_indices[2] - peak_indices[1] < min_leg_span:
                         pass
-                    elif self.compute_body_size(df.iloc[peak_indices[2]]) >= self.compute_body_size(df.iloc[peak_indices[0]]):
+                    elif df.iloc[peak_indices[2]]["body_size"] >= df.iloc[peak_indices[0]]["body_size"]:
                         pass
                     else:
                         third_bar = df.iloc[peak_indices[2]]
@@ -592,7 +692,7 @@ class PatternDetector:
                         pass
                     elif trough_indices[1] - trough_indices[0] < min_leg_span or trough_indices[2] - trough_indices[1] < min_leg_span:
                         pass
-                    elif self.compute_body_size(df.iloc[trough_indices[2]]) >= self.compute_body_size(df.iloc[trough_indices[0]]):
+                    elif df.iloc[trough_indices[2]]["body_size"] >= df.iloc[trough_indices[0]]["body_size"]:
                         pass
                     else:
                         third_bar = df.iloc[trough_indices[2]]

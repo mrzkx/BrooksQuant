@@ -83,6 +83,10 @@ class Trade(Base):
     trailing_max_profit_r = Column(Float, nullable=True)  # 最大盈利（以R为单位）
     original_stop_loss = Column(Float, nullable=True)  # 原始止损价（用于计算R）
     
+    # 动态分批出场参数（Al Brooks 优化）
+    tp1_close_ratio = Column(Float, default=0.5)  # TP1 平仓比例（默认50%，Climax时75%）
+    is_climax_bar = Column(Boolean, default=False)  # 是否是 Climax 信号棒
+    
     # 市场上下文
     market_state = Column(String(50), nullable=True)
     tight_channel_score = Column(Float, nullable=True)
@@ -134,6 +138,12 @@ class TradeLogger:
         
         # 内存缓存
         self.positions: Dict[str, Optional[Trade]] = {}
+        
+        # ========== 延迟写入优化 ==========
+        # 避免每次价格检查都写入数据库，只在状态变化时写入
+        self._dirty_trades: Dict[str, bool] = {}  # 标记需要持久化的交易
+        self._last_db_sync: float = 0  # 上次数据库同步时间
+        self.DB_SYNC_INTERVAL = 5.0  # 最小同步间隔（秒）
         
         # TP2 订单状态跟踪（实盘模式下，TP1 触发后需要挂 TP2 订单）
         self._tp2_order_placed: Dict[str, bool] = {}
@@ -196,6 +206,47 @@ class TradeLogger:
                 
             except Exception as e:
                 logging.error(f"❌ 从数据库恢复持仓失败: {e}", exc_info=True)
+    
+    def sync_dirty_trades(self, force: bool = False) -> int:
+        """
+        批量同步脏数据到数据库（延迟写入优化）
+        
+        Args:
+            force: 是否强制同步（忽略时间间隔）
+        
+        Returns:
+            int: 同步的交易数量
+        """
+        import time
+        current_time = time.time()
+        
+        # 检查同步间隔
+        if not force and (current_time - self._last_db_sync) < self.DB_SYNC_INTERVAL:
+            return 0
+        
+        with self._lock:
+            dirty_users = [u for u, dirty in self._dirty_trades.items() if dirty]
+            if not dirty_users:
+                return 0
+            
+            synced = 0
+            with self.session_scope() as session:
+                for user in dirty_users:
+                    trade = self.positions.get(user)
+                    if trade:
+                        session.merge(trade)
+                        self._dirty_trades[user] = False
+                        synced += 1
+            
+            self._last_db_sync = current_time
+            if synced > 0:
+                logging.debug(f"📊 批量同步 {synced} 个交易到数据库")
+            
+            return synced
+    
+    def mark_dirty(self, user: str):
+        """标记交易为脏数据（需要同步）"""
+        self._dirty_trades[user] = True
 
     def open_position(
         self,
@@ -212,6 +263,8 @@ class TradeLogger:
         market_state: Optional[str] = None,
         tight_channel_score: Optional[float] = None,
         is_observe: bool = True,  # 默认为观察模式
+        tp1_close_ratio: float = 0.5,  # TP1 平仓比例（默认50%，Climax时75%）
+        is_climax_bar: bool = False,  # 是否是 Climax 信号棒
     ) -> Trade:
         """开仓并持久化（线程安全）"""
         # 将 numpy 类型转换为 Python 原生类型（PostgreSQL 不支持 np.float64）
@@ -254,6 +307,9 @@ class TradeLogger:
                     tight_channel_score=tight_channel_score,
                     signal_strength=signal_strength,
                     is_observe=is_observe,  # 记录交易模式
+                    # 动态分批出场参数
+                    tp1_close_ratio=tp1_close_ratio,
+                    is_climax_bar=is_climax_bar,
                 )
 
                 session.add(trade)
@@ -452,12 +508,13 @@ class TradeLogger:
                         ts_state["max_profit"] = profit_in_r
                         ts_updated = True
                     
-                    # 问题3修复：持久化追踪止损更新
+                    # 延迟写入优化：只更新内存，标记为脏数据
+                    # 数据库写入由 sync_dirty_trades() 批量处理
                     if ts_updated:
                         trade.stop_loss = ts_state["trailing_stop"]
                         trade.trailing_stop_price = ts_state["trailing_stop"]
                         trade.trailing_max_profit_r = ts_state["max_profit"]
-                        session.merge(trade)
+                        self.mark_dirty(user)  # 延迟写入
                 
                 # ========== TP1 触发（阶段0 → 1）==========
                 if trade.exit_stage == 0 and trade.tp1_price:
@@ -465,47 +522,58 @@ class TradeLogger:
                               (trade.side == "sell" and current_price <= float(trade.tp1_price))
                     
                     if tp1_hit:
-                        half_qty = float(trade.quantity) * 0.5
-                        trade.remaining_quantity = float(trade.quantity) - half_qty
+                        # 使用动态平仓比例（默认 50%，Climax 时 75%）
+                        close_ratio = float(trade.tp1_close_ratio or 0.5)
+                        close_qty = float(trade.quantity) * close_ratio
+                        trade.remaining_quantity = float(trade.quantity) - close_qty
                         trade.exit_stage = 1
                         trade.status = "partial"
-                        trade.stop_loss = float(trade.entry_price)  # 移至入场价（保本）
+                        
+                        # 动态保本：止损移至入场价 + 手续费覆盖（0.04% × 2 = 0.08%）
+                        entry_price = float(trade.entry_price)
+                        fee_buffer = entry_price * 0.001  # 0.1% 缓冲（覆盖手续费+滑点）
+                        if trade.side == "buy":
+                            breakeven_stop = entry_price + fee_buffer  # 做多：入场价上方
+                        else:
+                            breakeven_stop = entry_price - fee_buffer  # 做空：入场价下方
+                        
+                        trade.stop_loss = breakeven_stop
                         trade.breakeven_moved = True
                         
                         session.merge(trade)
                         
                         # 更新追踪止损状态（不允许后退）
-                        entry_price = float(trade.entry_price)
                         if trade.side == "buy":
-                            # 做多：取追踪止损和入场价中的较大值
-                            ts_state["trailing_stop"] = max(ts_state["trailing_stop"], entry_price)
+                            # 做多：取追踪止损和保本价中的较大值
+                            ts_state["trailing_stop"] = max(ts_state["trailing_stop"], breakeven_stop)
                         else:
-                            # 做空：取追踪止损和入场价中的较小值
-                            ts_state["trailing_stop"] = min(ts_state["trailing_stop"], entry_price)
+                            # 做空：取追踪止损和保本价中的较小值
+                            ts_state["trailing_stop"] = min(ts_state["trailing_stop"], breakeven_stop)
                         ts_state["activated"] = True
                         
                         if trade.side == "buy":
-                            tp1_pnl = (float(trade.tp1_price) - entry_price) * half_qty
+                            tp1_pnl = (float(trade.tp1_price) - entry_price) * close_qty
                         else:
-                            tp1_pnl = (entry_price - float(trade.tp1_price)) * half_qty
+                            tp1_pnl = (entry_price - float(trade.tp1_price)) * close_qty
                         
+                        close_pct = int(close_ratio * 100)
                         logging.info(
-                            f"🎯 [{user}] TP1触发！平仓50% @ {float(trade.tp1_price):.2f}, "
-                            f"盈利={tp1_pnl:.4f}, 追踪止损={ts_state['trailing_stop']:.2f}"
+                            f"🎯 [{user}] TP1触发！平仓{close_pct}% @ {float(trade.tp1_price):.2f}, "
+                            f"盈利={tp1_pnl:.4f}, 保本止损={breakeven_stop:.2f}"
+                            + (f" [Climax信号棒，加大平仓比例]" if trade.is_climax_bar else "")
                         )
                         
                         # 标记需要通知实盘平仓（如果存在 TP2）
                         if trade.tp2_price:
                             self._tp2_order_placed[user] = False
                         
-                        # 问题2修复：返回TP1操作信息，让user_worker立即执行
-                        # 返回字典包含 action 类型和平仓数量
+                        # 返回 TP1 操作信息，让 user_worker 立即执行
                         return {
                             "action": "tp1",
                             "trade": trade,
-                            "close_quantity": half_qty,
+                            "close_quantity": close_qty,
                             "close_price": float(trade.tp1_price),
-                            "new_stop_loss": float(trade.entry_price),
+                            "new_stop_loss": breakeven_stop,
                             "tp2_price": float(trade.tp2_price) if trade.tp2_price else None,
                         }
                 

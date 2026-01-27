@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from typing import Optional, Tuple, Dict, List
 from enum import Enum
 
+import numpy as np
 import redis.asyncio as aioredis
 from binance import AsyncClient, BinanceSocketManager
 from binance.exceptions import ReadLoopClosed
@@ -210,6 +211,46 @@ class DeltaAnalyzer:
             # 批量清理（每 CLEANUP_BATCH_SIZE 条或时间间隔）
             if self._trades_since_cleanup >= self.CLEANUP_BATCH_SIZE:
                 await self._batch_cleanup(timestamp_ms)
+    
+    async def add_trades_batch(self, trades: List[Tuple[int, float, float, bool]]):
+        """
+        批量添加交易记录（高性能版本）
+        
+        Args:
+            trades: [(timestamp_ms, price, qty, is_buyer_maker), ...]
+        
+        优化点：
+        - 一次性获取锁，减少锁竞争
+        - 批量更新 volume
+        - NumPy 向量化计算
+        """
+        if not trades:
+            return
+        
+        async with self._lock:
+            # 转换为 numpy 数组加速计算
+            trades_arr = np.array(trades, dtype=[
+                ('ts', np.int64), ('price', np.float64), 
+                ('qty', np.float64), ('is_buyer_maker', np.bool_)
+            ])
+            
+            # 批量添加到 deque
+            for trade in trades:
+                self._trades.append(trade)
+            
+            # 批量更新 volume（向量化）
+            buyer_maker_mask = trades_arr['is_buyer_maker']
+            self._incremental_sell_volume += float(np.sum(trades_arr['qty'][buyer_maker_mask]))
+            self._incremental_buy_volume += float(np.sum(trades_arr['qty'][~buyer_maker_mask]))
+            
+            # 更新最新价格
+            self._last_price = float(trades_arr['price'][-1])
+            
+            self._trades_since_cleanup += len(trades)
+            
+            # 批量清理
+            if self._trades_since_cleanup >= self.CLEANUP_BATCH_SIZE:
+                await self._batch_cleanup(int(trades_arr['ts'][-1]))
     
     async def _batch_cleanup(self, current_ts_ms: int):
         """
@@ -776,9 +817,26 @@ async def aggtrade_worker(symbol: str = "BTCUSDT", redis_url: Optional[str] = No
                 )
                 reconnect_attempt = 0  # 重置重连计数
                 
+                # ========== 批量处理优化 ==========
+                # 收集一批交易后一次性处理，减少锁竞争和函数调用开销
+                BATCH_SIZE = 100  # 每批处理 100 条
+                BATCH_TIMEOUT = 0.1  # 最长等待 100ms
+                trade_batch: List[Tuple[int, float, float, bool]] = []
+                last_batch_time = time.time()
+                
                 while True:
                     try:
-                        msg = await asyncio.wait_for(stream.recv(), timeout=30.0)
+                        # 非阻塞接收，支持批量处理
+                        try:
+                            msg = await asyncio.wait_for(stream.recv(), timeout=BATCH_TIMEOUT)
+                        except asyncio.TimeoutError:
+                            # 超时，处理当前批次
+                            if trade_batch:
+                                await analyzer.add_trades_batch(trade_batch)
+                                trade_count += len(trade_batch)
+                                trade_batch = []
+                                last_batch_time = time.time()
+                            continue
                         
                         if msg is None:
                             logging.warning("aggTrade 数据流返回 None，可能连接断开")
@@ -793,9 +851,16 @@ async def aggtrade_worker(symbol: str = "BTCUSDT", redis_url: Optional[str] = No
                         is_buyer_maker = msg.get("m", False)  # true=卖方主动, false=买方主动
                         timestamp = msg.get("T", int(time.time() * 1000))
                         
-                        # 添加到分析器
-                        await analyzer.add_trade(price, qty, is_buyer_maker, timestamp)
-                        trade_count += 1
+                        # 添加到批次
+                        trade_batch.append((timestamp, price, qty, is_buyer_maker))
+                        
+                        # 批次满或超时，处理批次
+                        current_time = time.time()
+                        if len(trade_batch) >= BATCH_SIZE or (current_time - last_batch_time) >= BATCH_TIMEOUT:
+                            await analyzer.add_trades_batch(trade_batch)
+                            trade_count += len(trade_batch)
+                            trade_batch = []
+                            last_batch_time = current_time
                         
                         # 定期获取快照并存入 Redis
                         current_time = time.time()

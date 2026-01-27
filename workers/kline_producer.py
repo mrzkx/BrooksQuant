@@ -19,6 +19,9 @@ from strategy import AlBrooksStrategy
 from trade_logger import TradeLogger
 from workers.helpers import load_historical_klines, fill_missing_klines
 
+# HTF 过滤器
+from logic.htf_filter import get_htf_filter
+
 # 尝试导入 websockets 异常
 try:
     from websockets.exceptions import ConnectionClosed
@@ -77,6 +80,13 @@ async def kline_producer(
                 logging.info(f"重连后补全数据，上次最后K线时间戳: {last_kline_timestamp}")
                 last_kline_timestamp = await fill_missing_klines(client, history, last_kline_timestamp)
 
+            # ========== 初始化 HTF 过滤器（1h EMA20）==========
+            # Al Brooks: "大周期的趋势是日内交易最好的保护伞"
+            htf_filter = get_htf_filter(htf_interval="1h", ema_period=20)
+            await htf_filter.update(client, SYMBOL)
+            htf_update_counter = 0  # 每 12 根 K 线（5分钟周期 = 1小时）更新一次 HTF
+            HTF_UPDATE_INTERVAL = 12  # 12 * 5分钟 = 1小时
+
             # 进行一次信号扫描
             if len(history) >= 50:
                 df = pd.DataFrame(history)
@@ -127,6 +137,12 @@ async def kline_producer(
                                 f"📊 K线收盘 #{kline_count}: O={float(k['o']):.2f} "
                                 f"H={float(k['h']):.2f} L={float(k['l']):.2f} C={float(k['c']):.2f}"
                             )
+                            
+                            # ========== 定期更新 HTF 数据（每 12 根 K 线 = 1 小时）==========
+                            htf_update_counter += 1
+                            if htf_update_counter >= HTF_UPDATE_INTERVAL:
+                                await htf_filter.update(client, SYMBOL)
+                                htf_update_counter = 0
 
                             # 更新历史数据
                             kline_data = {
@@ -291,9 +307,19 @@ def _build_signal(last, k, df) -> Dict:
     market_state = last.get("market_state", "Unknown")
     atr_value = last.get("atr", None)
     
-    # 计算信号强度
+    # 动态分批出场参数
+    tp1_close_ratio = last.get("tp1_close_ratio", 0.5)
+    is_climax_bar = last.get("is_climax_bar", False)
+    
+    # TA-Lib 形态加成
+    talib_boost = last.get("talib_boost", 0.0) or 0.0
+    talib_patterns_str = last.get("talib_patterns", None)
+    
+    # 计算信号强度（基础强度 + TA-Lib 加成）
     current_bar = df.iloc[-1]
-    signal_strength = abs(current_bar["close"] - current_bar["open"])
+    base_strength = abs(current_bar["close"] - current_bar["open"])
+    # 信号强度 = 基础强度 × (1 + TA-Lib 加成)
+    signal_strength = base_strength * (1 + talib_boost)
     
     # 计算止盈
     if tp1_price and tp2_price:
@@ -330,6 +356,12 @@ def _build_signal(last, k, df) -> Dict:
         "tp2_price": tp2_price,
         "tight_channel_score": tight_channel_score,
         "atr": atr_value,
+        # 动态分批出场参数
+        "tp1_close_ratio": tp1_close_ratio,
+        "is_climax_bar": is_climax_bar,
+        # TA-Lib 形态增强
+        "talib_boost": talib_boost,
+        "talib_patterns": talib_patterns_str,
     }
 
 
@@ -346,23 +378,37 @@ def _log_signal(signal: Dict, last) -> None:
     tp1_price = signal.get("tp1_price")
     tp2_price = signal.get("tp2_price")
     
+    # TA-Lib 形态信息
+    talib_boost = signal.get("talib_boost", 0.0) or 0.0
+    talib_patterns = signal.get("talib_patterns")
+    talib_info = ""
+    if talib_boost > 0 and talib_patterns:
+        talib_info = f", TA-Lib +{talib_boost:.0%} [{talib_patterns}]"
+    
+    # 动态平仓比例
+    tp1_ratio = signal.get("tp1_close_ratio", 0.5)
+    tp1_pct = int(tp1_ratio * 100)
+    tp2_pct = 100 - tp1_pct
+    
     if tp1_price and tp2_price:
         logging.info(
             f"🎯 触发交易信号: {signal['signal']} {signal['side']} @ {signal['price']:.2f}, "
-            f"止损={signal['stop_loss']:.2f}, TP1={tp1_price:.2f}(50%), TP2={tp2_price:.2f}(50%), "
-            f"市场模式={state_display}"
+            f"止损={signal['stop_loss']:.2f}, TP1={tp1_price:.2f}({tp1_pct}%), TP2={tp2_price:.2f}({tp2_pct}%), "
+            f"市场模式={state_display}{talib_info}"
         )
         print(
             f"🎯 触发信号: {signal['signal']} {signal['side']} @ {signal['price']:.2f}, "
-            f"止损={signal['stop_loss']:.2f}, TP1={tp1_price:.2f}(50%), TP2={tp2_price:.2f}(50%)"
+            f"止损={signal['stop_loss']:.2f}, TP1={tp1_price:.2f}({tp1_pct}%), TP2={tp2_price:.2f}({tp2_pct}%)"
+            + (f" [TA-Lib: {talib_patterns}]" if talib_patterns else "")
         )
     else:
         logging.info(
             f"🎯 触发交易信号: {signal['signal']} {signal['side']} @ {signal['price']:.2f}, "
             f"止损={signal['stop_loss']:.2f}, 止盈={signal['take_profit']:.2f}, "
-            f"盈亏比=1:{signal['risk_reward_ratio']:.1f}, 市场模式={state_display}"
+            f"盈亏比=1:{signal['risk_reward_ratio']:.1f}, 市场模式={state_display}{talib_info}"
         )
         print(
             f"🎯 触发信号: {signal['signal']} {signal['side']} @ {signal['price']:.2f}, "
             f"止损={signal['stop_loss']:.2f}, 止盈={signal['take_profit']:.2f}"
+            + (f" [TA-Lib: {talib_patterns}]" if talib_patterns else "")
         )

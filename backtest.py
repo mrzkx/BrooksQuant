@@ -27,6 +27,7 @@ from binance import AsyncClient
 from logic.market_analyzer import MarketState, MarketAnalyzer
 from logic.patterns import PatternDetector
 from logic.state_machines import HState, LState, H2StateMachine, L2StateMachine
+from logic.talib_indicators import compute_ema, compute_atr
 
 
 # ============================================================================
@@ -240,21 +241,12 @@ class BacktestStrategy:
         self.pattern_detector.calculate_unified_stop_loss = staticmethod(custom_unified_stop_loss)
     
     def _compute_ema(self, df: pd.DataFrame) -> pd.Series:
-        """计算 EMA"""
-        return df["close"].ewm(span=self.ema_period, adjust=False).mean()
+        """计算 EMA (使用 TA-Lib)"""
+        return compute_ema(df["close"], self.ema_period)
     
     def _compute_atr(self, df: pd.DataFrame, period: int = 14) -> pd.Series:
-        """计算 ATR"""
-        high = df["high"]
-        low = df["low"]
-        close = df["close"]
-        
-        tr1 = high - low
-        tr2 = abs(high - close.shift(1))
-        tr3 = abs(low - close.shift(1))
-        
-        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-        return tr.ewm(span=period, adjust=False).mean()
+        """计算 ATR (使用 TA-Lib)"""
+        return compute_atr(df["high"], df["low"], df["close"], period)
     
     def _calculate_tp1_tp2(
         self, entry_price: float, stop_loss: float, side: str, 

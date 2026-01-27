@@ -69,6 +69,10 @@ async def execute_observe_order(
     tight_channel_score_val = signal.get("tight_channel_score", 0.0)
     signal_strength = signal.get("signal_strength", 0.0)
     
+    # 动态分批出场参数
+    tp1_close_ratio = signal.get("tp1_close_ratio", 0.5)
+    is_climax_bar = signal.get("is_climax_bar", False)
+    
     # 记录观察模式交易
     trade = trade_logger.open_position(
         user=user.name,
@@ -84,6 +88,8 @@ async def execute_observe_order(
         market_state=market_state_val,
         tight_channel_score=tight_channel_score_val,
         is_observe=True,
+        tp1_close_ratio=tp1_close_ratio,
+        is_climax_bar=is_climax_bar,
     )
     
     # 日志输出
@@ -136,6 +142,10 @@ async def execute_live_order(
     market_state_val = signal.get("market_state", "Unknown")
     tight_channel_score_val = signal.get("tight_channel_score", 0.0)
     signal_strength = signal.get("signal_strength", 0.0)
+    
+    # 动态分批出场参数
+    tp1_close_ratio = signal.get("tp1_close_ratio", 0.5)
+    is_climax_bar = signal.get("is_climax_bar", False)
     
     # 确定止损方向
     stop_side = "SELL" if signal["side"].lower() == "buy" else "BUY"
@@ -260,6 +270,8 @@ async def execute_live_order(
             market_state=market_state_val,
             tight_channel_score=tight_channel_score_val,
             is_observe=False,
+            tp1_close_ratio=tp1_close_ratio,
+            is_climax_bar=is_climax_bar,
         )
         
         # 日志输出
@@ -311,8 +323,12 @@ async def handle_close_request(
     
     try:
         if action_type == "tp1":
-            # TP1触发：执行50%平仓并更新止损
-            logging.info(f"[{user.name}] 🎯 执行TP1: 平仓50%")
+            # TP1触发：执行动态比例平仓并更新止损（动态保本）
+            close_qty = close_request["close_quantity"]
+            total_qty = close_qty + close_request.get("remaining_quantity", close_qty)
+            close_pct = int((close_qty / total_qty) * 100) if total_qty > 0 else 50
+            
+            logging.info(f"[{user.name}] 🎯 执行TP1: 平仓{close_pct}%")
             
             # 按 stepSize 截断数量（修复精度问题）
             tp1_qty = round_quantity_to_step_size(close_request["close_quantity"])
@@ -323,10 +339,10 @@ async def handle_close_request(
             )
             
             logging.info(
-                f"[{user.name}] ✅ TP1平仓成功: 数量={tp1_qty:.4f} BTC, "
+                f"[{user.name}] ✅ TP1平仓成功: 数量={tp1_qty:.4f} BTC ({close_pct}%), "
                 f"价格≈{close_request['close_price']:.2f}"
             )
-            print(f"[{user.name}] ✅ TP1平仓成功: 数量={tp1_qty:.4f} BTC")
+            print(f"[{user.name}] ✅ TP1平仓成功: 数量={tp1_qty:.4f} BTC ({close_pct}%)")
             
             # 取消原有止损单
             await user.cancel_all_orders(SYMBOL)
