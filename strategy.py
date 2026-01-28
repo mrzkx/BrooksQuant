@@ -35,6 +35,9 @@ from dataclasses import dataclass, field
 
 import redis.asyncio as aioredis
 
+# ⭐ 提前导入 MarketState，供 dataclass 使用
+from logic.market_analyzer import MarketState
+
 
 # ============================================================================
 # 辅助数据类（用于拆分 generate_signals）
@@ -128,8 +131,8 @@ class SignalResult:
     tp1_close_ratio: float = 0.5
     is_climax: bool = False
 
-# 导入模块化组件
-from logic.market_analyzer import MarketState, MarketAnalyzer
+# 导入模块化组件（MarketState 已在文件顶部导入）
+from logic.market_analyzer import MarketAnalyzer
 from logic.patterns import PatternDetector
 from logic.state_machines import H2StateMachine, L2StateMachine
 from logic.interval_params import get_interval_params, IntervalParams
