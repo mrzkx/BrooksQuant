@@ -296,11 +296,13 @@ class PatternDetector:
         if i < 10:  # 需要更多历史数据
             return None
         
-        # 只在 BREAKOUT 状态下触发（收紧：移除 CHANNEL 和 STRONG_TREND）
-        if market_state not in [MarketState.BREAKOUT]:
+        # ⭐ 优化：在 BREAKOUT 和 CHANNEL 状态都可触发
+        # Al Brooks: 通道中的突破也是有效信号，只要有足够的动能
+        if market_state not in [MarketState.BREAKOUT, MarketState.CHANNEL, MarketState.STRONG_TREND]:
             return None
         
-        # ===== 条件1: 实体大小（从 2x 提高到 3x）=====
+        # ===== 条件1: 实体大小 =====
+        # ⭐ 优化：从 3x 降回 2x（Al Brooks 标准）
         # 使用预计算的 body_size 列（向量化）
         if "body_size" not in df.columns:
             return None
@@ -312,8 +314,8 @@ class PatternDetector:
         avg_body = recent_bodies.mean()
         current_body = df.iloc[i]["body_size"]
         
-        # 实体阈值从 2x 提高到 3x
-        if avg_body == 0 or current_body < avg_body * 3:
+        # ⭐ 实体阈值从 3x 降到 2x
+        if avg_body == 0 or current_body < avg_body * 2:
             return None
         
         # 一次性提取当前行数据（减少多次 iloc 访问）
@@ -327,7 +329,6 @@ class PatternDetector:
         # 一次性提取前几根 K 线
         prev_bar_1 = df.iloc[i - 1]
         prev_bar_2 = df.iloc[i - 2]
-        prev_bar_3 = df.iloc[i - 3]
         
         # ATR 过滤：Climax 不追涨（周期自适应）
         if atr is not None and atr > 0:
@@ -341,13 +342,13 @@ class PatternDetector:
         
         # 向上突破
         if close > ema and close > open_price:
+            # ⭐ 优化：body_ratio 从 0.8 降到 0.7
             body_ratio = (close - low) / (high - low) if (high - low) > 0 else 0
-            if body_ratio > 0.8:
-                # 检查连续 3 根同向 K 线
+            if body_ratio > 0.7:
+                # ⭐ 优化：从 3 根同向 K 线降到 2 根（Al Brooks 标准是 2 根）
                 is_consecutive_bullish = (
                     prev_bar_1["close"] > prev_bar_1["open"] and
-                    prev_bar_2["close"] > prev_bar_2["open"] and
-                    prev_bar_3["close"] > prev_bar_3["open"]
+                    prev_bar_2["close"] > prev_bar_2["open"]
                 )
                 if not is_consecutive_bullish:
                     return None
@@ -369,13 +370,13 @@ class PatternDetector:
         
         # 向下突破
         elif close < ema and close < open_price:
+            # ⭐ 优化：body_ratio 从 0.8 降到 0.7
             body_ratio = (high - close) / (high - low) if (high - low) > 0 else 0
-            if body_ratio > 0.8:
-                # 检查连续 3 根同向 K 线
+            if body_ratio > 0.7:
+                # ⭐ 优化：从 3 根同向 K 线降到 2 根（Al Brooks 标准）
                 is_consecutive_bearish = (
                     prev_bar_1["close"] < prev_bar_1["open"] and
-                    prev_bar_2["close"] < prev_bar_2["open"] and
-                    prev_bar_3["close"] < prev_bar_3["open"]
+                    prev_bar_2["close"] < prev_bar_2["open"]
                 )
                 if not is_consecutive_bearish:
                     return None

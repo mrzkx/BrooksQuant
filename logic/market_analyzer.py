@@ -130,7 +130,7 @@ class MarketAnalyzer:
         if ema_crosses >= 4:
             return MarketState.TRADING_RANGE
         
-        # 检测强突破（Spike）- 优化：放宽条件
+        # 检测强突破（Spike）- ⭐ 优化：进一步放宽条件
         if i >= 1 and "body_size" in df.columns:
             # 使用预计算的 body_size 列（向量化）
             recent_bodies = df["body_size"].iloc[max(0, i - 10):i + 1]
@@ -138,17 +138,17 @@ class MarketAnalyzer:
             current_body = df.iloc[i]["body_size"]
             
             if avg_body > 0:
-                # 优化：只需当前K线实体 > 1.8倍平均值（原先需要连续两根 > 2倍）
-                if current_body > avg_body * 1.8:
+                # ⭐ 优化：从 1.8x 降到 1.5x（更容易触发 BREAKOUT）
+                if current_body > avg_body * 1.5:
                     close = df.iloc[i]["close"]
                     high = df.iloc[i]["high"]
                     low = df.iloc[i]["low"]
                     
                     if (high - low) > 0:
-                        # 优化：body_ratio 从 0.9 降到 0.8
-                        if close > ema and (close - low) / (high - low) > 0.8:
+                        # ⭐ 优化：body_ratio 从 0.8 降到 0.7（双向）
+                        if close > ema and (close - low) / (high - low) > 0.7:
                             return MarketState.BREAKOUT
-                        elif close < ema and (high - close) / (high - low) > 0.8:
+                        elif close < ema and (high - close) / (high - low) > 0.7:
                             return MarketState.BREAKOUT
         
         return MarketState.CHANNEL

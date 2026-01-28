@@ -6,12 +6,61 @@ H2/L2 状态机管理
 Al Brooks H2/L2 回调策略：
 - H2: 上升趋势中的第二次回调买入点
 - L2: 下降趋势中的第二次反弹卖出点
+
+Outside Bar 处理原则 (Al Brooks)：
+- Outside Bar 是指当前 K 线高点 > 前一根高点，且低点 < 前一根低点
+- Outside Bar 的方向由收盘价位置决定：
+  - 收盘在上半部分 (>50%) = 看涨 Outside Bar
+  - 收盘在下半部分 (<50%) = 看跌 Outside Bar
+- "Outside Bar 本质上是市场的犹豫，收盘价告诉我们谁赢了"
 """
 
+import logging
 import pandas as pd
 from enum import Enum
-from typing import Optional
+from typing import Optional, Tuple
 from dataclasses import dataclass
+
+
+def is_outside_bar(
+    current_high: float, current_low: float,
+    prev_high: float, prev_low: float
+) -> bool:
+    """
+    判断是否是 Outside Bar
+    
+    Al Brooks 定义：当前 K 线完全包含前一根 K 线
+    - 当前高点 > 前一根高点
+    - 当前低点 < 前一根低点
+    """
+    return current_high > prev_high and current_low < prev_low
+
+
+def get_outside_bar_bias(
+    high: float, low: float, close: float
+) -> str:
+    """
+    获取 Outside Bar 的方向偏好
+    
+    Al Brooks: "Outside Bar 本质上是市场的犹豫，收盘价告诉我们谁赢了"
+    
+    Returns:
+        "bullish": 收盘在上半部分，看涨
+        "bearish": 收盘在下半部分，看跌
+        "neutral": 收盘在中间（少见）
+    """
+    bar_range = high - low
+    if bar_range == 0:
+        return "neutral"
+    
+    close_position = (close - low) / bar_range
+    
+    if close_position >= 0.55:  # 收盘在上55%区域
+        return "bullish"
+    elif close_position <= 0.45:  # 收盘在下45%区域
+        return "bearish"
+    else:
+        return "neutral"
 
 
 class HState(Enum):
@@ -122,6 +171,10 @@ class H2StateMachine:
         # 问题8修复：验证状态一致性
         self._validate_state()
         
+        # 获取前一根 K 线数据用于 Outside Bar 检测
+        prev_high = df.iloc[i - 1]["high"] if i > 0 else high
+        prev_low = df.iloc[i - 1]["low"] if i > 0 else low
+        
         if close > ema:
             if self.state == HState.WAITING_FOR_PULLBACK:
                 if self.trend_high is None or high > self.trend_high:
@@ -139,25 +192,62 @@ class H2StateMachine:
                         self.is_strong_trend = False
             
             elif self.state == HState.H1_DETECTED:
-                # Outside Bar 处理：优先检测突破失败（低点突破）
-                # 因为失败信号比延续信号更重要
-                if self.pullback_start_low is not None and low < self.pullback_start_low:
-                    # 突破失败：低点跌破回调起点 -> 重置状态机
-                    self.state = HState.WAITING_FOR_PULLBACK
-                    self.trend_high = high if self.trend_high is None or high > self.trend_high else self.trend_high
-                    self.pullback_start_low = None
-                    self.h1_high = None
-                elif high > self.h1_high:
-                    # 延续上涨：更新高点
-                    self.h1_high = high
-                elif self.h1_high is not None and low < self.h1_high:
-                    # 开始回调：进入等待 H2 状态
-                    if self.pullback_start_low is not None and low >= self.pullback_start_low:
-                        self.state = HState.WAITING_FOR_H2
-                    elif self.pullback_start_low is None:
-                        # 防护：如果 pullback_start_low 未设置，设置当前低点
-                        self.pullback_start_low = low
-                        self.state = HState.WAITING_FOR_H2
+                # ========== Outside Bar 处理（Al Brooks 原则）==========
+                # Outside Bar 是市场犹豫的表现，收盘价决定方向
+                is_ob = is_outside_bar(high, low, prev_high, prev_low)
+                
+                if is_ob:
+                    # Outside Bar: 根据收盘价位置判断方向
+                    ob_bias = get_outside_bar_bias(high, low, close)
+                    
+                    if ob_bias == "bullish":
+                        # 看涨 Outside Bar: 趋势延续，更新高点
+                        self.h1_high = high
+                        logging.debug(
+                            f"📊 H2状态机: 看涨 Outside Bar @ bar {i}, "
+                            f"收盘偏上，趋势延续"
+                        )
+                    elif ob_bias == "bearish":
+                        # 看跌 Outside Bar: 检查是否跌破回调起点
+                        if self.pullback_start_low is not None and low < self.pullback_start_low:
+                            # 跌破回调起点，重置状态机
+                            self.state = HState.WAITING_FOR_PULLBACK
+                            self.trend_high = high
+                            self.pullback_start_low = None
+                            self.h1_high = None
+                            logging.debug(
+                                f"📊 H2状态机: 看跌 Outside Bar @ bar {i}, "
+                                f"跌破回调起点，重置状态机"
+                            )
+                        else:
+                            # 未跌破回调起点，进入等待 H2 状态
+                            self.state = HState.WAITING_FOR_H2
+                            logging.debug(
+                                f"📊 H2状态机: 看跌 Outside Bar @ bar {i}, "
+                                f"进入等待 H2"
+                            )
+                    else:
+                        # 中性 Outside Bar: 保持当前状态，更新高点
+                        self.h1_high = max(self.h1_high or high, high)
+                else:
+                    # ========== 非 Outside Bar 的标准处理 ==========
+                    if self.pullback_start_low is not None and low < self.pullback_start_low:
+                        # 突破失败：低点跌破回调起点 -> 重置状态机
+                        self.state = HState.WAITING_FOR_PULLBACK
+                        self.trend_high = high if self.trend_high is None or high > self.trend_high else self.trend_high
+                        self.pullback_start_low = None
+                        self.h1_high = None
+                    elif high > self.h1_high:
+                        # 延续上涨：更新高点
+                        self.h1_high = high
+                    elif self.h1_high is not None and low < self.h1_high:
+                        # 开始回调：进入等待 H2 状态
+                        if self.pullback_start_low is not None and low >= self.pullback_start_low:
+                            self.state = HState.WAITING_FOR_H2
+                        elif self.pullback_start_low is None:
+                            # 防护：如果 pullback_start_low 未设置，设置当前低点
+                            self.pullback_start_low = low
+                            self.state = HState.WAITING_FOR_H2
             
             elif self.state == HState.WAITING_FOR_H2:
                 if self.h1_high is not None and high > self.h1_high:
@@ -266,6 +356,10 @@ class L2StateMachine:
         # 问题8修复：验证状态一致性
         self._validate_state()
         
+        # 获取前一根 K 线数据用于 Outside Bar 检测
+        prev_high = df.iloc[i - 1]["high"] if i > 0 else high
+        prev_low = df.iloc[i - 1]["low"] if i > 0 else low
+        
         if close < ema:
             if self.state == LState.WAITING_FOR_BOUNCE:
                 if self.trend_low is None or low < self.trend_low:
@@ -283,25 +377,62 @@ class L2StateMachine:
                         self.is_strong_trend = False
             
             elif self.state == LState.L1_DETECTED:
-                # Outside Bar 处理：优先检测突破失败（高点突破）
-                # 因为失败信号比延续信号更重要
-                if self.bounce_start_high is not None and high > self.bounce_start_high:
-                    # 突破失败：高点突破反弹起点 -> 重置状态机
-                    self.state = LState.WAITING_FOR_BOUNCE
-                    self.trend_low = low if self.trend_low is None or low < self.trend_low else self.trend_low
-                    self.bounce_start_high = None
-                    self.l1_low = None
-                elif low < self.l1_low:
-                    # 延续下跌：更新低点
-                    self.l1_low = low
-                elif self.l1_low is not None and high > self.l1_low:
-                    # 开始反弹：进入等待 L2 状态
-                    if self.bounce_start_high is not None and high <= self.bounce_start_high:
-                        self.state = LState.WAITING_FOR_L2
-                    elif self.bounce_start_high is None:
-                        # 防护：如果 bounce_start_high 未设置，设置当前高点
-                        self.bounce_start_high = high
-                        self.state = LState.WAITING_FOR_L2
+                # ========== Outside Bar 处理（Al Brooks 原则）==========
+                # Outside Bar 是市场犹豫的表现，收盘价决定方向
+                is_ob = is_outside_bar(high, low, prev_high, prev_low)
+                
+                if is_ob:
+                    # Outside Bar: 根据收盘价位置判断方向
+                    ob_bias = get_outside_bar_bias(high, low, close)
+                    
+                    if ob_bias == "bearish":
+                        # 看跌 Outside Bar: 趋势延续，更新低点
+                        self.l1_low = low
+                        logging.debug(
+                            f"📊 L2状态机: 看跌 Outside Bar @ bar {i}, "
+                            f"收盘偏下，趋势延续"
+                        )
+                    elif ob_bias == "bullish":
+                        # 看涨 Outside Bar: 检查是否突破反弹起点
+                        if self.bounce_start_high is not None and high > self.bounce_start_high:
+                            # 突破反弹起点，重置状态机
+                            self.state = LState.WAITING_FOR_BOUNCE
+                            self.trend_low = low
+                            self.bounce_start_high = None
+                            self.l1_low = None
+                            logging.debug(
+                                f"📊 L2状态机: 看涨 Outside Bar @ bar {i}, "
+                                f"突破反弹起点，重置状态机"
+                            )
+                        else:
+                            # 未突破反弹起点，进入等待 L2 状态
+                            self.state = LState.WAITING_FOR_L2
+                            logging.debug(
+                                f"📊 L2状态机: 看涨 Outside Bar @ bar {i}, "
+                                f"进入等待 L2"
+                            )
+                    else:
+                        # 中性 Outside Bar: 保持当前状态，更新低点
+                        self.l1_low = min(self.l1_low or low, low)
+                else:
+                    # ========== 非 Outside Bar 的标准处理 ==========
+                    if self.bounce_start_high is not None and high > self.bounce_start_high:
+                        # 突破失败：高点突破反弹起点 -> 重置状态机
+                        self.state = LState.WAITING_FOR_BOUNCE
+                        self.trend_low = low if self.trend_low is None or low < self.trend_low else self.trend_low
+                        self.bounce_start_high = None
+                        self.l1_low = None
+                    elif low < self.l1_low:
+                        # 延续下跌：更新低点
+                        self.l1_low = low
+                    elif self.l1_low is not None and high > self.l1_low:
+                        # 开始反弹：进入等待 L2 状态
+                        if self.bounce_start_high is not None and high <= self.bounce_start_high:
+                            self.state = LState.WAITING_FOR_L2
+                        elif self.bounce_start_high is None:
+                            # 防护：如果 bounce_start_high 未设置，设置当前高点
+                            self.bounce_start_high = high
+                            self.state = LState.WAITING_FOR_L2
             
             elif self.state == LState.WAITING_FOR_L2:
                 if self.l1_low is not None and low < self.l1_low:

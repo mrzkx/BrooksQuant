@@ -121,20 +121,21 @@ INTERVAL_PARAMS: Dict[str, IntervalParams] = {
     ),
     
     # ========== 5分钟：标准周期（当前默认）==========
+    # ⭐ 优化：放宽信号棒质量要求，增加信号频率
     "5m": IntervalParams(
-        min_body_ratio=0.60,            # 当前值
-        close_position_pct=0.20,        # 当前值
+        min_body_ratio=0.50,            # ⭐ 从 0.60 降到 0.50（Al Brooks 允许更多形态）
+        close_position_pct=0.25,        # ⭐ 从 0.20 放宽到 0.25
         
         slope_threshold_pct=0.008,      # 0.8%（10根=50分钟）
         strong_trend_threshold=0.50,    # 当前值
         trend_lookback_bars=10,
         
-        signal_cooldown_bars=5,         # 25 分钟
+        signal_cooldown_bars=3,         # ⭐ 从 5 降到 3（15 分钟，更灵活）
         
         atr_stop_min_mult=1.5,          # 当前值
         atr_stop_max_mult=3.0,          # 当前值
         atr_climax_mult=2.5,            # 当前值
-        atr_spike_filter_mult=2.5,
+        atr_spike_filter_mult=3.0,      # ⭐ 从 2.5 提高到 3.0（允许更大的突破）
         
         wedge_min_total_span=8,
         wedge_min_leg_span=2,
