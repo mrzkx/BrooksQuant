@@ -17,7 +17,7 @@ import argparse
 import logging
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Union
 from decimal import Decimal, ROUND_DOWN
 
 import pandas as pd
@@ -28,6 +28,7 @@ from logic.market_analyzer import MarketState, MarketAnalyzer
 from logic.patterns import PatternDetector
 from logic.state_machines import H2StateMachine, L2StateMachine
 from logic.talib_indicators import compute_ema, compute_atr
+from logic.htf_filter import HTFTrend
 
 
 # ============================================================================
@@ -165,14 +166,18 @@ class BacktestStrategy:
     - 可配置止损 ATR 乘数
     """
     
-    def __init__(self, ema_period: int = 20, lookback_period: int = 20, stop_loss_atr_multiplier: float = 2.0):
+    def __init__(self, ema_period: int = 20, lookback_period: int = 20, stop_loss_atr_multiplier: float = 2.0, kline_interval: str = "5m"):
         self.ema_period = ema_period
         self.lookback_period = lookback_period
         self.stop_loss_atr_multiplier = stop_loss_atr_multiplier  # 止损 ATR 乘数
+        self.kline_interval = kline_interval
         
         # 初始化模块化组件
-        self.market_analyzer = MarketAnalyzer(ema_period=ema_period)
-        self.pattern_detector = PatternDetector(lookback_period=lookback_period)
+        self.market_analyzer = MarketAnalyzer(ema_period=ema_period, kline_interval=kline_interval)
+        self.pattern_detector = PatternDetector(lookback_period=lookback_period, kline_interval=kline_interval)
+        
+        # HTF 趋势缓存（用于过滤 H2/L2 信号）
+        self._htf_trend_cache: Optional[Dict[int, HTFTrend]] = None
         
         # 覆盖 pattern_detector 的止损计算方法
         self._override_stop_loss_calculation()
@@ -248,6 +253,74 @@ class BacktestStrategy:
         """计算 ATR (使用 TA-Lib)"""
         return compute_atr(df["high"], df["low"], df["close"], period)
     
+    async def _compute_htf_trend(self, df_5m: pd.DataFrame, client: AsyncClient, symbol: str = "BTCUSDT") -> Dict[int, HTFTrend]:
+        """
+        计算 HTF (1h) 趋势，用于过滤 H2/L2 信号
+        
+        返回每个 5m K 线索引对应的 1h 趋势
+        """
+        htf_trends: Dict[int, HTFTrend] = {}
+        
+        try:
+            # 获取 1h K 线数据
+            start_str = df_5m.index[0].strftime("%Y-%m-%d")
+            end_str = (df_5m.index[-1] + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+            
+            klines_1h = await client.get_historical_klines(
+                symbol=symbol,
+                interval="1h",
+                start_str=start_str,
+                end_str=end_str
+            )
+            
+            if not klines_1h or len(klines_1h) < 20:
+                logging.warning("⚠️ HTF 数据不足，跳过 HTF 过滤")
+                return htf_trends
+            
+            # 转换为 DataFrame
+            df_1h = pd.DataFrame(klines_1h, columns=[
+                "open_time", "open", "high", "low", "close", "volume",
+                "close_time", "quote_volume", "trades", "taker_buy_base",
+                "taker_buy_quote", "ignore"
+            ])
+            df_1h["open_time"] = pd.to_datetime(df_1h["open_time"], unit="ms")
+            df_1h["close"] = df_1h["close"].astype(float)
+            df_1h = df_1h.set_index("open_time")
+            
+            # 计算 1h EMA20
+            df_1h["ema"] = compute_ema(df_1h["close"], 20)
+            
+            # 计算 EMA 斜率（最近 3 根）
+            slope_lookback = 3
+            for i in range(20 + slope_lookback, len(df_1h)):
+                ema_values = df_1h["ema"].iloc[i - slope_lookback:i + 1].values
+                if len(ema_values) >= 2:
+                    ema_start = ema_values[0]
+                    ema_end = ema_values[-1]
+                    ema_slope = (ema_end - ema_start) / ema_start if ema_start > 0 else 0
+                    
+                    # 判断趋势
+                    if ema_slope > 0.001:  # 0.1%
+                        trend = HTFTrend.BULLISH
+                    elif ema_slope < -0.001:
+                        trend = HTFTrend.BEARISH
+                    else:
+                        trend = HTFTrend.NEUTRAL
+                    
+                    # 找到这个 1h K 线对应的所有 5m K 线
+                    htf_time = df_1h.index[i]
+                    for j, kline_time in enumerate(df_5m.index):
+                        # 如果 5m K 线在这个 1h K 线的时间范围内
+                        if htf_time <= kline_time < htf_time + pd.Timedelta(hours=1):
+                            htf_trends[j] = trend
+            
+            logging.info(f"✅ HTF 趋势计算完成: {len(htf_trends)} 个 5m K 线有 HTF 趋势数据")
+            
+        except Exception as e:
+            logging.warning(f"⚠️ HTF 趋势计算失败: {e}，跳过 HTF 过滤")
+        
+        return htf_trends
+    
     def _calculate_tp1_tp2(
         self, entry_price: float, stop_loss: float, side: str, 
         base_height: float, atr: Optional[float] = None
@@ -270,19 +343,55 @@ class BacktestStrategy:
         
         return (tp1, tp2)
     
-    def generate_signals(self, df: pd.DataFrame, show_progress: bool = True) -> pd.DataFrame:
+    async def generate_signals(self, df: pd.DataFrame, show_progress: bool = True, htf_client: Optional[AsyncClient] = None, symbol: str = "BTCUSDT") -> pd.DataFrame:
         """
-        生成交易信号（同步版本）
+        生成交易信号（同步版本，但 HTF 计算需要异步）
         
         与实盘 AlBrooksStrategy.generate_signals 逻辑一致
+        添加了 HTF 过滤和信号棒质量验证（仅用于 H2/L2 信号）
         """
         data = df.copy()
+        
+        # 确保数据类型为 float
+        for col in ["open", "high", "low", "close"]:
+            if col in data.columns:
+                data[col] = data[col].astype(float)
+        
+        # 计算技术指标
         data["ema"] = self._compute_ema(data)
         
         if len(data) >= 20:
             data["atr"] = self._compute_atr(data, period=20)
         else:
-            data["atr"] = None
+            data["atr"] = data["high"] - data["low"]  # 用波幅代替
+        
+        # 计算 HTF 趋势（用于过滤 H2/L2 信号）
+        if htf_client is not None:
+            self._htf_trend_cache = await self._compute_htf_trend(data, htf_client, symbol)
+        else:
+            self._htf_trend_cache = {}
+        
+        # 预计算基础向量化列（pattern_detector 需要）
+        data["body_size"] = (data["close"] - data["open"]).abs()
+        data["kline_range"] = data["high"] - data["low"]
+        data["is_bullish"] = data["close"] > data["open"]
+        data["is_bearish"] = data["close"] < data["open"]
+        
+        # 避免除零
+        data["body_ratio"] = data["body_size"] / data["kline_range"].replace(0, float('nan'))
+        data["body_ratio"] = data["body_ratio"].fillna(0)
+        
+        # 价格与 EMA 关系
+        data["above_ema"] = data["close"] > data["ema"]
+        data["ema_distance"] = (data["close"] - data["ema"]).abs()
+        data["ema_distance_pct"] = data["ema_distance"] / data["ema"]
+        
+        # EMA 穿越检测（向量化）
+        data["ema_cross"] = data["above_ema"].astype(int).diff().abs()
+        
+        # 滚动计算（用于 Spike/Climax 检测）
+        data["body_size_ma10"] = data["body_size"].rolling(window=10, min_periods=1).mean()
+        data["kline_range_ma10"] = data["kline_range"].rolling(window=10, min_periods=1).mean()
         
         total_bars = len(data)
         progress_interval = max(total_bars // 20, 1000)  # 每5%或1000根打印一次
@@ -457,13 +566,25 @@ class BacktestStrategy:
                     tp1_prices[i], tp2_prices[i] = tp1, tp2
                     continue
             
-            # H2 状态机
+            # H2 状态机（添加 HTF 过滤和信号棒质量验证）
             if allowed_side is None or allowed_side == "buy":
                 h2_signal = h2_machine.update(
                     close, high, low, ema, atr, data, i,
                     self.pattern_detector.calculate_unified_stop_loss
                 )
                 if h2_signal:
+                    # HTF 过滤：只允许买入信号在非下降趋势时触发
+                    htf_trend = self._htf_trend_cache.get(i, HTFTrend.NEUTRAL)
+                    if htf_trend == HTFTrend.BEARISH:
+                        continue  # HTF 下降趋势，禁止买入
+                    
+                    # 信号棒质量验证
+                    bar_valid, bar_reason = self.pattern_detector.validate_btc_signal_bar(
+                        data.iloc[i], h2_signal.side
+                    )
+                    if not bar_valid:
+                        continue  # 信号棒质量不合格
+                    
                     signals[i] = h2_signal.signal_type
                     sides[i] = h2_signal.side
                     stops[i] = h2_signal.stop_loss
@@ -472,13 +593,25 @@ class BacktestStrategy:
                     tp1, tp2 = self._calculate_tp1_tp2(close, h2_signal.stop_loss, h2_signal.side, h2_signal.base_height, atr)
                     tp1_prices[i], tp2_prices[i] = tp1, tp2
             
-            # L2 状态机
+            # L2 状态机（添加 HTF 过滤和信号棒质量验证）
             if allowed_side is None or allowed_side == "sell":
                 l2_signal = l2_machine.update(
                     close, high, low, ema, atr, data, i,
                     self.pattern_detector.calculate_unified_stop_loss
                 )
                 if l2_signal:
+                    # HTF 过滤：只允许卖出信号在非上升趋势时触发
+                    htf_trend = self._htf_trend_cache.get(i, HTFTrend.NEUTRAL)
+                    if htf_trend == HTFTrend.BULLISH:
+                        continue  # HTF 上升趋势，禁止卖出
+                    
+                    # 信号棒质量验证
+                    bar_valid, bar_reason = self.pattern_detector.validate_btc_signal_bar(
+                        data.iloc[i], l2_signal.side
+                    )
+                    if not bar_valid:
+                        continue  # 信号棒质量不合格
+                    
                     signals[i] = l2_signal.signal_type
                     sides[i] = l2_signal.side
                     stops[i] = l2_signal.stop_loss
@@ -513,7 +646,8 @@ class BacktestEngine:
         self.strategy = BacktestStrategy(
             ema_period=config.ema_period,
             lookback_period=config.lookback_period,
-            stop_loss_atr_multiplier=config.stop_loss_atr_multiplier
+            stop_loss_atr_multiplier=config.stop_loss_atr_multiplier,
+            kline_interval=config.interval
         )
         
         # 交易状态
@@ -813,12 +947,21 @@ class BacktestEngine:
         if reason == "stop_loss" and total_pnl < 0:
             self.cooldown_until = bar_idx + self.config.cooldown_bars
     
-    def run(self, df: pd.DataFrame) -> BacktestResult:
+    async def run(self, df: pd.DataFrame) -> BacktestResult:
         """运行回测"""
         logging.info("正在生成交易信号...")
         
-        # 生成信号
-        df_with_signals = self.strategy.generate_signals(df)
+        # 创建客户端用于获取 HTF 数据
+        client = await AsyncClient.create()
+        try:
+            # 生成信号（传递客户端用于 HTF 计算）
+            df_with_signals = await self.strategy.generate_signals(
+                df, 
+                htf_client=client,
+                symbol=self.config.symbol
+            )
+        finally:
+            await client.close_connection()
         
         # 过滤到回测时间范围
         start_dt = datetime.strptime(self.config.start_date, "%Y-%m-%d")

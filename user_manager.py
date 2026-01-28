@@ -657,6 +657,137 @@ class TradingUser:
             reduce_only=True,
         )
 
+    async def has_open_position(self, symbol: str) -> bool:
+        """
+        检查是否有未平仓的仓位（双止损优化）
+        
+        用于在程序执行止损前检查仓位是否已被硬止损单平掉
+        
+        Args:
+            symbol: 交易对
+        
+        Returns:
+            bool: True 表示有仓位，False 表示无仓位
+        """
+        if self.client is None:
+            raise RuntimeError(f"用户 {self.name} 尚未连接客户端")
+        
+        try:
+            positions = await self.client.futures_position_information(symbol=symbol)
+            for pos in positions:
+                amt = float(pos.get("positionAmt", 0))
+                if amt != 0:
+                    logging.debug(f"[{self.name}] 检测到仓位: {symbol} {amt}")
+                    return True
+            
+            logging.debug(f"[{self.name}] 无仓位: {symbol}")
+            return False
+            
+        except Exception as e:
+            logging.error(f"[{self.name}] 检查仓位失败: {e}")
+            raise
+
+    async def get_recent_trades(self, symbol: str, limit: int = 10) -> list:
+        """
+        获取最近的成交记录（用于计算实际盈亏）
+        
+        Args:
+            symbol: 交易对
+            limit: 返回记录数
+        
+        Returns:
+            成交记录列表，包含 price, qty, commission, commissionAsset 等
+        """
+        if self.client is None:
+            raise RuntimeError(f"用户 {self.name} 尚未连接客户端")
+        
+        try:
+            trades = await self.client.futures_account_trades(symbol=symbol, limit=limit)
+            return trades
+        except Exception as e:
+            logging.error(f"[{self.name}] 获取成交记录失败: {e}")
+            return []
+
+    async def get_trade_details(self, symbol: str, quantity: float) -> dict:
+        """
+        获取最近平仓的实际成交详情（价格和手续费）
+        
+        通过匹配数量找到对应的成交记录
+        
+        Args:
+            symbol: 交易对
+            quantity: 平仓数量
+        
+        Returns:
+            {
+                "avg_price": 实际成交均价,
+                "commission": 手续费,
+                "commission_asset": 手续费资产
+            }
+        """
+        if self.client is None:
+            raise RuntimeError(f"用户 {self.name} 尚未连接客户端")
+        
+        try:
+            # 获取最近 20 条成交记录
+            trades = await self.client.futures_account_trades(symbol=symbol, limit=20)
+            
+            if not trades:
+                return {"avg_price": 0, "commission": 0, "commission_asset": "USDT"}
+            
+            # 按时间倒序（最新的在前）
+            trades.sort(key=lambda x: x.get("time", 0), reverse=True)
+            
+            # 查找匹配数量的成交（可能分多笔成交）
+            target_qty = abs(float(quantity))
+            matched_trades = []
+            accumulated_qty = 0
+            
+            for trade in trades:
+                trade_qty = abs(float(trade.get("qty", 0)))
+                accumulated_qty += trade_qty
+                matched_trades.append(trade)
+                
+                # 累计数量达到目标（允许 1% 误差）
+                if accumulated_qty >= target_qty * 0.99:
+                    break
+            
+            if not matched_trades:
+                return {"avg_price": 0, "commission": 0, "commission_asset": "USDT"}
+            
+            # 计算加权平均价格和总手续费
+            total_value = 0
+            total_qty = 0
+            total_commission = 0
+            commission_asset = "USDT"
+            
+            for trade in matched_trades:
+                price = float(trade.get("price", 0))
+                qty = abs(float(trade.get("qty", 0)))
+                commission = float(trade.get("commission", 0))
+                commission_asset = trade.get("commissionAsset", "USDT")
+                
+                total_value += price * qty
+                total_qty += qty
+                total_commission += commission
+            
+            avg_price = total_value / total_qty if total_qty > 0 else 0
+            
+            logging.info(
+                f"[{self.name}] 成交详情: 均价={avg_price:.2f}, "
+                f"手续费={total_commission:.4f} {commission_asset}"
+            )
+            
+            return {
+                "avg_price": avg_price,
+                "commission": total_commission,
+                "commission_asset": commission_asset,
+            }
+            
+        except Exception as e:
+            logging.error(f"[{self.name}] 获取成交详情失败: {e}")
+            return {"avg_price": 0, "commission": 0, "commission_asset": "USDT"}
+
     def calculate_limit_price(
         self, 
         current_price: float, 

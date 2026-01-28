@@ -87,6 +87,11 @@ class Trade(Base):
     tp1_close_ratio = Column(Float, default=0.5)  # TP1 平仓比例（默认50%，Climax时75%）
     is_climax_bar = Column(Boolean, default=False)  # 是否是 Climax 信号棒
     
+    # 双止损配置（Al Brooks 风险管理）
+    # soft_stop_loss = stop_loss（基于 K 线收盘价判断）
+    # hard_stop_loss = 挂在币安的止损单价格（比 soft_stop_loss 更宽松，作为保险）
+    hard_stop_loss = Column(Float, nullable=True)  # 硬止损价格（挂单价格）
+    
     # 市场上下文
     market_state = Column(String(50), nullable=True)
     tight_channel_score = Column(Float, nullable=True)
@@ -265,6 +270,7 @@ class TradeLogger:
         is_observe: bool = True,  # 默认为观察模式
         tp1_close_ratio: float = 0.5,  # TP1 平仓比例（默认50%，Climax时75%）
         is_climax_bar: bool = False,  # 是否是 Climax 信号棒
+        hard_stop_loss: Optional[float] = None,  # 硬止损价格（挂单价格，比 stop_loss 更宽松）
     ) -> Trade:
         """开仓并持久化（线程安全）"""
         # 将 numpy 类型转换为 Python 原生类型（PostgreSQL 不支持 np.float64）
@@ -276,6 +282,8 @@ class TradeLogger:
         tp1_price = float(tp1_price) if tp1_price is not None else None
         tp2_price = float(tp2_price) if tp2_price is not None else None
         tight_channel_score = float(tight_channel_score) if tight_channel_score is not None else None
+        tp1_close_ratio = float(tp1_close_ratio) if tp1_close_ratio is not None else 0.5
+        hard_stop_loss = float(hard_stop_loss) if hard_stop_loss is not None else None
 
         with self._lock:
             # 已有持仓则先平仓（注意：close_position 内部也会获取锁，使用 RLock 避免死锁）
@@ -298,7 +306,7 @@ class TradeLogger:
                     remaining_quantity=quantity,
                     breakeven_moved=False,
                     # 追踪止损初始化（问题3修复）
-                    original_stop_loss=stop_loss,  # 保存原始止损
+                    original_stop_loss=stop_loss,  # 保存原始止损（软止损）
                     trailing_stop_price=None,
                     trailing_stop_activated=False,
                     trailing_max_profit_r=None,
@@ -310,6 +318,8 @@ class TradeLogger:
                     # 动态分批出场参数
                     tp1_close_ratio=tp1_close_ratio,
                     is_climax_bar=is_climax_bar,
+                    # 双止损配置
+                    hard_stop_loss=hard_stop_loss,  # 硬止损价格（挂单价格）
                 )
 
                 session.add(trade)
@@ -394,6 +404,78 @@ class TradeLogger:
 
             self.positions[user] = None
             return trade
+
+    def update_trade_with_actual_pnl(
+        self,
+        user: str,
+        actual_exit_price: float,
+        commission: float = 0.0,
+        open_commission: float = 0.0,
+    ) -> bool:
+        """
+        更新交易记录的实际盈亏（使用币安真实成交数据）
+        
+        在平仓后调用，用真实成交价和手续费更新数据库记录
+        
+        Args:
+            user: 用户名
+            actual_exit_price: 实际成交价
+            commission: 平仓手续费
+            open_commission: 开仓手续费（可选，如果已知）
+        
+        Returns:
+            bool: 是否更新成功
+        """
+        # 将 numpy 类型转换为 Python 原生类型
+        actual_exit_price = float(actual_exit_price)
+        commission = float(commission)
+        open_commission = float(open_commission)
+        
+        with self.session_scope() as session:
+            try:
+                # 查找最近关闭的交易
+                trade = session.query(Trade).filter(
+                    Trade.user == user,
+                    Trade.status == "closed"
+                ).order_by(Trade.updated_at.desc()).first()
+                
+                if not trade:
+                    logging.warning(f"[{user}] 未找到最近的已关闭交易，无法更新盈亏")
+                    return False
+                
+                # 更新实际出场价
+                old_exit_price = trade.exit_price
+                trade.exit_price = actual_exit_price
+                
+                # 重新计算盈亏（包含手续费）
+                qty = trade.remaining_quantity or trade.quantity
+                
+                if trade.side == "buy":
+                    raw_pnl = (actual_exit_price - float(trade.entry_price)) * float(qty)
+                else:
+                    raw_pnl = (float(trade.entry_price) - actual_exit_price) * float(qty)
+                
+                # 扣除手续费（开仓+平仓）
+                total_commission = commission + open_commission
+                trade.pnl = raw_pnl - total_commission
+                
+                # 重新计算百分比
+                cost_basis = float(trade.entry_price) * float(trade.quantity)
+                if cost_basis > 0:
+                    trade.pnl_percent = (trade.pnl / cost_basis) * 100
+                
+                session.merge(trade)
+                
+                logging.info(
+                    f"[{user}] 更新实际盈亏: 出场价 {old_exit_price:.2f} → {actual_exit_price:.2f}, "
+                    f"手续费={total_commission:.4f}, 实际盈亏={trade.pnl:.4f} USDT ({trade.pnl_percent:.2f}%)"
+                )
+                
+                return True
+                
+            except Exception as e:
+                logging.error(f"[{user}] 更新实际盈亏失败: {e}")
+                return False
 
     def check_stop_loss_take_profit(self, user: str, current_price: float) -> Optional[Trade]:
         """

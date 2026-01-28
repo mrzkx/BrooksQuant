@@ -277,6 +277,20 @@ KLINE_INTERVAL = TRADING_CONFIG["interval"]
 LARGE_BALANCE_THRESHOLD = TRADING_CONFIG["large_balance_threshold"]
 LARGE_BALANCE_POSITION_PCT = TRADING_CONFIG["large_balance_position_pct"]
 
+# ============================================================================
+# 双止损配置（Al Brooks 风险管理）
+# ============================================================================
+# 
+# 双止损方案说明：
+# 1. 软止损（程序监控）：基于 K 线收盘价判断，避免假突破
+# 2. 硬止损（挂止损单）：作为保险，防止程序崩溃时仓位失控
+#
+# 硬止损价格 = 软止损价格 × (1 + HARD_STOP_BUFFER_PCT)  （做多时）
+# 硬止损价格 = 软止损价格 × (1 - HARD_STOP_BUFFER_PCT)  （做空时）
+
+# 硬止损缓冲百分比（默认 0.15%，即比软止损多 0.15% 的缓冲空间）
+HARD_STOP_BUFFER_PCT = float(os.getenv("HARD_STOP_BUFFER_PCT", "0.15")) / 100
+
 
 # ============================================================================
 # 日志配置
