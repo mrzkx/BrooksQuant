@@ -42,7 +42,10 @@ async def print_stats_periodically(
             position_info = ""
             if has_position:
                 pos = trade_logger.positions[user.name]
-                position_info = f", 当前持仓: {pos.signal} {pos.side} @ {pos.entry_price:.2f}"
+                # 确保 entry_price 有效（不为 0）
+                entry_price = getattr(pos, 'entry_price', 0) or 0
+                if entry_price > 0:
+                    position_info = f", 当前持仓: {pos.signal} {pos.side} @ {entry_price:.2f}"
 
             mode_tag = "🔍观察" if OBSERVE_MODE else "💰实盘"
             stats_msg = (

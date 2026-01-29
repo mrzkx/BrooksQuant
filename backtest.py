@@ -60,6 +60,9 @@ class BacktestConfig:
     # 风控参数
     cooldown_bars: int = 3  # 止损后冷却K线数
 
+    # 回测专用：是否对 H2/L2 使用 1h HTF 过滤（默认关闭，便于统计 H2/L2 触发与胜率）
+    use_htf_filter_for_h2l2: bool = False
+
 
 # ============================================================================
 # 数据结构
@@ -166,12 +169,13 @@ class BacktestStrategy:
     - 可配置止损 ATR 乘数
     """
     
-    def __init__(self, ema_period: int = 20, lookback_period: int = 20, stop_loss_atr_multiplier: float = 2.0, kline_interval: str = "5m"):
+    def __init__(self, ema_period: int = 20, lookback_period: int = 20, stop_loss_atr_multiplier: float = 2.0, kline_interval: str = "5m", use_htf_filter_for_h2l2: bool = False):
         self.ema_period = ema_period
         self.lookback_period = lookback_period
         self.stop_loss_atr_multiplier = stop_loss_atr_multiplier  # 止损 ATR 乘数
         self.kline_interval = kline_interval
-        
+        self.use_htf_filter_for_h2l2 = use_htf_filter_for_h2l2  # 回测时默认 False，让 H2/L2 能触发
+
         # 初始化模块化组件
         self.market_analyzer = MarketAnalyzer(ema_period=ema_period, kline_interval=kline_interval)
         self.pattern_detector = PatternDetector(lookback_period=lookback_period, kline_interval=kline_interval)
@@ -573,10 +577,11 @@ class BacktestStrategy:
                     self.pattern_detector.calculate_unified_stop_loss
                 )
                 if h2_signal:
-                    # HTF 过滤：只允许买入信号在非下降趋势时触发
-                    htf_trend = self._htf_trend_cache.get(i, HTFTrend.NEUTRAL)
-                    if htf_trend == HTFTrend.BEARISH:
-                        continue  # HTF 下降趋势，禁止买入
+                    # HTF 过滤（回测可关闭）：只允许买入信号在非下降趋势时触发
+                    if self.use_htf_filter_for_h2l2:
+                        htf_trend = self._htf_trend_cache.get(i, HTFTrend.NEUTRAL)
+                        if htf_trend == HTFTrend.BEARISH:
+                            continue  # HTF 下降趋势，禁止买入
                     
                     # 信号棒质量验证
                     bar_valid, bar_reason = self.pattern_detector.validate_btc_signal_bar(
@@ -600,10 +605,11 @@ class BacktestStrategy:
                     self.pattern_detector.calculate_unified_stop_loss
                 )
                 if l2_signal:
-                    # HTF 过滤：只允许卖出信号在非上升趋势时触发
-                    htf_trend = self._htf_trend_cache.get(i, HTFTrend.NEUTRAL)
-                    if htf_trend == HTFTrend.BULLISH:
-                        continue  # HTF 上升趋势，禁止卖出
+                    # HTF 过滤（回测可关闭）：只允许卖出信号在非上升趋势时触发
+                    if self.use_htf_filter_for_h2l2:
+                        htf_trend = self._htf_trend_cache.get(i, HTFTrend.NEUTRAL)
+                        if htf_trend == HTFTrend.BULLISH:
+                            continue  # HTF 上升趋势，禁止卖出
                     
                     # 信号棒质量验证
                     bar_valid, bar_reason = self.pattern_detector.validate_btc_signal_bar(
@@ -647,7 +653,8 @@ class BacktestEngine:
             ema_period=config.ema_period,
             lookback_period=config.lookback_period,
             stop_loss_atr_multiplier=config.stop_loss_atr_multiplier,
-            kline_interval=config.interval
+            kline_interval=config.interval,
+            use_htf_filter_for_h2l2=config.use_htf_filter_for_h2l2,
         )
         
         # 交易状态

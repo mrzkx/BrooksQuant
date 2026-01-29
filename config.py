@@ -37,6 +37,9 @@ load_dotenv()
 # 观察模式：设置为 True 时只模拟交易，不实际下单
 OBSERVE_MODE = os.getenv("OBSERVE_MODE", "true").lower() == "true"
 
+# 是否保存交易记录到数据库（设置为 False 时禁用数据库保存）
+SAVE_TRADES_TO_DB = os.getenv("SAVE_TRADES_TO_DB", "false").lower() == "true"
+
 
 # ============================================================================
 # 环境变量验证
@@ -278,17 +281,11 @@ LARGE_BALANCE_THRESHOLD = TRADING_CONFIG["large_balance_threshold"]
 LARGE_BALANCE_POSITION_PCT = TRADING_CONFIG["large_balance_position_pct"]
 
 # ============================================================================
-# 双止损配置（Al Brooks 风险管理）
+# 止盈止损执行方式（已改为程序执行，不挂委托）
 # ============================================================================
-# 
-# 双止损方案说明：
-# 1. 软止损（程序监控）：基于 K 线收盘价判断，避免假突破
-# 2. 硬止损（挂止损单）：作为保险，防止程序崩溃时仓位失控
-#
-# 硬止损价格 = 软止损价格 × (1 + HARD_STOP_BUFFER_PCT)  （做多时）
-# 硬止损价格 = 软止损价格 × (1 - HARD_STOP_BUFFER_PCT)  （做空时）
-
-# 硬止损缓冲百分比（默认 0.15%，即比软止损多 0.15% 的缓冲空间）
+# 止损、TP1、TP2 均由程序根据 K 线监控判断后市价平仓，不在交易所挂 STOP_MARKET/TAKE_PROFIT_MARKET。
+# 以下配置已废弃，仅保留兼容（不再使用）：
+# HARD_STOP_BUFFER_PCT = 硬止损缓冲百分比（原用于挂硬止损单）
 HARD_STOP_BUFFER_PCT = float(os.getenv("HARD_STOP_BUFFER_PCT", "0.15")) / 100
 
 

@@ -356,6 +356,12 @@ class TradingUser:
         
         公式: 下单数量 = (余额 × 仓位百分比 × 杠杆) / 当前价格
         
+        保证金检查：
+        - 需要的保证金 = quantity * price / leverage
+        - 手续费预留 = quantity * price * 0.001 (0.1% 总手续费)
+        - 总需求 = 保证金 + 手续费预留
+        - 确保总需求 <= 可用余额
+        
         Args:
             balance: 账户 USDT 余额
             current_price: 当前价格
@@ -411,11 +417,41 @@ class TradingUser:
                 f"{notional_value:.2f} < {min_notional}, 新数量={quantity:.6f}"
             )
         
+        # ========== 保证金检查（只检查保证金，不考虑手续费）==========
+        # 需要的保证金 = 名义价值 / 杠杆
+        required_margin = notional_value / leverage
+        
+        # 如果保证金超过可用余额，减少数量
+        if required_margin > balance:
+            # 反向计算：从可用余额反推最大数量
+            # balance = quantity * price / leverage
+            # quantity = balance * leverage / price
+            max_quantity = balance * leverage / current_price
+            max_quantity = self.round_step_size(max_quantity, step_size)
+            
+            # 确保不低于最小交易量
+            if max_quantity >= min_qty:
+                quantity = max_quantity
+                notional_value = quantity * current_price
+                required_margin = notional_value / leverage
+                
+                logging.warning(
+                    f"[{self.name}] ⚠️ 保证金不足，调整数量: "
+                    f"需要保证金={required_margin:.2f} > 余额={balance:.2f}, "
+                    f"调整为 {quantity:.6f} BTC"
+                )
+            else:
+                logging.error(
+                    f"[{self.name}] ❌ 余额不足，无法满足最小交易量: "
+                    f"余额={balance:.2f}, 最小数量需要保证金={min_qty * current_price / leverage:.2f}"
+                )
+                return 0.0  # 返回 0 表示无法下单
+        
         logging.info(
             f"[{self.name}] 仓位计算: 余额={balance:.2f} USDT, "
             f"仓位比例={position_pct:.0f}%, 杠杆={leverage}x, "
-            f"下单数量={quantity:.6f} BTC (≈{quantity * current_price:.2f} USDT), "
-            f"stepSize={step_size}"
+            f"下单数量={quantity:.6f} BTC (≈{notional_value:.2f} USDT), "
+            f"保证金={required_margin:.2f}, stepSize={step_size}"
         )
         
         return quantity
@@ -686,6 +722,83 @@ class TradingUser:
         except Exception as e:
             logging.error(f"[{self.name}] 检查仓位失败: {e}")
             raise
+
+    async def get_used_margin(self, symbol: str) -> float:
+        """
+        获取当前已占用的保证金（用于仓位计算）
+        
+        Args:
+            symbol: 交易对
+        
+        Returns:
+            float: 已占用的保证金（USDT）
+        """
+        if self.client is None:
+            raise RuntimeError(f"用户 {self.name} 尚未连接客户端")
+        
+        try:
+            positions = await self.client.futures_position_information(symbol=symbol)
+            total_used_margin = 0.0
+            
+            for pos in positions:
+                amt = float(pos.get("positionAmt", 0))
+                if amt != 0:
+                    # 获取持仓的保证金
+                    position_margin = float(pos.get("positionInitialMargin", 0))
+                    total_used_margin += position_margin
+            
+            return total_used_margin
+            
+        except Exception as e:
+            logging.warning(f"[{self.name}] 获取已占用保证金失败: {e}，假设为 0")
+            return 0.0
+
+    async def get_position_info(self, symbol: str) -> Optional[Dict]:
+        """
+        获取币安真实持仓信息（用于恢复持仓状态）
+        
+        Args:
+            symbol: 交易对
+        
+        Returns:
+            Dict 包含持仓信息，如果没有持仓则返回 None
+            {
+                "positionAmt": 持仓数量（正数=做多，负数=做空）,
+                "entryPrice": 入场均价,
+                "markPrice": 标记价格,
+                "unRealizedProfit": 未实现盈亏,
+                "leverage": 杠杆倍数,
+                "positionSide": 持仓方向（LONG/SHORT）,
+                "notional": 持仓名义价值
+            }
+        """
+        if self.client is None:
+            raise RuntimeError(f"用户 {self.name} 尚未连接客户端")
+        
+        try:
+            positions = await self.client.futures_position_information(symbol=symbol)
+            
+            for pos in positions:
+                amt = float(pos.get("positionAmt", 0))
+                if amt != 0:
+                    # 找到有持仓的仓位
+                    return {
+                        "positionAmt": amt,
+                        "entryPrice": float(pos.get("entryPrice", 0)),
+                        "markPrice": float(pos.get("markPrice", 0)),
+                        "unRealizedProfit": float(pos.get("unRealizedProfit", 0)),
+                        "leverage": int(pos.get("leverage", 20)),
+                        "positionSide": pos.get("positionSide", "BOTH"),
+                        "notional": float(pos.get("notional", 0)),
+                        "isolatedMargin": float(pos.get("isolatedMargin", 0)),
+                        "isolated": pos.get("isolated", False),
+                    }
+            
+            return None
+            
+        except Exception as e:
+            logging.error(f"[{self.name}] 获取持仓信息失败: {e}")
+            return None
 
     async def get_recent_trades(self, symbol: str, limit: int = 10) -> list:
         """

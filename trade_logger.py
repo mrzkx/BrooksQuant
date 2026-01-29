@@ -13,14 +13,14 @@ import logging
 import threading
 from datetime import datetime
 from typing import Dict, Optional
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 
 from sqlalchemy import (
     create_engine, Column, Integer, String, Float, Boolean, DateTime,
     func, case
 )
 from sqlalchemy.orm import sessionmaker, declarative_base
-from config import DATABASE_URL
+from config import DATABASE_URL, SAVE_TRADES_TO_DB
 
 
 Base = declarative_base()
@@ -152,6 +152,8 @@ class TradeLogger:
         
         # TP2 订单状态跟踪（实盘模式下，TP1 触发后需要挂 TP2 订单）
         self._tp2_order_placed: Dict[str, bool] = {}
+        # TP1 订单状态：开仓后挂 TP1 止盈单，TP1 触发后由程序决定移动止盈止损
+        self._tp1_order_placed: Dict[str, bool] = {}
         
         # Al Brooks 追踪止损状态
         # 格式: {user: {"trailing_stop": float, "max_profit": float, "activated": bool}}
@@ -185,6 +187,10 @@ class TradeLogger:
 
     def sync_from_db(self):
         """从数据库恢复未平仓持仓"""
+        if not SAVE_TRADES_TO_DB:
+            logging.info("📊 数据库保存已禁用，跳过数据库恢复")
+            return
+            
         with self.session_scope() as session:
             try:
                 open_trades = session.query(Trade).filter(
@@ -211,6 +217,163 @@ class TradeLogger:
                 
             except Exception as e:
                 logging.error(f"❌ 从数据库恢复持仓失败: {e}", exc_info=True)
+
+    def recover_from_binance_position(
+        self,
+        user: str,
+        position_info: Dict,
+        current_price: float,
+        atr: Optional[float] = None,
+    ) -> Optional[Trade]:
+        """
+        根据币安真实持仓恢复交易状态（网络断开重启时使用）
+        
+        Args:
+            user: 用户名
+            position_info: 币安持仓信息（从 get_position_info 获取）
+            current_price: 当前价格（用于计算止损止盈）
+            atr: ATR 值（可选，用于计算止损距离）
+        
+        Returns:
+            Trade: 恢复的交易记录，如果失败返回 None
+        """
+        with self._lock:
+            # 如果已有持仓记录，先清除
+            if self.positions.get(user):
+                logging.warning(f"[{user}] 已有持仓记录，将被币安真实持仓覆盖")
+                self.positions[user] = None
+            
+            try:
+                position_amt = position_info["positionAmt"]
+                entry_price = position_info["entryPrice"]
+                
+                # 确定方向
+                if position_amt > 0:
+                    side = "buy"
+                    quantity = position_amt
+                else:
+                    side = "sell"
+                    quantity = abs(position_amt)
+                
+                # 计算止损距离（使用策略标准）
+                if atr and atr > 0:
+                    # 使用 ATR 计算止损距离（策略标准：1.5-3.0x ATR）
+                    stop_distance = atr * 1.5  # 保守使用 1.5x ATR
+                else:
+                    # 使用入场价的 1% 作为止损距离
+                    stop_distance = entry_price * 0.01
+                
+                # 计算止损价格
+                if side == "buy":
+                    stop_loss = entry_price - stop_distance
+                else:
+                    stop_loss = entry_price + stop_distance
+                
+                # 计算风险（R）= 入场价到止损的距离
+                risk = stop_distance
+                
+                # 使用策略标准计算 TP1 和 TP2（Al Brooks 风格）
+                # TP1 = 1R（大多数信号类型的默认值）
+                # TP2 = 2R（保守估计）
+                tp1_multiplier = 1.0  # 1R
+                tp2_multiplier = 2.0  # 2R
+                
+                if side == "buy":
+                    tp1_price = entry_price + risk * tp1_multiplier
+                    tp2_price = entry_price + risk * tp2_multiplier
+                    take_profit = tp2_price  # 总止盈目标
+                else:
+                    tp1_price = entry_price - risk * tp1_multiplier
+                    tp2_price = entry_price - risk * tp2_multiplier
+                    take_profit = tp2_price  # 总止盈目标
+                
+                # 创建内存交易记录
+                from dataclasses import dataclass
+                from typing import Optional as Opt
+                
+                @dataclass
+                class MemoryTrade:
+                    id: int = 0
+                    user: str = ""
+                    signal: str = "Recovered"
+                    side: str = ""
+                    entry_price: float = 0.0
+                    quantity: float = 0.0
+                    stop_loss: float = 0.0
+                    take_profit: float = 0.0
+                    status: str = "open"
+                    exit_stage: int = 0
+                    tp1_price: Opt[float] = None
+                    tp2_price: Opt[float] = None
+                    remaining_quantity: float = 0.0
+                    breakeven_moved: bool = False
+                    original_stop_loss: float = 0.0
+                    trailing_stop_price: Opt[float] = None
+                    trailing_stop_activated: bool = False
+                    trailing_max_profit_r: Opt[float] = None
+                    market_state: Opt[str] = None
+                    tight_channel_score: Opt[float] = None
+                    signal_strength: Opt[float] = None
+                    is_observe: bool = False
+                    tp1_close_ratio: float = 0.5  # 默认 50% 止盈
+                    is_climax_bar: bool = False
+                    hard_stop_loss: Opt[float] = None
+                
+                trade = MemoryTrade(
+                    user=user,
+                    signal="Recovered",
+                    side=side,
+                    entry_price=entry_price,
+                    quantity=quantity,
+                    stop_loss=stop_loss,
+                    take_profit=take_profit,
+                    status="open",
+                    exit_stage=0,
+                    tp1_price=tp1_price,  # 使用策略标准 1R
+                    tp2_price=tp2_price,  # 使用策略标准 2R
+                    remaining_quantity=quantity,
+                    breakeven_moved=False,
+                    original_stop_loss=stop_loss,
+                    trailing_stop_price=None,
+                    trailing_stop_activated=False,
+                    trailing_max_profit_r=None,
+                    market_state=None,
+                    tight_channel_score=None,
+                    signal_strength=None,
+                    is_observe=False,
+                    tp1_close_ratio=0.5,  # 默认 50% 止盈
+                    is_climax_bar=False,
+                    hard_stop_loss=None,
+                )
+                
+                self.positions[user] = trade
+                self._tp2_order_placed[user] = False
+                
+                # 检查当前价格是否已经达到 TP1（恢复时立即检查）
+                tp1_already_hit = False
+                if side == "buy":
+                    tp1_already_hit = current_price >= tp1_price
+                else:
+                    tp1_already_hit = current_price <= tp1_price
+                
+                if tp1_already_hit:
+                    logging.info(
+                        f"🔄 从币安恢复持仓 [{user}]: {side.upper()} {quantity:.6f} BTC @ {entry_price:.2f}, "
+                        f"止损={stop_loss:.2f}, TP1={tp1_price:.2f}(1R), TP2={tp2_price:.2f}(2R), "
+                        f"当前价={current_price:.2f} 已超过 TP1，将在下个周期触发 50% 止盈"
+                    )
+                else:
+                    logging.info(
+                        f"🔄 从币安恢复持仓 [{user}]: {side.upper()} {quantity:.6f} BTC @ {entry_price:.2f}, "
+                        f"止损={stop_loss:.2f}, TP1={tp1_price:.2f}(1R), TP2={tp2_price:.2f}(2R), "
+                        f"当前价={current_price:.2f}, 未实现盈亏={position_info.get('unRealizedProfit', 0):.2f} USDT"
+                    )
+                
+                return trade
+                
+            except Exception as e:
+                logging.error(f"❌ 从币安恢复持仓失败 [{user}]: {e}", exc_info=True)
+                return None
     
     def sync_dirty_trades(self, force: bool = False) -> int:
         """
@@ -290,8 +453,90 @@ class TradeLogger:
             if self.positions.get(user):
                 self._close_position_unlocked(user, entry_price, "manual", "新信号开仓")
 
-            with self.session_scope() as session:
-                trade = Trade(
+            if SAVE_TRADES_TO_DB:
+                # 保存到数据库
+                with self.session_scope() as session:
+                    trade = Trade(
+                        user=user,
+                        signal=signal,
+                        side=side,
+                        entry_price=entry_price,
+                        quantity=quantity,
+                        stop_loss=stop_loss,
+                        take_profit=take_profit,
+                        status="open",
+                        exit_stage=0,
+                        tp1_price=tp1_price,
+                        tp2_price=tp2_price,
+                        remaining_quantity=quantity,
+                        breakeven_moved=False,
+                        # 追踪止损初始化（问题3修复）
+                        original_stop_loss=stop_loss,  # 保存原始止损（软止损）
+                        trailing_stop_price=None,
+                        trailing_stop_activated=False,
+                        trailing_max_profit_r=None,
+                        # 市场上下文
+                        market_state=market_state,
+                        tight_channel_score=tight_channel_score,
+                        signal_strength=signal_strength,
+                        is_observe=is_observe,  # 记录交易模式
+                        # 动态分批出场参数
+                        tp1_close_ratio=tp1_close_ratio,
+                        is_climax_bar=is_climax_bar,
+                        # 双止损配置
+                        hard_stop_loss=hard_stop_loss,  # 硬止损价格（挂单价格）
+                    )
+
+                    session.add(trade)
+                    session.flush()
+                    session.expunge(trade)
+
+                    self.positions[user] = trade
+                    
+                    # 重置 TP2/TP1 订单标记（新开仓）
+                    self._tp2_order_placed[user] = False
+                    self._tp1_order_placed[user] = False
+
+                    logging.info(
+                        f"用户 {user} 开仓 [ID={trade.id}]: {signal} {side} @ {entry_price:.2f}, "
+                        f"止损={stop_loss:.2f}, TP1={tp1_price or take_profit:.2f}, TP2={tp2_price or take_profit:.2f}"
+                    )
+                    
+                    return trade
+            else:
+                # 不保存到数据库，只创建内存对象
+                from dataclasses import dataclass
+                from typing import Optional as Opt
+                
+                @dataclass
+                class MemoryTrade:
+                    id: int = 0
+                    user: str = ""
+                    signal: str = ""
+                    side: str = ""
+                    entry_price: float = 0.0
+                    quantity: float = 0.0
+                    stop_loss: float = 0.0
+                    take_profit: float = 0.0
+                    status: str = "open"
+                    exit_stage: int = 0
+                    tp1_price: Opt[float] = None
+                    tp2_price: Opt[float] = None
+                    remaining_quantity: float = 0.0
+                    breakeven_moved: bool = False
+                    original_stop_loss: float = 0.0
+                    trailing_stop_price: Opt[float] = None
+                    trailing_stop_activated: bool = False
+                    trailing_max_profit_r: Opt[float] = None
+                    market_state: Opt[str] = None
+                    tight_channel_score: Opt[float] = None
+                    signal_strength: Opt[float] = None
+                    is_observe: bool = True
+                    tp1_close_ratio: float = 0.5
+                    is_climax_bar: bool = False
+                    hard_stop_loss: Opt[float] = None
+                
+                trade = MemoryTrade(
                     user=user,
                     signal=signal,
                     side=side,
@@ -305,34 +550,27 @@ class TradeLogger:
                     tp2_price=tp2_price,
                     remaining_quantity=quantity,
                     breakeven_moved=False,
-                    # 追踪止损初始化（问题3修复）
-                    original_stop_loss=stop_loss,  # 保存原始止损（软止损）
+                    original_stop_loss=stop_loss,
                     trailing_stop_price=None,
                     trailing_stop_activated=False,
                     trailing_max_profit_r=None,
-                    # 市场上下文
                     market_state=market_state,
                     tight_channel_score=tight_channel_score,
                     signal_strength=signal_strength,
-                    is_observe=is_observe,  # 记录交易模式
-                    # 动态分批出场参数
+                    is_observe=is_observe,
                     tp1_close_ratio=tp1_close_ratio,
                     is_climax_bar=is_climax_bar,
-                    # 双止损配置
-                    hard_stop_loss=hard_stop_loss,  # 硬止损价格（挂单价格）
+                    hard_stop_loss=hard_stop_loss,
                 )
-
-                session.add(trade)
-                session.flush()
-                session.expunge(trade)
 
                 self.positions[user] = trade
                 
-                # 重置 TP2 订单标记（新开仓）
+                # 重置 TP2/TP1 订单标记（新开仓）
                 self._tp2_order_placed[user] = False
+                self._tp1_order_placed[user] = False
 
                 logging.info(
-                    f"用户 {user} 开仓 [ID={trade.id}]: {signal} {side} @ {entry_price:.2f}, "
+                    f"用户 {user} 开仓（内存）: {signal} {side} @ {entry_price:.2f}, "
                     f"止损={stop_loss:.2f}, TP1={tp1_price or take_profit:.2f}, TP2={tp2_price or take_profit:.2f}"
                 )
                 
@@ -356,54 +594,64 @@ class TradeLogger:
         # 将 numpy 类型转换为 Python 原生类型
         exit_price = float(exit_price)
 
-        with self.session_scope() as session:
-            trade.exit_price = exit_price
-            trade.exit_reason = exit_reason
-            trade.exit_timestamp = datetime.utcnow()
-            trade.status = "closed"
-            trade.exit_stage = 2
+        # 更新交易对象
+        trade.exit_price = exit_price
+        trade.exit_reason = exit_reason
+        trade.exit_timestamp = datetime.utcnow()
+        trade.status = "closed"
+        trade.exit_stage = 2
 
-            # 计算盈亏
-            qty = trade.remaining_quantity or trade.quantity
-            
+        # 计算盈亏
+        qty = trade.remaining_quantity or trade.quantity
+        
+        if trade.side == "buy":
+            final_pnl = (exit_price - trade.entry_price) * qty
+        else:
+            final_pnl = (trade.entry_price - exit_price) * qty
+
+        # 累加 TP1 盈利（如果有）
+        if trade.exit_stage >= 1 and trade.tp1_price:
+            half_qty = trade.quantity * 0.5
             if trade.side == "buy":
-                final_pnl = (exit_price - trade.entry_price) * qty
+                tp1_pnl = (trade.tp1_price - trade.entry_price) * half_qty
             else:
-                final_pnl = (trade.entry_price - exit_price) * qty
-
-            # 累加 TP1 盈利（如果有）
-            if trade.exit_stage >= 1 and trade.tp1_price:
-                half_qty = trade.quantity * 0.5
-                if trade.side == "buy":
-                    tp1_pnl = (trade.tp1_price - trade.entry_price) * half_qty
-                else:
-                    tp1_pnl = (trade.entry_price - trade.tp1_price) * half_qty
-                
-                trade.pnl = tp1_pnl + final_pnl
-            else:
-                trade.pnl = final_pnl
+                tp1_pnl = (trade.entry_price - trade.tp1_price) * half_qty
             
-            # 防止除以零
-            cost_basis = (trade.entry_price or 0) * (trade.quantity or 0)
-            if cost_basis > 0:
-                trade.pnl_percent = (trade.pnl / cost_basis) * 100
-            else:
-                trade.pnl_percent = 0.0
-                logging.warning(f"用户 {user} 交易 [ID={trade.id}] 成本为零，无法计算百分比盈亏")
+            trade.pnl = tp1_pnl + final_pnl
+        else:
+            trade.pnl = final_pnl
+        
+        # 防止除以零
+        cost_basis = (trade.entry_price or 0) * (trade.quantity or 0)
+        if cost_basis > 0:
+            trade.pnl_percent = (trade.pnl / cost_basis) * 100
+        else:
+            trade.pnl_percent = 0.0
+            trade_id = getattr(trade, 'id', 'N/A')
+            logging.warning(f"用户 {user} 交易 [ID={trade_id}] 成本为零，无法计算百分比盈亏")
 
-            session.merge(trade)
-
+        # 如果启用数据库保存，则保存到数据库
+        if SAVE_TRADES_TO_DB:
+            with self.session_scope() as session:
+                session.merge(trade)
+                trade_id = getattr(trade, 'id', 'N/A')
+                logging.info(
+                    f"用户 {user} 平仓 [ID={trade_id}]: {exit_reason} @ {exit_price:.2f}, "
+                    f"盈亏={trade.pnl:.4f} USDT ({trade.pnl_percent:.2f}%) {note}"
+                )
+        else:
+            trade_id = getattr(trade, 'id', 'N/A')
             logging.info(
-                f"用户 {user} 平仓 [ID={trade.id}]: {exit_reason} @ {exit_price:.2f}, "
+                f"用户 {user} 平仓（内存）[ID={trade_id}]: {exit_reason} @ {exit_price:.2f}, "
                 f"盈亏={trade.pnl:.4f} USDT ({trade.pnl_percent:.2f}%) {note}"
             )
 
-            # 止损亏损启动冷却期
-            if exit_reason == "stop_loss" and trade.pnl and trade.pnl < 0:
-                self.set_cooldown(user, cooldown_bars=3)
+        # 止损亏损启动冷却期
+        if exit_reason == "stop_loss" and trade.pnl and trade.pnl < 0:
+            self.set_cooldown(user, cooldown_bars=3)
 
-            self.positions[user] = None
-            return trade
+        self.positions[user] = None
+        return trade
 
     def update_trade_with_actual_pnl(
         self,
@@ -426,6 +674,10 @@ class TradeLogger:
         Returns:
             bool: 是否更新成功
         """
+        # 如果未启用数据库保存，直接返回
+        if not SAVE_TRADES_TO_DB:
+            return True
+        
         # 将 numpy 类型转换为 Python 原生类型
         actual_exit_price = float(actual_exit_price)
         commission = float(commission)
@@ -495,7 +747,16 @@ class TradeLogger:
             if not trade:
                 return None
 
-            with self.session_scope() as session:
+            # 检查是否是 MemoryTrade（禁用数据库保存时）
+            is_memory_trade = not hasattr(trade, '__table__') or trade.__class__.__name__ == 'MemoryTrade'
+            
+            # 如果禁用数据库保存，使用空上下文管理器
+            if is_memory_trade or not SAVE_TRADES_TO_DB:
+                session_context = nullcontext()
+            else:
+                session_context = self.session_scope()
+            
+            with session_context as session:
                 # 计算风险（R）= 入场价到止损的距离
                 initial_risk = abs(float(trade.entry_price) - float(trade.stop_loss))
                 if initial_risk == 0:
@@ -532,7 +793,8 @@ class TradeLogger:
                         # 保存原始止损到数据库
                         if not trade.original_stop_loss:
                             trade.original_stop_loss = original_sl
-                            session.merge(trade)
+                            if session and SAVE_TRADES_TO_DB and not is_memory_trade:
+                                session.merge(trade)
                 
                 ts_state = self._trailing_stop[user]
                 
@@ -562,7 +824,8 @@ class TradeLogger:
                     trade.trailing_stop_activated = True
                     trade.trailing_stop_price = ts_state["trailing_stop"]
                     trade.trailing_max_profit_r = profit_in_r
-                    session.merge(trade)
+                    if session and SAVE_TRADES_TO_DB and not is_memory_trade:
+                        session.merge(trade)
                     
                     logging.info(
                         f"📈 [{user}] 追踪止损已激活！盈利={profit_in_r:.2f}R, "
@@ -603,6 +866,10 @@ class TradeLogger:
                     tp1_hit = (trade.side == "buy" and current_price >= float(trade.tp1_price)) or \
                               (trade.side == "sell" and current_price <= float(trade.tp1_price))
                     
+                    # 若已挂 TP1 止盈单，由交易所执行 TP1，不在此触发程序平仓；user_worker 会检测成交并 sync_after_tp1_filled
+                    if tp1_hit and self._tp1_order_placed.get(user, False):
+                        return None
+                    
                     if tp1_hit:
                         # 使用动态平仓比例（默认 50%，Climax 时 75%）
                         close_ratio = float(trade.tp1_close_ratio or 0.5)
@@ -622,7 +889,8 @@ class TradeLogger:
                         trade.stop_loss = breakeven_stop
                         trade.breakeven_moved = True
                         
-                        session.merge(trade)
+                        if session and SAVE_TRADES_TO_DB and not is_memory_trade:
+                            session.merge(trade)
                         
                         # 更新追踪止损状态（不允许后退）
                         if trade.side == "buy":
@@ -678,7 +946,8 @@ class TradeLogger:
                     if breakeven_hit:
                         trade.stop_loss = float(trade.entry_price)
                         trade.breakeven_moved = True
-                        session.merge(trade)
+                        if session and SAVE_TRADES_TO_DB and not is_memory_trade:
+                            session.merge(trade)
                         
                         # 更新追踪止损状态
                         ts_state["trailing_stop"] = float(trade.entry_price)
@@ -744,6 +1013,100 @@ class TradeLogger:
         """标记 TP2 订单已挂"""
         with self._lock:
             self._tp2_order_placed[user] = True
+
+    def mark_tp1_order_placed(self, user: str):
+        """标记 TP1 止盈单已挂（开仓后挂 TP1，TP1 触发后由程序决定移动止盈止损）"""
+        with self._lock:
+            self._tp1_order_placed[user] = True
+
+    def tp1_order_placed(self, user: str) -> bool:
+        """是否已挂 TP1 止盈单"""
+        with self._lock:
+            return bool(self._tp1_order_placed.get(user, False))
+
+    def update_position_from_binance(
+        self, user: str, quantity: float, entry_price: float
+    ) -> bool:
+        """
+        使用币安真实持仓更新内部持仓状态与数量（开仓后调用）
+        
+        Args:
+            user: 用户名
+            quantity: 持仓数量（正数）
+            entry_price: 入场均价
+        
+        Returns:
+            是否更新成功
+        """
+        quantity = float(quantity)
+        entry_price = float(entry_price)
+        with self._lock:
+            trade = self.positions.get(user)
+            if not trade:
+                return False
+            trade.quantity = quantity
+            trade.entry_price = entry_price
+            trade.remaining_quantity = quantity
+            self.mark_dirty(user)
+            logging.info(
+                f"[{user}] 已用币安真实持仓更新: 数量={quantity:.4f}, 入场价={entry_price:.2f}"
+            )
+            return True
+
+    def needs_tp1_fill_sync(self, user: str) -> bool:
+        """是否需要检测 TP1 成交并同步（已挂 TP1 单且尚未同步过）"""
+        with self._lock:
+            trade = self.positions.get(user)
+            if not trade:
+                return False
+            return bool(self._tp1_order_placed.get(user, False))
+
+    def sync_after_tp1_filled(
+        self, user: str, remaining_quantity: float, entry_price: float
+    ) -> bool:
+        """
+        TP1 由交易所触发后同步状态：剩余仓位、保本止损，之后由程序决定止盈止损。
+        
+        Args:
+            user: 用户名
+            remaining_quantity: 剩余持仓数量（币安当前持仓）
+            entry_price: 当前持仓入场均价（可选，用于保本计算）
+        
+        Returns:
+            是否同步成功
+        """
+        remaining_quantity = float(remaining_quantity)
+        entry_price = float(entry_price)
+        with self._lock:
+            trade = self.positions.get(user)
+            if not trade:
+                return False
+            close_ratio = float(trade.tp1_close_ratio or 0.5)
+            trade.remaining_quantity = remaining_quantity
+            trade.exit_stage = 1
+            trade.status = "partial"
+            # 保本止损
+            fee_buffer = entry_price * 0.001
+            if trade.side == "buy":
+                breakeven_stop = entry_price + fee_buffer
+            else:
+                breakeven_stop = entry_price - fee_buffer
+            trade.stop_loss = breakeven_stop
+            trade.breakeven_moved = True
+            if user in self._trailing_stop:
+                ts = self._trailing_stop[user]
+                if trade.side == "buy":
+                    ts["trailing_stop"] = max(ts.get("trailing_stop", 0), breakeven_stop)
+                else:
+                    ts["trailing_stop"] = min(ts.get("trailing_stop", float("inf")), breakeven_stop)
+                ts["activated"] = True
+            self._tp1_order_placed[user] = False
+            self.mark_dirty(user)
+            logging.info(
+                f"[{user}] TP1 已由交易所触发，已同步: 剩余={remaining_quantity:.4f}, "
+                f"保本止损={breakeven_stop:.2f}，后续由程序决定止盈止损"
+            )
+            return True
 
     def increment_kline(self):
         """递增 K 线计数器（保留用于兼容）"""

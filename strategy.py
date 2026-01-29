@@ -130,6 +130,8 @@ class SignalResult:
     delta_modifier: float = 1.0
     tp1_close_ratio: float = 0.5
     is_climax: bool = False
+    strength: float = 1.0               # 信号强度（HTF 权重调节用）
+    htf_modifier: float = 1.0           # HTF 权重调节因子
 
 # 导入模块化组件（MarketState 已在文件顶部导入）
 from logic.market_analyzer import MarketAnalyzer
@@ -1232,8 +1234,10 @@ class AlBrooksStrategy:
         # HTF 快照缓存（1h 级别，整个循环中不变）
         cached_htf_snapshot = self.htf_filter.get_snapshot()
         cached_htf_trend = cached_htf_snapshot.trend if cached_htf_snapshot else HTFTrend.NEUTRAL
-        cached_htf_allow_buy = cached_htf_snapshot.allow_buy if cached_htf_snapshot else True
-        cached_htf_allow_sell = cached_htf_snapshot.allow_sell if cached_htf_snapshot else True
+        
+        # HTF 权重调节因子缓存（v2.0 软过滤）
+        cached_htf_buy_modifier = self.htf_filter.get_signal_modifier("buy")
+        cached_htf_sell_modifier = self.htf_filter.get_signal_modifier("sell")
         
         # Delta 快照缓存
         cached_delta_snapshot: Optional[DeltaSnapshot] = None
@@ -1285,6 +1289,14 @@ class AlBrooksStrategy:
             # ---------- 优先级1: Failed Breakout ----------
             fb_result = self._check_failed_breakout(data, ctx)
             if fb_result:
+                # 应用 HTF 权重调节（v2.0 软过滤）
+                htf_modifier = cached_htf_buy_modifier if fb_result.side == "buy" else cached_htf_sell_modifier
+                fb_result.htf_modifier = htf_modifier
+                fb_result.strength = fb_result.strength * htf_modifier
+                
+                if ctx.is_latest_bar and htf_modifier != 1.0:
+                    logging.info(f"📊 HTF权重调节 FB: ×{htf_modifier} → 强度={fb_result.strength:.2f}")
+                
                 tp1, tp2, tp1_ratio, is_climax = self._calculate_tp1_tp2(
                     ctx.close, fb_result.stop_loss, fb_result.side, fb_result.base_height,
                     ctx.atr, fb_result.signal_type, ctx.market_state.value, data, i
@@ -1332,6 +1344,15 @@ class AlBrooksStrategy:
                     
                     if delta_modifier > 0:
                         spike_result.delta_modifier = delta_modifier
+                        
+                        # 应用 HTF 权重调节（v2.0 软过滤）
+                        htf_modifier = cached_htf_buy_modifier if spike_result.side == "buy" else cached_htf_sell_modifier
+                        spike_result.htf_modifier = htf_modifier
+                        spike_result.strength = spike_result.strength * htf_modifier
+                        
+                        if ctx.is_latest_bar and htf_modifier != 1.0:
+                            logging.info(f"📊 HTF权重调节 Spike: ×{htf_modifier} → 强度={spike_result.strength:.2f}")
+                        
                         tp1, tp2, tp1_ratio, is_climax = self._calculate_tp1_tp2(
                             ctx.close, spike_result.stop_loss, spike_result.side, spike_result.base_height,
                             ctx.atr, spike_result.signal_type, ctx.market_state.value, data, i
@@ -1349,6 +1370,14 @@ class AlBrooksStrategy:
             # ---------- 优先级3: Climax 反转 ----------
             climax_result = self._check_climax(data, ctx)
             if climax_result:
+                # 应用 HTF 权重调节（v2.0 软过滤）
+                htf_modifier = cached_htf_buy_modifier if climax_result.side == "buy" else cached_htf_sell_modifier
+                climax_result.htf_modifier = htf_modifier
+                climax_result.strength = climax_result.strength * htf_modifier
+                
+                if ctx.is_latest_bar and htf_modifier != 1.0:
+                    logging.info(f"📊 HTF权重调节 Climax: ×{htf_modifier} → 强度={climax_result.strength:.2f}")
+                
                 tp1, tp2, tp1_ratio, is_climax = self._calculate_tp1_tp2(
                     ctx.close, climax_result.stop_loss, climax_result.side, climax_result.base_height,
                     ctx.atr, climax_result.signal_type, ctx.market_state.value, data, i
@@ -1362,6 +1391,14 @@ class AlBrooksStrategy:
             # ---------- 优先级4: Wedge 反转 ----------
             wedge_result = self._check_wedge(data, ctx)
             if wedge_result:
+                # 应用 HTF 权重调节（v2.0 软过滤）
+                htf_modifier = cached_htf_buy_modifier if wedge_result.side == "buy" else cached_htf_sell_modifier
+                wedge_result.htf_modifier = htf_modifier
+                wedge_result.strength = wedge_result.strength * htf_modifier
+                
+                if ctx.is_latest_bar and htf_modifier != 1.0:
+                    logging.info(f"📊 HTF权重调节 Wedge: ×{htf_modifier} → 强度={wedge_result.strength:.2f}")
+                
                 tp1, tp2, tp1_ratio, is_climax = self._calculate_tp1_tp2(
                     ctx.close, wedge_result.stop_loss, wedge_result.side, wedge_result.base_height,
                     ctx.atr, wedge_result.signal_type, ctx.market_state.value, data, i
@@ -1373,9 +1410,9 @@ class AlBrooksStrategy:
                 continue
             
             # ---------- H2/L2 状态机处理 ----------
-            # 获取 HTF 过滤信息
-            htf_allow_buy, htf_buy_reason = self.htf_filter.should_allow_signal("buy")
-            htf_allow_sell, htf_sell_reason = self.htf_filter.should_allow_signal("sell")
+            # 使用缓存的 HTF 权重调节因子（v2.0 软过滤）
+            htf_buy_modifier = cached_htf_buy_modifier
+            htf_sell_modifier = cached_htf_sell_modifier
             
             # 获取 Delta 快照（如果需要）
             if ctx.is_latest_bar and not delta_snapshot_fetched:
@@ -1383,12 +1420,20 @@ class AlBrooksStrategy:
                 delta_snapshot_fetched = True
             delta_snapshot_for_hl = cached_delta_snapshot if ctx.is_latest_bar else None
             
-            # H2 信号处理
-            if (ctx.allowed_side is None or ctx.allowed_side == "buy") and htf_allow_buy:
+            # H2 信号处理（允许所有方向，通过权重调节）
+            if ctx.allowed_side is None or ctx.allowed_side == "buy":
                 h2_result = await self._process_h2_signal(
                     h2_machine, data, ctx, delta_snapshot_for_hl, cached_htf_trend
                 )
                 if h2_result:
+                    # 应用 HTF 权重调节信号强度
+                    h2_result.htf_modifier = htf_buy_modifier
+                    h2_result.strength = h2_result.strength * htf_buy_modifier
+                    
+                    # 日志记录 HTF 权重调节
+                    if ctx.is_latest_bar and htf_buy_modifier != 1.0:
+                        logging.info(f"📊 HTF权重调节 H2: ×{htf_buy_modifier} → 强度={h2_result.strength:.2f}")
+                    
                     tp1, tp2, tp1_ratio, is_climax = self._calculate_tp1_tp2(
                         ctx.close, h2_result.stop_loss, h2_result.side, h2_result.base_height,
                         ctx.atr, h2_result.signal_type, ctx.market_state.value, data, i
@@ -1397,21 +1442,21 @@ class AlBrooksStrategy:
                     h2_result.is_climax = is_climax
                     self._record_signal(arrays, i, h2_result, ctx.market_state.value, ctx.tight_channel_score, tp1, tp2)
                     self._update_signal_cooldown(h2_result.signal_type, i)
-            elif (ctx.allowed_side is None or ctx.allowed_side == "buy") and not htf_allow_buy:
-                # HTF 禁止买入时仍需更新状态机
-                h2_signal = h2_machine.update(
-                    ctx.close, ctx.high, ctx.low, ctx.ema, ctx.atr, data, i,
-                    self.pattern_detector.calculate_unified_stop_loss
-                )
-                if h2_signal and ctx.is_latest_bar:
-                    logging.info(f"🚫 HTF过滤H2: {h2_signal.signal_type} - {htf_buy_reason}")
             
-            # L2 信号处理
-            if (ctx.allowed_side is None or ctx.allowed_side == "sell") and htf_allow_sell:
+            # L2 信号处理（允许所有方向，通过权重调节）
+            if ctx.allowed_side is None or ctx.allowed_side == "sell":
                 l2_result = await self._process_l2_signal(
                     l2_machine, data, ctx, delta_snapshot_for_hl, cached_htf_trend
                 )
                 if l2_result:
+                    # 应用 HTF 权重调节信号强度
+                    l2_result.htf_modifier = htf_sell_modifier
+                    l2_result.strength = l2_result.strength * htf_sell_modifier
+                    
+                    # 日志记录 HTF 权重调节
+                    if ctx.is_latest_bar and htf_sell_modifier != 1.0:
+                        logging.info(f"📊 HTF权重调节 L2: ×{htf_sell_modifier} → 强度={l2_result.strength:.2f}")
+                    
                     tp1, tp2, tp1_ratio, is_climax = self._calculate_tp1_tp2(
                         ctx.close, l2_result.stop_loss, l2_result.side, l2_result.base_height,
                         ctx.atr, l2_result.signal_type, ctx.market_state.value, data, i
@@ -1420,14 +1465,6 @@ class AlBrooksStrategy:
                     l2_result.is_climax = is_climax
                     self._record_signal(arrays, i, l2_result, ctx.market_state.value, ctx.tight_channel_score, tp1, tp2)
                     self._update_signal_cooldown(l2_result.signal_type, i)
-            elif (ctx.allowed_side is None or ctx.allowed_side == "sell") and not htf_allow_sell:
-                # HTF 禁止卖出时仍需更新状态机
-                l2_signal = l2_machine.update(
-                    ctx.close, ctx.high, ctx.low, ctx.ema, ctx.atr, data, i,
-                    self.pattern_detector.calculate_unified_stop_loss
-                )
-                if l2_signal and ctx.is_latest_bar:
-                    logging.info(f"🚫 HTF过滤L2: {l2_signal.signal_type} - {htf_sell_reason}")
         
         # ========== Step 5: 应用 TA-Lib 形态加成 ==========
         self._apply_talib_boost(data, arrays)

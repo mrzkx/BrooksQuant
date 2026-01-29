@@ -167,6 +167,11 @@ async def kline_producer(
 
                             trade_logger.increment_kline()
 
+                            # 周期结束时检测 TP1 是否已被交易所触发（仅此时检测，不轮询）
+                            for u in list(trade_logger.positions.keys()):
+                                if trade_logger.needs_tp1_fill_sync(u) and u in close_queues:
+                                    await close_queues[u].put({"action": "sync_tp1"})
+
                             if last["signal"]:
                                 signal = _build_signal(last, k, df)
                                 _log_signal(signal, last)

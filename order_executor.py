@@ -4,12 +4,10 @@
 负责观察模式和实盘模式的订单执行逻辑
 将下单逻辑从 main.py 中抽离，提高代码可维护性
 
-双止损方案（Al Brooks 风险管理）：
-1. 软止损（程序监控）：基于 K 线收盘价判断，避免假突破
-2. 硬止损（挂止损单）：作为保险，防止程序崩溃时仓位失控
-   - 硬止损价格比软止损更宽松（多 0.15% 缓冲）
-   - 正常情况下由程序执行软止损并取消硬止损挂单
-   - 异常情况下（程序崩溃等）由硬止损单保护仓位
+实盘开仓逻辑：
+- 开仓后用币安真实持仓更新内部状态与数量
+- 开仓后挂 TP1 止盈单（仅 TP1 挂单）
+- TP1 触发后由程序决定移动止盈止损（不挂 TP2/止损单，程序监控后市价平仓）
 """
 
 import asyncio
@@ -17,7 +15,7 @@ import logging
 from decimal import Decimal, ROUND_DOWN
 from typing import Dict
 
-from config import SYMBOL as CONFIG_SYMBOL, HARD_STOP_BUFFER_PCT
+from config import SYMBOL as CONFIG_SYMBOL
 from trade_logger import TradeLogger
 from user_manager import TradingUser
 
@@ -43,27 +41,6 @@ def _extract_signal_params(signal: Dict) -> Dict:
         "tp1_close_ratio": signal.get("tp1_close_ratio", 0.5),
         "is_climax_bar": signal.get("is_climax_bar", False),
     }
-
-
-def calculate_hard_stop_price(soft_stop: float, side: str) -> float:
-    """
-    计算硬止损价格（比软止损更宽松，作为保险）
-    
-    Args:
-        soft_stop: 软止损价格（信号中的止损价）
-        side: 交易方向 ("buy" 或 "sell")
-    
-    Returns:
-        硬止损价格
-    """
-    buffer = soft_stop * HARD_STOP_BUFFER_PCT
-    
-    if side.lower() == "buy":
-        # 做多时，硬止损比软止损更低
-        return soft_stop - buffer
-    else:
-        # 做空时，硬止损比软止损更高
-        return soft_stop + buffer
 
 
 def round_quantity_to_step_size(quantity: float, step_size: float = 0.001) -> float:
@@ -180,9 +157,6 @@ async def execute_live_order(
     # 提取信号参数（使用公共函数避免重复）
     params = _extract_signal_params(signal)
     
-    # 确定止损方向
-    stop_side = "SELL" if signal["side"].lower() == "buy" else "BUY"
-    
     # 判断信号类型
     signal_type = signal["signal"]
     
@@ -217,7 +191,8 @@ async def execute_live_order(
             logging.info(f"[{user.name}] 市价开仓单已成交: ID={order_id}, 状态={order_status}")
             
             # 获取实际成交价
-            actual_price = float(entry_response.get("avgPrice", signal["price"]))
+            avg_price = entry_response.get("avgPrice", "0")
+            actual_price = float(avg_price) if avg_price and float(avg_price) > 0 else float(signal["price"])
         else:
             # ===== 回撤型信号：限价入场 =====
             signal_atr = signal.get("atr")
@@ -267,43 +242,26 @@ async def execute_live_order(
                     logging.error(f"[{user.name}] 等待限价单成交出错: {wait_err}")
                     return False
             
-            actual_price = float(entry_response.get("price", limit_price))
+            # 获取实际成交价（限价单可能还未成交）
+            price = entry_response.get("price", "0")
+            avg_price = entry_response.get("avgPrice", "0")
+            # 优先使用成交均价，其次使用限价，最后使用信号价格
+            if avg_price and float(avg_price) > 0:
+                actual_price = float(avg_price)
+            elif price and float(price) > 0:
+                actual_price = float(price)
+            else:
+                actual_price = limit_price
         
-        # 创建硬止损单（比软止损更宽松，作为保险）
-        # 软止损 = signal["stop_loss"]（基于 K 线收盘价由程序执行）
-        # 硬止损 = 比软止损多 0.15% 缓冲（挂在币安，防止程序崩溃）
-        soft_stop = signal["stop_loss"]
-        hard_stop = calculate_hard_stop_price(soft_stop, signal["side"])
-        
-        stop_order_id = None
-        try:
-            stop_response = await user.create_stop_market_order(
-                symbol=SYMBOL,
-                side=stop_side,
-                quantity=order_qty,
-                stop_price=round(hard_stop, 2),
-                reduce_only=True,
-            )
-            stop_order_id = stop_response.get("orderId") or stop_response.get("algoId")
-            logging.info(
-                f"[{user.name}] ✅ 双止损已设置: 软止损={soft_stop:.2f}(程序监控), "
-                f"硬止损={hard_stop:.2f}(挂单保险), ID={stop_order_id}"
-            )
-        except Exception as stop_err:
-            logging.error(f"[{user.name}] ⚠️ 硬止损单设置失败: {stop_err}")
-            print(f"[{user.name}] ⚠️ 硬止损单设置失败，请手动设置止损！")
-        
-        # 获取实际成交信息
         actual_qty = float(entry_response.get("origQty", order_qty))
         
-        # 记录到交易日志（包含软止损和硬止损）
         trade = trade_logger.open_position(
             user=user.name,
             signal=signal["signal"],
             side=signal["side"],
             entry_price=actual_price,
             quantity=actual_qty,
-            stop_loss=soft_stop,  # 软止损（程序监控，基于K线收盘价）
+            stop_loss=signal["stop_loss"],
             take_profit=signal["take_profit"],
             signal_strength=params["signal_strength"],
             tp1_price=params["tp1_price"],
@@ -313,8 +271,42 @@ async def execute_live_order(
             is_observe=False,
             tp1_close_ratio=params["tp1_close_ratio"],
             is_climax_bar=params["is_climax_bar"],
-            hard_stop_loss=hard_stop,  # 硬止损（挂单保险）
+            hard_stop_loss=None,
         )
+        
+        # 使用币安真实持仓更新状态与数量
+        await asyncio.sleep(1)
+        try:
+            pos = await user.get_position_info(SYMBOL)
+            if pos:
+                binance_qty = abs(float(pos["positionAmt"]))
+                binance_entry = float(pos["entryPrice"])
+                trade_logger.update_position_from_binance(user.name, binance_qty, binance_entry)
+                actual_qty = binance_qty
+                actual_price = binance_entry
+        except Exception as sync_err:
+            logging.warning(f"[{user.name}] 开仓后同步币安持仓失败: {sync_err}，使用下单数量")
+        
+        # 开仓后挂 TP1 止盈单；TP1 触发后由程序决定移动止盈止损
+        if params.get("tp1_price") and actual_qty > 0:
+            tp1_close_ratio = params.get("tp1_close_ratio", 0.5)
+            tp1_qty = round_quantity_to_step_size(actual_qty * tp1_close_ratio)
+            stop_side = "SELL" if signal["side"].lower() == "buy" else "BUY"
+            try:
+                await user.create_take_profit_market_order(
+                    symbol=SYMBOL,
+                    side=stop_side,
+                    quantity=tp1_qty,
+                    stop_price=round(float(params["tp1_price"]), 2),
+                    reduce_only=True,
+                )
+                trade_logger.mark_tp1_order_placed(user.name)
+                logging.info(
+                    f"[{user.name}] ✅ TP1 止盈单已挂: 触发价={params['tp1_price']:.2f}, "
+                    f"数量={tp1_qty:.4f} ({int(tp1_close_ratio*100)}%)，TP1 触发后由程序决定止盈止损"
+                )
+            except Exception as tp1_err:
+                logging.error(f"[{user.name}] ⚠️ TP1 止盈单挂单失败: {tp1_err}")
         
         # 日志输出
         status_emoji = "✅" if order_status == "FILLED" else "📝"
@@ -351,11 +343,9 @@ async def handle_close_request(
     trade_logger: TradeLogger,
 ) -> bool:
     """
-    处理平仓请求（双止损方案优化）
+    处理平仓请求（止盈止损由程序执行，不挂委托）
     
-    双止损逻辑：
-    1. 程序检测到软止损触发 → 执行平仓并取消硬止损挂单
-    2. 如果硬止损挂单已被币安执行 → 仓位已不存在，只需取消剩余挂单
+    程序根据 K 线监控判断止损/TP1/TP2 触发后，在此执行市价平仓。
     
     Args:
         user: 交易用户
@@ -400,55 +390,12 @@ async def handle_close_request(
                 f"实际价格={actual_tp1_price:.2f}, 手续费={tp1_commission:.4f}"
             )
             print(f"[{user.name}] ✅ TP1平仓成功: 数量={tp1_qty:.4f} BTC ({close_pct}%), 价格={actual_tp1_price:.2f}")
-            
-            # 取消原有止损单
-            await user.cancel_all_orders(SYMBOL)
-            
-            # 设置新的止损单（保本价）
-            # 按 stepSize 截断数量（修复精度问题）
-            remaining_qty = round_quantity_to_step_size(close_request["remaining_quantity"])
-            stop_side = "SELL" if close_request["side"] == "buy" else "BUY"
-            
-            try:
-                await user.create_stop_market_order(
-                    symbol=SYMBOL,
-                    side=stop_side,
-                    quantity=remaining_qty,
-                    stop_price=round(close_request["new_stop_loss"], 2),
-                    reduce_only=True,
-                )
-                logging.info(
-                    f"[{user.name}] ✅ 新止损单（保本）: "
-                    f"价格={close_request['new_stop_loss']:.2f}, 数量={remaining_qty:.4f}"
-                )
-            except Exception as stop_err:
-                logging.error(f"[{user.name}] ⚠️ 新止损单设置失败: {stop_err}")
-            
-            # 挂TP2止盈单
-            if close_request.get("tp2_price"):
-                try:
-                    # remaining_qty 已经被截断，直接使用
-                    await user.create_take_profit_market_order(
-                        symbol=SYMBOL,
-                        side=stop_side,
-                        quantity=remaining_qty,
-                        stop_price=round(close_request["tp2_price"], 2),
-                        reduce_only=True,
-                    )
-                    trade_logger.mark_tp2_order_placed(user.name)
-                    logging.info(
-                        f"[{user.name}] ✅ TP2止盈单已设置: "
-                        f"触发价={close_request['tp2_price']:.2f}, 数量={remaining_qty:.4f}"
-                    )
-                    print(f"[{user.name}] ✅ TP2止盈单已设置: 触发价={close_request['tp2_price']:.2f}")
-                except Exception as tp2_err:
-                    logging.error(f"[{user.name}] ⚠️ TP2止盈单设置失败: {tp2_err}")
+            # 保本止损与 TP2 由程序监控执行，不挂委托
         
         else:
-            # 完全平仓（双止损优化：先检查是否还有仓位）
+            # 完全平仓（止盈/止损由程序触发，此处执行市价平仓）
             logging.info(f"[{user.name}] 🔴 执行平仓: {close_request}")
             
-            # 检查是否还有实际仓位（可能已被硬止损单平掉）
             try:
                 has_position = await user.has_open_position(SYMBOL)
             except Exception as check_err:
@@ -456,28 +403,23 @@ async def handle_close_request(
                 has_position = True
             
             if has_position:
-                # 仓位存在，执行平仓
                 close_qty = round_quantity_to_step_size(close_request["quantity"])
                 await user.close_position_market(
                     symbol=SYMBOL,
                     side=close_request["side"],
                     quantity=close_qty,
                 )
-                
                 logging.info(
-                    f"[{user.name}] ✅ 软止损平仓成功: {close_request['exit_reason']}, "
+                    f"[{user.name}] ✅ 平仓成功: {close_request['exit_reason']}, "
                     f"数量={close_request['quantity']:.4f} BTC"
                 )
                 print(
-                    f"[{user.name}] ✅ 软止损平仓成功: {close_request['exit_reason']}, "
+                    f"[{user.name}] ✅ 平仓成功: {close_request['exit_reason']}, "
                     f"数量={close_request['quantity']:.4f} BTC"
                 )
-                
-                # 查询实际成交价和手续费，更新盈亏
                 try:
-                    await asyncio.sleep(1)  # 等待成交记录更新
+                    await asyncio.sleep(1)
                     trade_details = await user.get_trade_details(SYMBOL, close_qty)
-                    
                     if trade_details["avg_price"] > 0:
                         trade_logger.update_trade_with_actual_pnl(
                             user=user.name,
@@ -487,18 +429,9 @@ async def handle_close_request(
                 except Exception as pnl_err:
                     logging.warning(f"[{user.name}] 更新实际盈亏失败: {pnl_err}")
             else:
-                # 仓位已不存在（硬止损单已触发），查询实际成交更新盈亏
-                logging.info(
-                    f"[{user.name}] ℹ️ 仓位已被硬止损单平掉，查询实际成交"
-                )
-                print(
-                    f"[{user.name}] ℹ️ 仓位已被硬止损单平掉"
-                )
-                
-                # 查询实际成交价和手续费，更新盈亏
+                logging.info(f"[{user.name}] ℹ️ 仓位已不存在，仅更新盈亏")
                 try:
                     trade_details = await user.get_trade_details(SYMBOL, close_request["quantity"])
-                    
                     if trade_details["avg_price"] > 0:
                         trade_logger.update_trade_with_actual_pnl(
                             user=user.name,
@@ -508,8 +441,7 @@ async def handle_close_request(
                 except Exception as pnl_err:
                     logging.warning(f"[{user.name}] 更新实际盈亏失败: {pnl_err}")
             
-            # 取消所有挂单（清理硬止损单和其他挂单）
-            await user.cancel_all_orders(SYMBOL)
+            await user.cancel_all_orders(SYMBOL)  # 清理可能存在的其他挂单
         
         return True
         

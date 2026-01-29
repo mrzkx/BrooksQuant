@@ -3,16 +3,18 @@
 
 Al Brooks 核心原则：
 "大周期的趋势是日内交易最好的保护伞"
+"没有 100% 的确定性，只有概率和盈亏比"
 
 功能：
 1. 获取 1h EMA20 方向作为趋势过滤器
-2. 上升趋势：只允许买入信号（H1/H2），屏蔽卖出信号（L1/L2）
-3. 下降趋势：只允许卖出信号（L1/L2），屏蔽买入信号（H1/H2）
-4. 中性趋势：允许双向交易
+2. 上升趋势：增强买入信号（×1.2），削弱卖出信号（×0.5）
+3. 下降趋势：增强卖出信号（×1.2），削弱买入信号（×0.5）
+4. 中性趋势：双向交易（×1.0）
 
-多周期共振：
-- 当 1h 和 5m 趋势方向一致时，信号质量最高
-- 当方向相反时，禁止交易
+软过滤策略（v2.0 优化）：
+- 不完全禁止逆势交易，而是降低信号权重
+- 强烈的反转信号（Climax、Failed Breakout）仍可逆势入场
+- 通过信号强度 × 权重来自动筛选
 """
 
 import asyncio
@@ -60,31 +62,41 @@ class HTFSnapshot:
 
 class HTFFilter:
     """
-    高时间框架过滤器
+    高时间框架过滤器（v2.0 软过滤版本）
     
     使用 1h EMA20 方向过滤日内交易信号
     
     Al Brooks 原则：
-    - 大周期上涨 → 只做多，不做空
-    - 大周期下跌 → 只做空，不做多
-    - 大周期横盘 → 双向交易，但要谨慎
+    - 大周期上涨 → 增强做多信号，削弱做空信号
+    - 大周期下跌 → 增强做空信号，削弱做多信号
+    - 大周期横盘 → 双向交易
     
     EMA 斜率计算：
-    - 比较最近 3 根 1h K 线的 EMA 变化
-    - 斜率 > 0.1% → 上升趋势
-    - 斜率 < -0.1% → 下降趋势
+    - 比较最近 6 根 1h K 线的 EMA 变化（6 小时）
+    - 斜率 > 0.3% → 上升趋势
+    - 斜率 < -0.3% → 下降趋势
     - 介于之间 → 中性
+    
+    信号权重调节：
+    - 顺势信号：×1.2（增强）
+    - 逆势信号：×0.5（削弱，但不禁止）
+    - 中性趋势：×1.0
     """
     
     # EMA 参数
     EMA_PERIOD = 20
     
     # 斜率阈值（%）
-    # BTC 1h 周期，0.1% 的 EMA 变化已经是明显的趋势
-    SLOPE_THRESHOLD_PCT = 0.001  # 0.1%
+    # BTC 1h 周期，0.3% 的 EMA 变化是更稳定的趋势信号
+    SLOPE_THRESHOLD_PCT = 0.003  # 0.3%（从 0.1% 提高）
     
-    # 斜率计算使用的 K 线数
-    SLOPE_LOOKBACK_BARS = 3
+    # 斜率计算使用的 K 线数（6 小时，更能反映趋势）
+    SLOPE_LOOKBACK_BARS = 6  # 从 3 根提高到 6 根
+    
+    # 信号权重因子
+    TREND_BOOST_FACTOR = 1.2      # 顺势增强
+    COUNTER_TREND_FACTOR = 0.5    # 逆势削弱（不是 0）
+    NEUTRAL_FACTOR = 1.0          # 中性
     
     # 更新间隔（秒）- 每 5 分钟更新一次
     UPDATE_INTERVAL_SECONDS = 300
@@ -235,67 +247,72 @@ class HTFFilter:
     
     def should_allow_signal(self, side: str) -> tuple[bool, str]:
         """
-        判断是否允许该方向的信号
+        判断是否允许该方向的信号（v2.0 软过滤）
+        
+        软过滤策略：总是允许交易，但通过权重调节信号强度
+        - 逆势信号不再被完全禁止
+        - 由信号强度 × 权重来决定是否达到入场阈值
         
         Args:
             side: 交易方向 ("buy" 或 "sell")
         
         Returns:
-            (is_allowed, reason): 是否允许及原因
+            (is_allowed, reason): 总是返回 True，reason 说明权重调节
         """
         if self._snapshot is None:
-            return (True, "HTF 数据未初始化，允许交易")
+            return (True, "HTF 数据未初始化，权重=1.0")
         
         trend = self._snapshot.trend
+        modifier = self.get_signal_modifier(side)
         
         if side == "buy":
             if trend == HTFTrend.BEARISH:
-                return (False, f"HTF({self.htf_interval}) 下降趋势，禁止买入")
+                return (True, f"HTF({self.htf_interval}) 下降趋势，买入权重×{modifier}（逆势削弱）")
             elif trend == HTFTrend.BULLISH:
-                return (True, f"HTF({self.htf_interval}) 上升趋势，买入信号增强")
+                return (True, f"HTF({self.htf_interval}) 上升趋势，买入权重×{modifier}（顺势增强）")
             else:
-                return (True, f"HTF({self.htf_interval}) 中性趋势，允许买入")
+                return (True, f"HTF({self.htf_interval}) 中性趋势，买入权重×{modifier}")
         
         else:  # side == "sell"
             if trend == HTFTrend.BULLISH:
-                return (False, f"HTF({self.htf_interval}) 上升趋势，禁止卖出")
+                return (True, f"HTF({self.htf_interval}) 上升趋势，卖出权重×{modifier}（逆势削弱）")
             elif trend == HTFTrend.BEARISH:
-                return (True, f"HTF({self.htf_interval}) 下降趋势，卖出信号增强")
+                return (True, f"HTF({self.htf_interval}) 下降趋势，卖出权重×{modifier}（顺势增强）")
             else:
-                return (True, f"HTF({self.htf_interval}) 中性趋势，允许卖出")
+                return (True, f"HTF({self.htf_interval}) 中性趋势，卖出权重×{modifier}")
     
     def get_signal_modifier(self, side: str) -> float:
         """
-        获取 HTF 信号调节因子
+        获取 HTF 信号调节因子（v2.0 软过滤）
         
         Args:
             side: 交易方向 ("buy" 或 "sell")
         
         Returns:
             float: 调节因子
-            - 1.2: 趋势方向一致（增强）
-            - 1.0: 中性
-            - 0.0: 趋势方向相反（禁止）
+            - 1.2: 趋势方向一致（顺势增强）
+            - 1.0: 中性趋势
+            - 0.5: 趋势方向相反（逆势削弱，但不禁止）
         """
         if self._snapshot is None:
-            return 1.0
+            return self.NEUTRAL_FACTOR
         
         trend = self._snapshot.trend
         
         if side == "buy":
             if trend == HTFTrend.BULLISH:
-                return 1.2  # 增强
+                return self.TREND_BOOST_FACTOR      # 1.2 顺势增强
             elif trend == HTFTrend.BEARISH:
-                return 0.0  # 禁止
+                return self.COUNTER_TREND_FACTOR    # 0.5 逆势削弱（不是 0）
             else:
-                return 1.0  # 中性
+                return self.NEUTRAL_FACTOR          # 1.0 中性
         else:
             if trend == HTFTrend.BEARISH:
-                return 1.2  # 增强
+                return self.TREND_BOOST_FACTOR      # 1.2 顺势增强
             elif trend == HTFTrend.BULLISH:
-                return 0.0  # 禁止
+                return self.COUNTER_TREND_FACTOR    # 0.5 逆势削弱（不是 0）
             else:
-                return 1.0  # 中性
+                return self.NEUTRAL_FACTOR          # 1.0 中性
 
 
 # ============================================================================
