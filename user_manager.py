@@ -808,6 +808,7 @@ class TradingUser:
             "entry_price": 0.0,
             "unrealized_profit": 0.0,
             "has_position": False,
+            "api_error": False,
         }
 
         try:
@@ -828,11 +829,13 @@ class TradingUser:
                     "entry_price": entry_price,
                     "unrealized_profit": un_realized,
                     "has_position": True,
+                    "api_error": False,
                 }
             return empty
         except Exception as e:
             logging.error(f"[{self.name}] sync_real_position({symbol}) 失败: {e}")
-            return empty
+            # 返回带错误标记的空字典，避免误判为外部平仓
+            return {**empty, "api_error": True}
 
     async def get_recent_trades(self, symbol: str, limit: int = 10) -> list:
         """

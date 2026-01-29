@@ -137,8 +137,36 @@ async def main() -> None:
         logging.error(f"发生错误: {e}", exc_info=True)
     finally:
         logging.info("正在清理资源...")
+        
+        # 取消所有运行中的任务
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        
+        # 等待所有任务完成取消（给予清理时间）
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # 关闭用户连接
         for user in users:
-            await user.close()
+            try:
+                await user.close()
+            except Exception as e:
+                logging.warning(f"关闭用户 {user.name} 连接时出错: {e}")
+        
+        # 关闭 Delta 分析器的 Redis 连接
+        try:
+            if strategy.delta_analyzer:
+                await strategy.delta_analyzer.close()
+        except Exception as e:
+            logging.warning(f"关闭 Delta 分析器时出错: {e}")
+        
+        # 关闭 trade_logger 的 Redis 连接
+        try:
+            await trade_logger.close()
+        except Exception as e:
+            logging.warning(f"关闭交易日志器时出错: {e}")
+        
         logging.info("程序已正常退出")
 
 

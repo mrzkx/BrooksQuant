@@ -229,10 +229,16 @@ async def _position_sync_alignment(user: TradingUser, trade_logger: TradeLogger)
     实盘对齐：对比币安真实持仓与本地 trade_logger，纠正脱节。
     - 币安无仓、本地有 -> 强制标记为外部平仓（externally_closed）
     - 币安有仓、本地无 -> 孤儿持仓，从币安恢复并挂 2% ATR 紧急止损
+    - 币安有仓、本地有但不一致 -> 同步数量/方向
     """
     try:
         real = await user.sync_real_position(SYMBOL)
         local_pos = trade_logger.positions.get(user.name)
+        
+        # API 失败时跳过本次校准，避免误判
+        if real.get("api_error"):
+            logging.debug(f"[{user.name}] 持仓校准: API 调用失败，跳过本次")
+            return
 
         # 币安无仓位，本地有记录 -> 外部平仓（手动/强平/TP2/SL 被交易所触发等）
         if not real["has_position"] and local_pos is not None:
@@ -282,6 +288,57 @@ async def _position_sync_alignment(user: TradingUser, trade_logger: TradeLogger)
                     f"[{user.name}] 实盘对齐: 发现孤儿持仓，已从币安恢复并挂载 2% ATR 紧急止损 "
                     f"({trade.side.upper()} {trade.quantity:.6f} @ {trade.entry_price:.2f})"
                 )
+            return
+        
+        # 币安有仓、本地也有 -> 检查数量/方向是否一致
+        if real["has_position"] and local_pos is not None:
+            binance_qty = real["quantity"]
+            binance_side = real["side"]
+            local_qty = float(local_pos.remaining_quantity or local_pos.quantity)
+            local_side = local_pos.side
+            
+            # 方向不一致（极端异常，可能手动反手了）
+            if binance_side != local_side:
+                logging.warning(
+                    f"[{user.name}] ⚠️ 实盘对齐: 方向不一致! "
+                    f"币安={binance_side.upper()} {binance_qty:.6f}, "
+                    f"本地={local_side.upper()} {local_qty:.6f}，将以币安为准重建"
+                )
+                # 强制关闭本地记录，重新恢复
+                trade_logger.force_close_position(
+                    user.name, real["entry_price"], reason="direction_mismatch"
+                )
+                position_info = await user.get_position_info(SYMBOL)
+                if position_info:
+                    try:
+                        ticker = await user.client.futures_symbol_ticker(symbol=SYMBOL)
+                        current_price = float(ticker.get("price", 0))
+                    except Exception:
+                        current_price = real["entry_price"]
+                    atr = current_price * 0.02
+                    trade_logger.recover_from_binance_position(
+                        user=user.name,
+                        position_info=position_info,
+                        current_price=current_price,
+                        atr=atr,
+                    )
+                return
+            
+            # 数量差异超过 5%（排除小数点精度误差）
+            if local_qty > 0 and abs(binance_qty - local_qty) / local_qty > 0.05:
+                logging.info(
+                    f"[{user.name}] 实盘对齐: 数量不一致 "
+                    f"(币安={binance_qty:.6f}, 本地={local_qty:.6f})，同步中..."
+                )
+                # 更新本地数量（可能是手动加仓/减仓，或 TP1 未同步）
+                local_pos.remaining_quantity = binance_qty
+                if binance_qty > local_qty:
+                    # 加仓了，更新总量
+                    local_pos.quantity = binance_qty
+                # 同步入场价（币安的均价可能因加仓而改变）
+                local_pos.entry_price = real["entry_price"]
+                trade_logger._redis_save_position(user.name, local_pos)
+                
     except Exception as e:
         logging.warning(f"[{user.name}] 持仓校准失败: {e}")
 

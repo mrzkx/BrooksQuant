@@ -528,6 +528,16 @@ class DeltaAnalyzer:
         
         return (is_climax_buy, is_climax_sell, is_absorption, is_withdrawal)
 
+    async def close(self) -> None:
+        """
+        关闭 DeltaAnalyzer 资源
+        
+        注意：Redis 连接由 aggtrade_worker 管理，这里只是占位符
+        """
+        # 清理内部数据
+        self._trades.clear()
+        logging.debug("DeltaAnalyzer 资源已清理")
+
 
 class DeltaSignalModifier:
     """
@@ -761,236 +771,252 @@ async def aggtrade_worker(symbol: str = "BTCUSDT", redis_url: Optional[str] = No
     # 获取全局 Delta 分析器（使用 K 线周期初始化）
     analyzer = get_delta_analyzer(kline_interval=kline_interval)
     
-    while reconnect_attempt < max_reconnect_attempts:
-        try:
-            logging.info(
-                f"正在连接 Binance WebSocket (aggTrade 订单流)..."
-                + (
-                    f" (重连尝试 {reconnect_attempt + 1}/{max_reconnect_attempts})"
-                    if reconnect_attempt > 0
-                    else ""
-                )
-            )
-            
-            # 连接 Redis（可选）
-            if redis_url:
-                try:
-                    redis_client = await aioredis.from_url(
-                        redis_url,
-                        encoding="utf-8",
-                        decode_responses=True,
-                        socket_connect_timeout=5,
-                    )
-                    await redis_client.ping()
-                    logging.info(f"✅ Redis 连接成功（用于 Delta 缓存）")
-                except Exception as e:
-                    logging.warning(f"⚠️ Redis 连接失败: {e}，Delta 数据将仅保存在内存中")
-                    redis_client = None
-            
-            # 创建 Binance 客户端
+    try:
+        while reconnect_attempt < max_reconnect_attempts:
             try:
+                logging.info(
+                    f"正在连接 Binance WebSocket (aggTrade 订单流)..."
+                    + (
+                        f" (重连尝试 {reconnect_attempt + 1}/{max_reconnect_attempts})"
+                        if reconnect_attempt > 0
+                        else ""
+                    )
+                )
+                
+                # 连接 Redis（可选）
+                if redis_url:
+                    try:
+                        redis_client = await aioredis.from_url(
+                            redis_url,
+                            encoding="utf-8",
+                            decode_responses=True,
+                            socket_connect_timeout=5,
+                        )
+                        await redis_client.ping()
+                        logging.info(f"✅ Redis 连接成功（用于 Delta 缓存）")
+                    except Exception as e:
+                        logging.warning(f"⚠️ Redis 连接失败: {e}，Delta 数据将仅保存在内存中")
+                        redis_client = None
+                
+                # 创建 Binance 客户端
+                try:
+                    if client is not None:
+                        try:
+                            await client.close_connection()
+                        except:
+                            pass
+                    client = await AsyncClient.create()
+                    logging.info("✅ Binance WebSocket 客户端创建成功")
+                except Exception as e:
+                    logging.error(f"❌ Binance 客户端创建失败: {e}")
+                    raise
+                
+                # 创建 WebSocket 管理器（必须在构造函数中传入 max_queue_size）
+                bsm = BinanceSocketManager(client, user_timeout=60, max_queue_size=10000)
+                
+                # 订阅 aggTrade 数据流
+                trade_socket = bsm.aggtrade_socket(symbol)
+                
+                # 统计计数器
+                trade_count = 0
+                last_log_time = time.time()
+                # 日志间隔：与短窗口对齐，最小 30 秒
+                LOG_INTERVAL = max(analyzer.SHORT_WINDOW_SECONDS, 30)
+                # Redis 缓存过期时间：短窗口的一半，确保数据新鲜
+                REDIS_CACHE_EXPIRE = max(analyzer.SHORT_WINDOW_SECONDS // 2, 10)
+                
+                async with trade_socket as stream:
+                    logging.info(
+                        f"🔄 动态订单流监控已启动: {symbol} (aggTrade Delta, "
+                        f"窗口={analyzer.WINDOW_SECONDS}秒, 日志间隔={LOG_INTERVAL}秒)"
+                    )
+                    reconnect_attempt = 0  # 重置重连计数
+                    
+                    # ========== 批量处理优化 ==========
+                    # 收集一批交易后一次性处理，减少锁竞争和函数调用开销
+                    BATCH_SIZE = 100  # 每批处理 100 条
+                    BATCH_TIMEOUT = 0.1  # 最长等待 100ms
+                    trade_batch: List[Tuple[int, float, float, bool]] = []
+                    last_batch_time = time.time()
+                    
+                    while True:
+                        try:
+                            # 非阻塞接收，支持批量处理
+                            try:
+                                msg = await asyncio.wait_for(stream.recv(), timeout=BATCH_TIMEOUT)
+                            except asyncio.TimeoutError:
+                                # 超时，处理当前批次
+                                if trade_batch:
+                                    await analyzer.add_trades_batch(trade_batch)
+                                    trade_count += len(trade_batch)
+                                    trade_batch = []
+                                    last_batch_time = time.time()
+                                continue
+                            
+                            if msg is None:
+                                logging.warning("aggTrade 数据流返回 None，可能连接断开")
+                                break
+                            
+                            # 解析 aggTrade 数据
+                            if "p" not in msg or "q" not in msg:
+                                continue
+                            
+                            price = float(msg["p"])
+                            qty = float(msg["q"])
+                            is_buyer_maker = msg.get("m", False)  # true=卖方主动, false=买方主动
+                            timestamp = msg.get("T", int(time.time() * 1000))
+                            
+                            # 添加到批次
+                            trade_batch.append((timestamp, price, qty, is_buyer_maker))
+                            
+                            # 批次满或超时，处理批次
+                            current_time = time.time()
+                            if len(trade_batch) >= BATCH_SIZE or (current_time - last_batch_time) >= BATCH_TIMEOUT:
+                                await analyzer.add_trades_batch(trade_batch)
+                                trade_count += len(trade_batch)
+                                trade_batch = []
+                                last_batch_time = current_time
+                            
+                            # 定期获取快照并存入 Redis
+                            current_time = time.time()
+                            if current_time - last_log_time >= LOG_INTERVAL:
+                                snapshot = await analyzer.get_snapshot(symbol)
+                                
+                                # 存入 Redis（带重连逻辑）
+                                if redis_client:
+                                    try:
+                                        redis_key = f"cache:delta:{symbol}"
+                                        await redis_client.setex(
+                                            redis_key,
+                                            REDIS_CACHE_EXPIRE,  # 动态过期时间
+                                            json.dumps({
+                                                "cumulative_delta": round(snapshot.cumulative_delta, 4),
+                                                "buy_volume": round(snapshot.buy_volume, 4),
+                                                "sell_volume": round(snapshot.sell_volume, 4),
+                                                "delta_ratio": round(snapshot.delta_ratio, 4),
+                                                "delta_avg": round(snapshot.delta_avg, 4),
+                                                "delta_acceleration": round(snapshot.delta_acceleration, 4),
+                                                "delta_trend": snapshot.delta_trend.value,
+                                                "is_absorption": snapshot.is_absorption,
+                                                "is_climax_buy": snapshot.is_climax_buy,
+                                                "is_climax_sell": snapshot.is_climax_sell,
+                                                "trade_count": snapshot.trade_count,
+                                                "timestamp": snapshot.timestamp,
+                                            })
+                                        )
+                                    except Exception as redis_err:
+                                        logging.warning(f"⚠️ Redis 写入失败: {redis_err}，尝试重连...")
+                                        # 尝试重连 Redis
+                                        try:
+                                            await redis_client.aclose()
+                                        except:
+                                            pass
+                                        
+                                        if redis_url:
+                                            try:
+                                                redis_client = await aioredis.from_url(
+                                                    redis_url,
+                                                    encoding="utf-8",
+                                                    decode_responses=True,
+                                                    socket_connect_timeout=5,
+                                                )
+                                                await redis_client.ping()
+                                                logging.info(f"✅ Redis 重连成功")
+                                            except Exception as reconnect_err:
+                                                logging.warning(f"⚠️ Redis 重连失败: {reconnect_err}，继续使用内存模式")
+                                                redis_client = None
+                                
+                                # 日志输出
+                                trend_emoji = {
+                                    DeltaTrend.STRONG_BULLISH: "🟢🟢",
+                                    DeltaTrend.BULLISH: "🟢",
+                                    DeltaTrend.NEUTRAL: "⚪",
+                                    DeltaTrend.BEARISH: "🔴",
+                                    DeltaTrend.STRONG_BEARISH: "🔴🔴",
+                                }
+                                logging.debug(
+                                    f"📊 Delta更新: {trend_emoji.get(snapshot.delta_trend, '⚪')} "
+                                    f"累计={snapshot.cumulative_delta:.4f}, "
+                                    f"比率={snapshot.delta_ratio:.4f}, "
+                                    f"买量={snapshot.buy_volume:.2f}, "
+                                    f"卖量={snapshot.sell_volume:.2f}, "
+                                    f"趋势={snapshot.delta_trend.value}, "
+                                    f"成交数={trade_count}"
+                                )
+                                
+                                last_log_time = current_time
+                                trade_count = 0
+                        
+                        except asyncio.CancelledError:
+                            # 任务被取消，向上传播
+                            logging.info("aggTrade 内层循环收到取消信号")
+                            raise
+                        except ReadLoopClosed:
+                            logging.warning("WebSocket 读取循环已关闭，准备重连...")
+                            break
+                        except asyncio.TimeoutError:
+                            # 超时只是没有新数据，继续等待
+                            continue
+                        except Exception as e:
+                            logging.error(f"处理 aggTrade 数据失败: {e}", exc_info=True)
+                            await asyncio.sleep(1)
+            
+            except ReadLoopClosed:
+                reconnect_attempt += 1
+                delay = min(base_delay * (2 ** reconnect_attempt), 60)
+                logging.warning(
+                    f"aggTrade WebSocket 读取循环已关闭，"
+                    f"{delay}秒后重连 ({reconnect_attempt}/{max_reconnect_attempts})"
+                )
+                await asyncio.sleep(delay)
+            except ConnectionClosed as e:
+                reconnect_attempt += 1
+                delay = min(base_delay * (2 ** reconnect_attempt), 60)
+                logging.warning(
+                    f"aggTrade WebSocket 连接关闭: {e}，"
+                    f"{delay}秒后重连 ({reconnect_attempt}/{max_reconnect_attempts})"
+                )
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                # 任务被取消，向上传播到外层处理
+                raise
+            except Exception as e:
+                reconnect_attempt += 1
+                delay = min(base_delay * (2 ** reconnect_attempt), 60)
+                logging.error(
+                    f"aggTrade 监控异常: {e}，"
+                    f"{delay}秒后重连 ({reconnect_attempt}/{max_reconnect_attempts})",
+                    exc_info=True
+                )
+                await asyncio.sleep(delay)
+                
+                # 只关闭 Binance 客户端（Redis 保持复用）
                 if client is not None:
                     try:
                         await client.close_connection()
                     except:
                         pass
-                client = await AsyncClient.create()
-                logging.info("✅ Binance WebSocket 客户端创建成功")
-            except Exception as e:
-                logging.error(f"❌ Binance 客户端创建失败: {e}")
-                raise
-            
-            # 创建 WebSocket 管理器（必须在构造函数中传入 max_queue_size）
-            bsm = BinanceSocketManager(client, user_timeout=60, max_queue_size=10000)
-            
-            # 订阅 aggTrade 数据流
-            trade_socket = bsm.aggtrade_socket(symbol)
-            
-            # 统计计数器
-            trade_count = 0
-            last_log_time = time.time()
-            # 日志间隔：与短窗口对齐，最小 30 秒
-            LOG_INTERVAL = max(analyzer.SHORT_WINDOW_SECONDS, 30)
-            # Redis 缓存过期时间：短窗口的一半，确保数据新鲜
-            REDIS_CACHE_EXPIRE = max(analyzer.SHORT_WINDOW_SECONDS // 2, 10)
-            
-            async with trade_socket as stream:
-                logging.info(
-                    f"🔄 动态订单流监控已启动: {symbol} (aggTrade Delta, "
-                    f"窗口={analyzer.WINDOW_SECONDS}秒, 日志间隔={LOG_INTERVAL}秒)"
-                )
-                reconnect_attempt = 0  # 重置重连计数
-                
-                # ========== 批量处理优化 ==========
-                # 收集一批交易后一次性处理，减少锁竞争和函数调用开销
-                BATCH_SIZE = 100  # 每批处理 100 条
-                BATCH_TIMEOUT = 0.1  # 最长等待 100ms
-                trade_batch: List[Tuple[int, float, float, bool]] = []
-                last_batch_time = time.time()
-                
-                while True:
-                    try:
-                        # 非阻塞接收，支持批量处理
-                        try:
-                            msg = await asyncio.wait_for(stream.recv(), timeout=BATCH_TIMEOUT)
-                        except asyncio.TimeoutError:
-                            # 超时，处理当前批次
-                            if trade_batch:
-                                await analyzer.add_trades_batch(trade_batch)
-                                trade_count += len(trade_batch)
-                                trade_batch = []
-                                last_batch_time = time.time()
-                            continue
-                        
-                        if msg is None:
-                            logging.warning("aggTrade 数据流返回 None，可能连接断开")
-                            break
-                        
-                        # 解析 aggTrade 数据
-                        if "p" not in msg or "q" not in msg:
-                            continue
-                        
-                        price = float(msg["p"])
-                        qty = float(msg["q"])
-                        is_buyer_maker = msg.get("m", False)  # true=卖方主动, false=买方主动
-                        timestamp = msg.get("T", int(time.time() * 1000))
-                        
-                        # 添加到批次
-                        trade_batch.append((timestamp, price, qty, is_buyer_maker))
-                        
-                        # 批次满或超时，处理批次
-                        current_time = time.time()
-                        if len(trade_batch) >= BATCH_SIZE or (current_time - last_batch_time) >= BATCH_TIMEOUT:
-                            await analyzer.add_trades_batch(trade_batch)
-                            trade_count += len(trade_batch)
-                            trade_batch = []
-                            last_batch_time = current_time
-                        
-                        # 定期获取快照并存入 Redis
-                        current_time = time.time()
-                        if current_time - last_log_time >= LOG_INTERVAL:
-                            snapshot = await analyzer.get_snapshot(symbol)
-                            
-                            # 存入 Redis（带重连逻辑）
-                            if redis_client:
-                                try:
-                                    redis_key = f"cache:delta:{symbol}"
-                                    await redis_client.setex(
-                                        redis_key,
-                                        REDIS_CACHE_EXPIRE,  # 动态过期时间
-                                        json.dumps({
-                                            "cumulative_delta": round(snapshot.cumulative_delta, 4),
-                                            "buy_volume": round(snapshot.buy_volume, 4),
-                                            "sell_volume": round(snapshot.sell_volume, 4),
-                                            "delta_ratio": round(snapshot.delta_ratio, 4),
-                                            "delta_avg": round(snapshot.delta_avg, 4),
-                                            "delta_acceleration": round(snapshot.delta_acceleration, 4),
-                                            "delta_trend": snapshot.delta_trend.value,
-                                            "is_absorption": snapshot.is_absorption,
-                                            "is_climax_buy": snapshot.is_climax_buy,
-                                            "is_climax_sell": snapshot.is_climax_sell,
-                                            "trade_count": snapshot.trade_count,
-                                            "timestamp": snapshot.timestamp,
-                                        })
-                                    )
-                                except Exception as redis_err:
-                                    logging.warning(f"⚠️ Redis 写入失败: {redis_err}，尝试重连...")
-                                    # 尝试重连 Redis
-                                    try:
-                                        await redis_client.aclose()
-                                    except:
-                                        pass
-                                    
-                                    if redis_url:
-                                        try:
-                                            redis_client = await aioredis.from_url(
-                                                redis_url,
-                                                encoding="utf-8",
-                                                decode_responses=True,
-                                                socket_connect_timeout=5,
-                                            )
-                                            await redis_client.ping()
-                                            logging.info(f"✅ Redis 重连成功")
-                                        except Exception as reconnect_err:
-                                            logging.warning(f"⚠️ Redis 重连失败: {reconnect_err}，继续使用内存模式")
-                                            redis_client = None
-                            
-                            # 日志输出
-                            trend_emoji = {
-                                DeltaTrend.STRONG_BULLISH: "🟢🟢",
-                                DeltaTrend.BULLISH: "🟢",
-                                DeltaTrend.NEUTRAL: "⚪",
-                                DeltaTrend.BEARISH: "🔴",
-                                DeltaTrend.STRONG_BEARISH: "🔴🔴",
-                            }
-                            logging.debug(
-                                f"📊 Delta更新: {trend_emoji.get(snapshot.delta_trend, '⚪')} "
-                                f"累计={snapshot.cumulative_delta:.4f}, "
-                                f"比率={snapshot.delta_ratio:.4f}, "
-                                f"买量={snapshot.buy_volume:.2f}, "
-                                f"卖量={snapshot.sell_volume:.2f}, "
-                                f"趋势={snapshot.delta_trend.value}, "
-                                f"成交数={trade_count}"
-                            )
-                            
-                            last_log_time = current_time
-                            trade_count = 0
-                    
-                    except ReadLoopClosed:
-                        logging.warning("WebSocket 读取循环已关闭，准备重连...")
-                        break
-                    except asyncio.TimeoutError:
-                        # 超时只是没有新数据，继续等待
-                        continue
-                    except Exception as e:
-                        logging.error(f"处理 aggTrade 数据失败: {e}", exc_info=True)
-                        await asyncio.sleep(1)
+                    client = None
         
-        except ReadLoopClosed:
-            reconnect_attempt += 1
-            delay = min(base_delay * (2 ** reconnect_attempt), 60)
-            logging.warning(
-                f"aggTrade WebSocket 读取循环已关闭，"
-                f"{delay}秒后重连 ({reconnect_attempt}/{max_reconnect_attempts})"
-            )
-            await asyncio.sleep(delay)
-        except ConnectionClosed as e:
-            reconnect_attempt += 1
-            delay = min(base_delay * (2 ** reconnect_attempt), 60)
-            logging.warning(
-                f"aggTrade WebSocket 连接关闭: {e}，"
-                f"{delay}秒后重连 ({reconnect_attempt}/{max_reconnect_attempts})"
-            )
-            await asyncio.sleep(delay)
-        except Exception as e:
-            reconnect_attempt += 1
-            delay = min(base_delay * (2 ** reconnect_attempt), 60)
-            logging.error(
-                f"aggTrade 监控异常: {e}，"
-                f"{delay}秒后重连 ({reconnect_attempt}/{max_reconnect_attempts})",
-                exc_info=True
-            )
-            await asyncio.sleep(delay)
-            
-            # 只关闭 Binance 客户端（Redis 保持复用）
-            if client is not None:
-                try:
-                    await client.close_connection()
-                except:
-                    pass
-                client = None
+        # 循环正常结束（达到最大重连次数）
+        logging.error(f"aggTrade 监控达到最大重连次数 ({max_reconnect_attempts})，已停止")
     
-    # 循环结束后，清理所有资源
-    logging.error(f"aggTrade 监控达到最大重连次数 ({max_reconnect_attempts})，已停止")
+    except asyncio.CancelledError:
+        logging.info("aggTrade 监控任务已取消")
     
-    # 最终清理
-    if client is not None:
-        try:
-            await client.close_connection()
-        except:
-            pass
-    if redis_client is not None:
-        try:
-            await redis_client.aclose()
-        except:
-            pass
+    finally:
+        # 最终清理（无论正常退出还是被取消）
+        logging.info("正在清理 aggTrade 监控资源...")
+        if client is not None:
+            try:
+                await client.close_connection()
+                logging.debug("Binance WebSocket 客户端已关闭")
+            except Exception as e:
+                logging.debug(f"关闭 Binance 客户端时出错: {e}")
+        if redis_client is not None:
+            try:
+                await redis_client.aclose()
+                logging.debug("aggTrade Redis 连接已关闭")
+            except Exception as e:
+                logging.debug(f"关闭 Redis 连接时出错: {e}")
+        logging.info("aggTrade 监控资源清理完成")

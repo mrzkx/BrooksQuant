@@ -139,6 +139,17 @@ class TradeLogger:
         else:
             logging.info("📊 交易日志器已初始化（内存版），持仓将根据币安真实持仓恢复与更新")
 
+    async def close(self) -> None:
+        """关闭 Redis 连接"""
+        if self._redis_client is not None:
+            try:
+                self._redis_client.close()
+                logging.info("📊 交易日志器 Redis 连接已关闭")
+            except Exception as e:
+                logging.warning(f"关闭交易日志器 Redis 连接时出错: {e}")
+            finally:
+                self._redis_client = None
+
     def _redis(self) -> Optional[Any]:
         """获取 Redis 客户端（懒连接）"""
         if self._redis_client is None:
