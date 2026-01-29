@@ -40,6 +40,7 @@ def _extract_signal_params(signal: Dict) -> Dict:
         "signal_strength": signal.get("signal_strength", 0.0),
         "tp1_close_ratio": signal.get("tp1_close_ratio", 0.5),
         "is_climax_bar": signal.get("is_climax_bar", False),
+        "move_stop_to_breakeven_at_tp1": signal.get("move_stop_to_breakeven_at_tp1", False),
     }
 
 

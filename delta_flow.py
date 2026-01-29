@@ -653,6 +653,50 @@ class DeltaSignalModifier:
         return (round(modifier, 2), reason)
 
 
+def compute_wedge_buy_delta_boost(
+    snapshot: DeltaSnapshot, price_change_pct: float = 0.0
+) -> Tuple[float, str]:
+    """
+    Wedge_Buy 专用：根据当前/过去若干 K 线窗口的 Delta 对信号加权。
+    
+    当检测到 Wedge_Buy 时，形态已保证价格创新低（第三推）。若此时 Delta 显示：
+    1. 正背离：价格创新低但 Delta 大幅回升（当前窗口 delta_ratio > 0 或趋势转多）→ 加权
+    2. 吸收：巨大负 Delta 但价格跌不动（is_absorption 且 delta_ratio < 0，买盘暗中吸筹）→ 加权
+    
+    Args:
+        snapshot: 当前 Delta 快照（与 K 线周期对齐，可视为近期 1～3 根 K 线内的订单流）
+        price_change_pct: 当前窗口内价格变化百分比（可选，用于辅助判断吸收）
+    
+    Returns:
+        (multiplier, reason): 加权倍数（1.0～1.35），及说明
+    """
+    if snapshot.trade_count == 0:
+        return (1.0, "无Delta数据")
+    
+    multiplier = 1.0
+    reasons: List[str] = []
+    
+    # 吸收：巨大负 Delta 但价格跌不动 → 买盘吸筹，利好 Wedge_Buy
+    if snapshot.is_absorption and snapshot.delta_ratio < 0:
+        multiplier = 1.25
+        reasons.append("吸收(巨大负Delta但价格跌不动，买盘吸筹)")
+    
+    # 正背离：价格创新低（由 Wedge 形态保证）但 Delta 大幅回升
+    if (
+        snapshot.delta_ratio > 0.2
+        or snapshot.delta_trend in (DeltaTrend.BULLISH, DeltaTrend.STRONG_BULLISH)
+    ):
+        boost = 1.2
+        if multiplier > 1.0:
+            multiplier = min(multiplier * boost, 1.35)  # 两者都满足时封顶 1.35
+        else:
+            multiplier = boost
+        reasons.append("正背离(价格创新低后Delta回升)")
+    
+    reason = ", ".join(reasons) if reasons else "Delta中性"
+    return (round(multiplier, 2), reason)
+
+
 # 全局 Delta 分析器实例
 _delta_analyzer: Optional[DeltaAnalyzer] = None
 _delta_analyzer_kline_interval: Optional[str] = None

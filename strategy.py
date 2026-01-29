@@ -92,6 +92,9 @@ class SignalArrays:
     is_climax_bars: List[Optional[bool]]
     talib_boosts: List[Optional[float]]
     talib_patterns: List[Optional[str]]
+    entry_modes: List[Optional[str]]      # Spike: "Market_Entry" / "Limit_Entry"
+    is_high_risk: List[Optional[bool]]    # Spike 高风险时 True，仓位 50%
+    move_stop_to_breakeven_at_tp1: List[Optional[bool]]  # TP1 后移动止损到保本（Wedge 必做）
     
     @classmethod
     def create(cls, length: int) -> "SignalArrays":
@@ -111,6 +114,9 @@ class SignalArrays:
             is_climax_bars=[None] * length,
             talib_boosts=[None] * length,
             talib_patterns=[None] * length,
+            entry_modes=[None] * length,
+            is_high_risk=[None] * length,
+            move_stop_to_breakeven_at_tp1=[None] * length,
         )
 
 
@@ -125,13 +131,19 @@ class SignalResult:
     side: str
     stop_loss: float
     base_height: float
-    limit_price: Optional[float] = None  # 限价入场价格（Spike回撤用）
+    limit_price: Optional[float] = None  # 限价入场价格（Spike Limit_Entry 用）
     risk_reward: float = 2.0
     delta_modifier: float = 1.0
     tp1_close_ratio: float = 0.5
     is_climax: bool = False
     strength: float = 1.0               # 信号强度（HTF 权重调节用）
     htf_modifier: float = 1.0           # HTF 权重调节因子
+    entry_mode: Optional[str] = None    # Spike 入场模式: "Market_Entry" / "Limit_Entry"
+    is_high_risk: bool = False          # Spike 止损距离 > 2.5*ATR 时 True，仓位 50%
+    wedge_tp1_price: Optional[float] = None  # Wedge 专用 TP1（EMA20）
+    wedge_tp2_price: Optional[float] = None  # Wedge 专用 TP2（楔形起点）
+    wedge_strong_reversal_bar: bool = False  # Wedge Signal Bar 是否为大影线强反转棒（强度+0.2）
+    move_stop_to_breakeven_at_tp1: bool = False  # TP1 触发后移动止损到保本（Wedge 必做，Brooks 高波动保命）
 
 # 导入模块化组件（MarketState 已在文件顶部导入）
 from logic.market_analyzer import MarketAnalyzer
@@ -149,11 +161,12 @@ from logic.talib_indicators import compute_ema, compute_atr
 
 # 导入动态订单流模块
 from delta_flow import (
-    DeltaAnalyzer, 
-    DeltaSnapshot, 
+    DeltaAnalyzer,
+    DeltaSnapshot,
     DeltaTrend,
-    DeltaSignalModifier, 
-    get_delta_analyzer
+    DeltaSignalModifier,
+    get_delta_analyzer,
+    compute_wedge_buy_delta_boost,
 )
 
 
@@ -736,6 +749,9 @@ class AlBrooksStrategy:
         arrays.tp1_close_ratios[i] = result.tp1_close_ratio
         arrays.is_climax_bars[i] = result.is_climax
         arrays.delta_modifiers[i] = result.delta_modifier
+        arrays.entry_modes[i] = getattr(result, "entry_mode", None)
+        arrays.is_high_risk[i] = getattr(result, "is_high_risk", False)
+        arrays.move_stop_to_breakeven_at_tp1[i] = getattr(result, "move_stop_to_breakeven_at_tp1", False)
     
     def _check_failed_breakout(
         self, 
@@ -816,7 +832,7 @@ class AlBrooksStrategy:
         if not result:
             return None
         
-        signal_type, side, stop_loss, limit_price, base_height = result
+        signal_type, side, stop_loss, limit_price, base_height, entry_mode, is_high_risk = result
         
         # 冷却期检查
         if self._check_signal_cooldown(signal_type, side, ctx.i, ctx.is_latest_bar):
@@ -842,6 +858,11 @@ class AlBrooksStrategy:
                 )
             return None
         
+        if ctx.is_latest_bar and is_high_risk:
+            logging.info(
+                f"⚠️ Spike 高风险: {signal_type} 止损距离>2.5*ATR，建议仓位 50%"
+            )
+        
         return SignalResult(
             signal_type=signal_type,
             side=side,
@@ -849,6 +870,8 @@ class AlBrooksStrategy:
             base_height=base_height,
             limit_price=limit_price,
             risk_reward=2.0,
+            entry_mode=entry_mode,
+            is_high_risk=is_high_risk,
         )
     
     def _check_climax(
@@ -927,13 +950,13 @@ class AlBrooksStrategy:
             return None
         
         result = self.pattern_detector.detect_wedge_reversal(
-            data, ctx.i, ctx.ema, ctx.atr
+            data, ctx.i, ctx.ema, ctx.atr, ctx.market_state
         )
         
         if not result:
             return None
         
-        signal_type, side, stop_loss, base_height = result
+        signal_type, side, stop_loss, base_height, wedge_tp1, wedge_tp2, is_strong_reversal_bar = result
         
         # 冷却期检查
         if self._check_signal_cooldown(signal_type, side, ctx.i, ctx.is_latest_bar):
@@ -948,12 +971,19 @@ class AlBrooksStrategy:
                 )
             return None
         
+        # Wedge 信号强度：初始 0.5，强反转棒 +0.2；Delta 背离在 generate_signals 中 +0.3
+        strength = 0.5 + (0.2 if is_strong_reversal_bar else 0.0)
+        
         return SignalResult(
             signal_type=signal_type,
             side=side,
             stop_loss=stop_loss,
             base_height=base_height,
             risk_reward=2.0,
+            wedge_tp1_price=wedge_tp1,
+            wedge_tp2_price=wedge_tp2,
+            wedge_strong_reversal_bar=is_strong_reversal_bar,
+            strength=strength,
         )
     
     async def _process_h2_signal(
@@ -1192,6 +1222,9 @@ class AlBrooksStrategy:
         data["is_climax_bar"] = arrays.is_climax_bars
         data["talib_boost"] = arrays.talib_boosts
         data["talib_patterns"] = arrays.talib_patterns
+        data["entry_mode"] = arrays.entry_modes
+        data["is_high_risk"] = arrays.is_high_risk
+        data["move_stop_to_breakeven_at_tp1"] = arrays.move_stop_to_breakeven_at_tp1
         
         return data
 
@@ -1224,8 +1257,8 @@ class AlBrooksStrategy:
         arrays = SignalArrays.create(total_bars)
         
         # ========== Step 3: 初始化状态机和缓存 ==========
-        # Spike 回撤入场状态
-        pending_spike: Optional[Tuple[str, str, float, float, float, int]] = None
+        # Spike 回撤入场状态 (Limit_Entry: signal_type, side, stop_loss, limit_price, base_height, spike_idx, is_high_risk)
+        pending_spike: Optional[Tuple[str, str, float, float, float, int, bool]] = None
         
         # H2/L2 状态机
         h2_machine = H2StateMachine()
@@ -1250,9 +1283,9 @@ class AlBrooksStrategy:
             arrays.market_states[i] = ctx.market_state.value
             arrays.tight_channel_scores[i] = ctx.tight_channel_score
             
-            # ---------- 处理待处理的 Spike 回撤入场 ----------
+            # ---------- 处理待处理的 Spike 回撤入场（Limit_Entry）----------
             if pending_spike is not None:
-                signal_type, side, stop_loss, limit_price, base_height, spike_idx = pending_spike
+                signal_type, side, stop_loss, limit_price, base_height, spike_idx, is_high_risk = pending_spike
                 
                 # 检查是否触发限价入场
                 triggered = False
@@ -1268,7 +1301,8 @@ class AlBrooksStrategy:
                     )
                     result = SignalResult(
                         signal_type=signal_type, side=side, stop_loss=stop_loss,
-                        base_height=base_height, tp1_close_ratio=tp1_ratio, is_climax=is_climax
+                        base_height=base_height, tp1_close_ratio=tp1_ratio, is_climax=is_climax,
+                        entry_mode="Limit_Entry", is_high_risk=is_high_risk
                     )
                     self._record_signal(arrays, i, result, ctx.market_state.value, ctx.tight_channel_score, tp1, tp2)
                     self._update_signal_cooldown(signal_type, i)
@@ -1311,10 +1345,11 @@ class AlBrooksStrategy:
             spike_result = self._check_spike(data, ctx)
             if spike_result:
                 if spike_result.limit_price is not None:
-                    # 设置待处理的 Spike 回撤入场
+                    # Limit_Entry: 设置待处理的 Spike 回撤入场（入场价 = Signal Bar 实体 50%）
                     pending_spike = (
                         spike_result.signal_type, spike_result.side, spike_result.stop_loss,
-                        spike_result.limit_price, spike_result.base_height, i
+                        spike_result.limit_price, spike_result.base_height, i,
+                        getattr(spike_result, "is_high_risk", False)
                     )
                 else:
                     # 直接入场（需要 Delta 过滤）
@@ -1391,6 +1426,28 @@ class AlBrooksStrategy:
             # ---------- 优先级4: Wedge 反转 ----------
             wedge_result = self._check_wedge(data, ctx)
             if wedge_result:
+                # Wedge_Buy 专用：Delta 背离（价格新低但卖压减弱）则强度 +0.3
+                if wedge_result.signal_type == "Wedge_Buy" and ctx.is_latest_bar:
+                    if not delta_snapshot_fetched:
+                        cached_delta_snapshot = await self._get_delta_snapshot("BTCUSDT")
+                        delta_snapshot_fetched = True
+                    if cached_delta_snapshot is not None and cached_delta_snapshot.trade_count > 0:
+                        kline_open = data.iloc[i]["open"]
+                        price_change_pct = (
+                            (ctx.close - kline_open) / kline_open * 100
+                            if kline_open > 0
+                            else 0.0
+                        )
+                        wedge_boost, wedge_boost_reason = compute_wedge_buy_delta_boost(
+                            cached_delta_snapshot, price_change_pct
+                        )
+                        wedge_result.delta_modifier = wedge_boost
+                        if wedge_boost > 1.0:
+                            wedge_result.strength += 0.3  # Delta 背离加权
+                            logging.info(
+                                f"✅ Wedge_Buy Delta背离: 强度+0.3, ×{wedge_boost} - {wedge_boost_reason}"
+                            )
+                
                 # 应用 HTF 权重调节（v2.0 软过滤）
                 htf_modifier = cached_htf_buy_modifier if wedge_result.side == "buy" else cached_htf_sell_modifier
                 wedge_result.htf_modifier = htf_modifier
@@ -1399,10 +1456,19 @@ class AlBrooksStrategy:
                 if ctx.is_latest_bar and htf_modifier != 1.0:
                     logging.info(f"📊 HTF权重调节 Wedge: ×{htf_modifier} → 强度={wedge_result.strength:.2f}")
                 
-                tp1, tp2, tp1_ratio, is_climax = self._calculate_tp1_tp2(
-                    ctx.close, wedge_result.stop_loss, wedge_result.side, wedge_result.base_height,
-                    ctx.atr, wedge_result.signal_type, ctx.market_state.value, data, i
-                )
+                # Wedge 专用止盈：TP1=EMA，TP2=楔形起点。BTC 5m 楔形易演变为 Wedge Bull/Bear Flag（深度回调），
+                # Brooks 高波动保命：TP1(EMA) 处至少平 50% 仓位并移动止损到保本价
+                if wedge_result.wedge_tp1_price is not None and wedge_result.wedge_tp2_price is not None:
+                    tp1 = wedge_result.wedge_tp1_price
+                    tp2 = wedge_result.wedge_tp2_price
+                    tp1_ratio = 0.5  # 至少 50% 在 TP1 平仓
+                    wedge_result.move_stop_to_breakeven_at_tp1 = True  # TP1 触发后止损移至保本
+                    is_climax = False
+                else:
+                    tp1, tp2, tp1_ratio, is_climax = self._calculate_tp1_tp2(
+                        ctx.close, wedge_result.stop_loss, wedge_result.side, wedge_result.base_height,
+                        ctx.atr, wedge_result.signal_type, ctx.market_state.value, data, i
+                    )
                 wedge_result.tp1_close_ratio = tp1_ratio
                 wedge_result.is_climax = is_climax
                 self._record_signal(arrays, i, wedge_result, ctx.market_state.value, ctx.tight_channel_score, tp1, tp2)

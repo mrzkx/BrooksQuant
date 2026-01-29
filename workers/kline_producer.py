@@ -315,6 +315,7 @@ def _build_signal(last, k, df) -> Dict:
     # 动态分批出场参数
     tp1_close_ratio = last.get("tp1_close_ratio", 0.5)
     is_climax_bar = last.get("is_climax_bar", False)
+    move_stop_to_breakeven_at_tp1 = last.get("move_stop_to_breakeven_at_tp1", False)
     
     # TA-Lib 形态加成
     talib_boost = last.get("talib_boost", 0.0) or 0.0
@@ -361,9 +362,10 @@ def _build_signal(last, k, df) -> Dict:
         "tp2_price": tp2_price,
         "tight_channel_score": tight_channel_score,
         "atr": atr_value,
-        # 动态分批出场参数
+        # 动态分批出场参数（Wedge: TP1 至少 50% 平仓 + 移动止损到保本，Brooks 高波动保命）
         "tp1_close_ratio": tp1_close_ratio,
         "is_climax_bar": is_climax_bar,
+        "move_stop_to_breakeven_at_tp1": move_stop_to_breakeven_at_tp1,
         # TA-Lib 形态增强
         "talib_boost": talib_boost,
         "talib_patterns": talib_patterns_str,

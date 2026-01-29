@@ -62,6 +62,12 @@ class BacktestConfig:
 
     # 回测专用：是否对 H2/L2 使用 1h HTF 过滤（默认关闭，便于统计 H2/L2 触发与胜率）
     use_htf_filter_for_h2l2: bool = False
+    # 回测专用：是否跳过 H2/L2 信号棒校验（用于诊断为何无 H2/L2 交易）
+    skip_h2l2_validation: bool = False
+    # 回测专用：仅 H2/L2 模式，禁用 Spike/Climax/Wedge/FailedBreakout
+    h2l2_only: bool = False
+    # 回测专用：关闭所有过滤，完全按 Al Brooks 原始逻辑（无信号棒校验、无 HTF 过滤、无强趋势方向限制）
+    no_filters: bool = False
 
 
 # ============================================================================
@@ -169,12 +175,15 @@ class BacktestStrategy:
     - 可配置止损 ATR 乘数
     """
     
-    def __init__(self, ema_period: int = 20, lookback_period: int = 20, stop_loss_atr_multiplier: float = 2.0, kline_interval: str = "5m", use_htf_filter_for_h2l2: bool = False):
+    def __init__(self, ema_period: int = 20, lookback_period: int = 20, stop_loss_atr_multiplier: float = 2.0, kline_interval: str = "5m", use_htf_filter_for_h2l2: bool = False, skip_h2l2_validation: bool = False, h2l2_only: bool = False, no_filters: bool = False):
         self.ema_period = ema_period
         self.lookback_period = lookback_period
         self.stop_loss_atr_multiplier = stop_loss_atr_multiplier  # 止损 ATR 乘数
         self.kline_interval = kline_interval
         self.use_htf_filter_for_h2l2 = use_htf_filter_for_h2l2  # 回测时默认 False，让 H2/L2 能触发
+        self.skip_h2l2_validation = skip_h2l2_validation  # 跳过 H2/L2 信号棒校验（诊断用）
+        self.h2l2_only = h2l2_only  # 仅 H2/L2，禁用其他形态
+        self.no_filters = no_filters  # 关闭所有过滤，完全 Al Brooks 原始逻辑
 
         # 初始化模块化组件
         self.market_analyzer = MarketAnalyzer(ema_period=ema_period, kline_interval=kline_interval)
@@ -411,12 +420,15 @@ class BacktestStrategy:
         tp2_prices: List[Optional[float]] = [None] * len(data)
         tight_channel_scores: List[Optional[float]] = [None] * len(data)
         
-        # Spike 回撤入场状态
-        pending_spike: Optional[Tuple[str, str, float, float, float, int]] = None
+        # Spike 回撤入场状态 (Limit_Entry: ..., spike_idx, is_high_risk)
+        pending_spike: Optional[Tuple[str, str, float, float, float, int, bool]] = None
         
         # H2/L2 状态机
         h2_machine = H2StateMachine()
         l2_machine = L2StateMachine()
+        
+        # H2/L2 诊断计数（用于排查无 H2/L2 交易）
+        self._h2l2_diag = {"bars_h2l2": 0, "h2_emitted": 0, "l2_emitted": 0, "h2_rejected": 0, "l2_rejected": 0}
         
         for i in range(1, len(data)):
             # 进度显示
@@ -452,123 +464,131 @@ class BacktestStrategy:
                 trend_strength >= 0.7
             )
             
-            # 确定允许的交易方向
+            # 确定允许的交易方向（no_filters 时取消强趋势方向限制，完全 Al Brooks）
             allowed_side: Optional[str] = None
-            if is_strong_trend_mode:
+            if is_strong_trend_mode and not self.no_filters:
                 if tight_channel_direction == "up" or trend_direction == "up":
                     allowed_side = "buy"
                 elif tight_channel_direction == "down" or trend_direction == "down":
                     allowed_side = "sell"
             
-            # 处理待处理的 Spike 回撤入场
-            if pending_spike is not None:
-                signal_type, side, stop_loss, limit_price, base_height, spike_idx = pending_spike
-                
-                if side == "buy" and low <= limit_price:
-                    signals[i] = signal_type
-                    sides[i] = side
-                    stops[i] = stop_loss
-                    base_heights[i] = base_height
-                    risk_reward_ratios[i] = 2.0
-                    tp1, tp2 = self._calculate_tp1_tp2(limit_price, stop_loss, side, base_height, atr)
-                    tp1_prices[i], tp2_prices[i] = tp1, tp2
-                    pending_spike = None
-                    h2_machine.set_strong_trend()
-                    continue
-                elif side == "sell" and high >= limit_price:
-                    signals[i] = signal_type
-                    sides[i] = side
-                    stops[i] = stop_loss
-                    base_heights[i] = base_height
-                    risk_reward_ratios[i] = 2.0
-                    tp1, tp2 = self._calculate_tp1_tp2(limit_price, stop_loss, side, base_height, atr)
-                    tp1_prices[i], tp2_prices[i] = tp1, tp2
-                    pending_spike = None
-                    l2_machine.set_strong_trend()
-                    continue
-                elif (side == "buy" and close > limit_price * 1.05) or (side == "sell" and close < limit_price * 0.95):
-                    pending_spike = None
-                elif i - spike_idx > 5:
-                    pending_spike = None
-            
-            # 优先级1: Failed Breakout
-            if market_state == MarketState.TRADING_RANGE and not is_strong_trend_mode:
-                result = self.pattern_detector.detect_failed_breakout(data, i, ema, atr, market_state)
-                if result:
-                    signal_type, side, stop_loss, base_height = result
+            if not self.h2l2_only:
+                # 处理待处理的 Spike 回撤入场（Limit_Entry）
+                if pending_spike is not None:
+                    signal_type, side, stop_loss, limit_price, base_height, spike_idx, _ = pending_spike
                     
-                    if allowed_side is not None and side != allowed_side:
-                        continue
-                    
-                    signals[i] = signal_type
-                    sides[i] = side
-                    stops[i] = stop_loss
-                    base_heights[i] = base_height
-                    risk_reward_ratios[i] = 1.0
-                    tp1, tp2 = self._calculate_tp1_tp2(close, stop_loss, side, base_height, atr)
-                    tp1_prices[i], tp2_prices[i] = tp1, tp2
-                    continue
-            
-            # 优先级2: Strong Spike
-            spike_result = self.pattern_detector.detect_strong_spike(data, i, ema, atr, market_state)
-            if spike_result:
-                signal_type, side, stop_loss, limit_price, base_height = spike_result
-                
-                if allowed_side is not None and side != allowed_side:
-                    continue
-                
-                if limit_price is not None:
-                    pending_spike = (signal_type, side, stop_loss, limit_price, base_height, i)
-                else:
-                    # 回测中不使用 Delta 过滤，直接入场
-                    signals[i] = signal_type
-                    sides[i] = side
-                    stops[i] = stop_loss
-                    base_heights[i] = base_height
-                    risk_reward_ratios[i] = 2.0
-                    tp1, tp2 = self._calculate_tp1_tp2(close, stop_loss, side, base_height, atr)
-                    tp1_prices[i], tp2_prices[i] = tp1, tp2
-                    if side == "buy":
+                    if side == "buy" and low <= limit_price:
+                        signals[i] = signal_type
+                        sides[i] = side
+                        stops[i] = stop_loss
+                        base_heights[i] = base_height
+                        risk_reward_ratios[i] = 2.0
+                        tp1, tp2 = self._calculate_tp1_tp2(limit_price, stop_loss, side, base_height, atr)
+                        tp1_prices[i], tp2_prices[i] = tp1, tp2
+                        pending_spike = None
                         h2_machine.set_strong_trend()
-                    else:
+                        continue
+                    elif side == "sell" and high >= limit_price:
+                        signals[i] = signal_type
+                        sides[i] = side
+                        stops[i] = stop_loss
+                        base_heights[i] = base_height
+                        risk_reward_ratios[i] = 2.0
+                        tp1, tp2 = self._calculate_tp1_tp2(limit_price, stop_loss, side, base_height, atr)
+                        tp1_prices[i], tp2_prices[i] = tp1, tp2
+                        pending_spike = None
                         l2_machine.set_strong_trend()
-                continue
-            
-            # 优先级3: Climax 反转
-            if not is_strong_trend_mode:
-                climax_result = self.pattern_detector.detect_climax_reversal(data, i, ema, atr)
-                if climax_result:
-                    signal_type, side, stop_loss, base_height = climax_result
+                        continue
+                    elif (side == "buy" and close > limit_price * 1.05) or (side == "sell" and close < limit_price * 0.95):
+                        pending_spike = None
+                    elif i - spike_idx > 5:
+                        pending_spike = None
+                
+                # 优先级1: Failed Breakout
+                if market_state == MarketState.TRADING_RANGE and not is_strong_trend_mode:
+                    result = self.pattern_detector.detect_failed_breakout(data, i, ema, atr, market_state)
+                    if result:
+                        signal_type, side, stop_loss, base_height = result
+                        
+                        if allowed_side is not None and side != allowed_side:
+                            continue
+                        
+                        signals[i] = signal_type
+                        sides[i] = side
+                        stops[i] = stop_loss
+                        base_heights[i] = base_height
+                        risk_reward_ratios[i] = 1.0
+                        tp1, tp2 = self._calculate_tp1_tp2(close, stop_loss, side, base_height, atr)
+                        tp1_prices[i], tp2_prices[i] = tp1, tp2
+                        continue
+                
+                # 优先级2: Strong Spike（Al Brooks Spike & Channel 对齐版）
+                spike_result = self.pattern_detector.detect_strong_spike(data, i, ema, atr, market_state)
+                if spike_result:
+                    signal_type, side, stop_loss, limit_price, base_height, entry_mode, is_high_risk = spike_result
                     
                     if allowed_side is not None and side != allowed_side:
                         continue
                     
-                    signals[i] = signal_type
-                    sides[i] = side
-                    stops[i] = stop_loss
-                    base_heights[i] = base_height
-                    risk_reward_ratios[i] = 2.0
-                    tp1, tp2 = self._calculate_tp1_tp2(close, stop_loss, side, base_height, atr)
-                    tp1_prices[i], tp2_prices[i] = tp1, tp2
+                    if limit_price is not None:
+                        pending_spike = (signal_type, side, stop_loss, limit_price, base_height, i, is_high_risk)
+                    else:
+                        signals[i] = signal_type
+                        sides[i] = side
+                        stops[i] = stop_loss
+                        base_heights[i] = base_height
+                        risk_reward_ratios[i] = 2.0
+                        tp1, tp2 = self._calculate_tp1_tp2(close, stop_loss, side, base_height, atr)
+                        tp1_prices[i], tp2_prices[i] = tp1, tp2
+                        if side == "buy":
+                            h2_machine.set_strong_trend()
+                        else:
+                            l2_machine.set_strong_trend()
                     continue
-            
-            # 优先级4: Wedge 反转
-            if not is_strong_trend_mode:
-                wedge_result = self.pattern_detector.detect_wedge_reversal(data, i, ema, atr)
-                if wedge_result:
-                    signal_type, side, stop_loss, base_height = wedge_result
-                    
-                    if allowed_side is not None and side != allowed_side:
+                
+                # 优先级3: Climax 反转
+                if not is_strong_trend_mode:
+                    climax_result = self.pattern_detector.detect_climax_reversal(data, i, ema, atr)
+                    if climax_result:
+                        signal_type, side, stop_loss, base_height = climax_result
+                        
+                        if allowed_side is not None and side != allowed_side:
+                            continue
+                        
+                        signals[i] = signal_type
+                        sides[i] = side
+                        stops[i] = stop_loss
+                        base_heights[i] = base_height
+                        risk_reward_ratios[i] = 2.0
+                        tp1, tp2 = self._calculate_tp1_tp2(close, stop_loss, side, base_height, atr)
+                        tp1_prices[i], tp2_prices[i] = tp1, tp2
                         continue
-                    
-                    signals[i] = signal_type
-                    sides[i] = side
-                    stops[i] = stop_loss
-                    base_heights[i] = base_height
-                    risk_reward_ratios[i] = 2.0
-                    tp1, tp2 = self._calculate_tp1_tp2(close, stop_loss, side, base_height, atr)
-                    tp1_prices[i], tp2_prices[i] = tp1, tp2
-                    continue
+                
+                # 优先级4: Wedge 反转（SL=极值±0.5*ATR，TP1=EMA20，TP2=楔形起点）
+                if not is_strong_trend_mode:
+                    wedge_result = self.pattern_detector.detect_wedge_reversal(
+                        data, i, ema, atr, market_state
+                    )
+                    if wedge_result:
+                        signal_type, side, stop_loss, base_height, wedge_tp1, wedge_tp2, _ = wedge_result
+                        
+                        if allowed_side is not None and side != allowed_side:
+                            continue
+                        
+                        signals[i] = signal_type
+                        sides[i] = side
+                        stops[i] = stop_loss
+                        base_heights[i] = base_height
+                        risk_reward_ratios[i] = 2.0
+                        if wedge_tp1 is not None and wedge_tp2 is not None:
+                            tp1, tp2 = wedge_tp1, wedge_tp2
+                        else:
+                            tp1, tp2 = self._calculate_tp1_tp2(close, stop_loss, side, base_height, atr)
+                        tp1_prices[i], tp2_prices[i] = tp1, tp2
+                        continue
+            
+            # H2/L2 块（h2l2_only 时每 bar 都跑；否则仅未被更高优先级占用的 bar）
+            self._h2l2_diag["bars_h2l2"] += 1
             
             # H2 状态机（添加 HTF 过滤和信号棒质量验证）
             if allowed_side is None or allowed_side == "buy":
@@ -577,18 +597,23 @@ class BacktestStrategy:
                     self.pattern_detector.calculate_unified_stop_loss
                 )
                 if h2_signal:
-                    # HTF 过滤（回测可关闭）：只允许买入信号在非下降趋势时触发
-                    if self.use_htf_filter_for_h2l2:
+                    self._h2l2_diag["h2_emitted"] += 1
+                    # HTF 过滤（no_filters 时关闭）
+                    if self.use_htf_filter_for_h2l2 and not self.no_filters:
                         htf_trend = self._htf_trend_cache.get(i, HTFTrend.NEUTRAL)
                         if htf_trend == HTFTrend.BEARISH:
                             continue  # HTF 下降趋势，禁止买入
                     
-                    # 信号棒质量验证
-                    bar_valid, bar_reason = self.pattern_detector.validate_btc_signal_bar(
-                        data.iloc[i], h2_signal.side
-                    )
-                    if not bar_valid:
-                        continue  # 信号棒质量不合格
+                    # 信号棒质量验证（no_filters / skip 时关闭，完全 Al Brooks）
+                    if not (self.skip_h2l2_validation or self.no_filters):
+                        bar_valid, bar_reason = self.pattern_detector.validate_btc_signal_bar(
+                            data.iloc[i], h2_signal.side,
+                            min_body_ratio=0.40,   # 放宽：实体≥40%
+                            close_position_pct=0.35,  # 放宽：收盘在顶/底 35% 区域
+                        )
+                        if not bar_valid:
+                            self._h2l2_diag["h2_rejected"] += 1
+                            continue  # 信号棒质量不合格
                     
                     signals[i] = h2_signal.signal_type
                     sides[i] = h2_signal.side
@@ -597,6 +622,7 @@ class BacktestStrategy:
                     risk_reward_ratios[i] = 2.0
                     tp1, tp2 = self._calculate_tp1_tp2(close, h2_signal.stop_loss, h2_signal.side, h2_signal.base_height, atr)
                     tp1_prices[i], tp2_prices[i] = tp1, tp2
+                    continue  # 已出 H2 信号，同 bar 不再尝试 L2
             
             # L2 状态机（添加 HTF 过滤和信号棒质量验证）
             if allowed_side is None or allowed_side == "sell":
@@ -605,18 +631,23 @@ class BacktestStrategy:
                     self.pattern_detector.calculate_unified_stop_loss
                 )
                 if l2_signal:
-                    # HTF 过滤（回测可关闭）：只允许卖出信号在非上升趋势时触发
-                    if self.use_htf_filter_for_h2l2:
+                    self._h2l2_diag["l2_emitted"] += 1
+                    # HTF 过滤（no_filters 时关闭）
+                    if self.use_htf_filter_for_h2l2 and not self.no_filters:
                         htf_trend = self._htf_trend_cache.get(i, HTFTrend.NEUTRAL)
                         if htf_trend == HTFTrend.BULLISH:
                             continue  # HTF 上升趋势，禁止卖出
                     
-                    # 信号棒质量验证
-                    bar_valid, bar_reason = self.pattern_detector.validate_btc_signal_bar(
-                        data.iloc[i], l2_signal.side
-                    )
-                    if not bar_valid:
-                        continue  # 信号棒质量不合格
+                    # 信号棒质量验证（no_filters / skip 时关闭，完全 Al Brooks）
+                    if not (self.skip_h2l2_validation or self.no_filters):
+                        bar_valid, bar_reason = self.pattern_detector.validate_btc_signal_bar(
+                            data.iloc[i], l2_signal.side,
+                            min_body_ratio=0.40,
+                            close_position_pct=0.35,
+                        )
+                        if not bar_valid:
+                            self._h2l2_diag["l2_rejected"] += 1
+                            continue  # 信号棒质量不合格
                     
                     signals[i] = l2_signal.signal_type
                     sides[i] = l2_signal.side
@@ -655,6 +686,9 @@ class BacktestEngine:
             stop_loss_atr_multiplier=config.stop_loss_atr_multiplier,
             kline_interval=config.interval,
             use_htf_filter_for_h2l2=config.use_htf_filter_for_h2l2,
+            skip_h2l2_validation=config.skip_h2l2_validation,
+            h2l2_only=config.h2l2_only,
+            no_filters=config.no_filters,
         )
         
         # 交易状态

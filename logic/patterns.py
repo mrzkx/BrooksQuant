@@ -277,124 +277,165 @@ class PatternDetector:
         
         return (atr * 2) if atr and atr > 0 else 0
     
+    @staticmethod
+    def _spike_stop_at_signal_bar_extreme(
+        signal_bar_high: float, signal_bar_low: float, side: str, buffer_pct: float = 0.001
+    ) -> float:
+        """
+        动态止损：设在 Signal Bar 极值外 buffer_pct 位置
+        
+        Al Brooks: 止损在 Signal Bar 极值外，避免被噪音扫损
+        
+        Args:
+            signal_bar_high, signal_bar_low: Signal Bar 高低点
+            side: "buy" / "sell"
+            buffer_pct: 极值外缓冲比例（默认 0.1%）
+        
+        Returns:
+            止损价
+        """
+        if side == "buy":
+            return signal_bar_low * (1.0 - buffer_pct)
+        else:
+            return signal_bar_high * (1.0 + buffer_pct)
+    
     def detect_strong_spike(
         self, df: pd.DataFrame, i: int, ema: float, atr: Optional[float] = None,
         market_state: Optional[MarketState] = None
-    ) -> Optional[Tuple[str, str, float, Optional[float], float]]:
+    ) -> Optional[Tuple[str, str, float, Optional[float], float, str, bool]]:
         """
-        检测 Strong Spike（强突破入场）- 优化版
+        检测 Strong Spike（强突破入场）- Al Brooks Spike & Channel 对齐版
         
-        Al Brooks 核心原则（严格版）：
-        1. 严禁在 TRADING_RANGE 中做突破单
-        2. 只在 BREAKOUT 状态下交易（收紧条件）
-        3. 连续性检查：过去 3 根K线必须同向（从 2 根提高到 3 根）
-        4. 实体大小：当前K线实体 > 3倍平均实体（从 2 倍提高到 3 倍）
-        5. 突破确认：必须突破前 10 根 K 线的高/低点
+        增强突破定义：
+        1. Signal Bar（前一根 i-1）实体占比 > 70%，且必须突破过去 10 根 K 线的极值
+        2. Entry Bar（当前 Bar i）续延性验证：同向强 K 线，实体 > 50%
         
-        返回: (signal_type, side, stop_loss, limit_price, base_height) 或 None
+        入场模式：
+        - EMA 偏离度 <= 1.5*ATR → Market_Entry（市价入场）
+        - EMA 偏离度 > 1.5*ATR → Limit_Entry（限价入场，入场价 = Signal Bar 实体 50% 处）
+        
+        动态止损：止损设在 Signal Bar 极值外 0.1%。若止损距离 > 2.5*ATR 标记为高风险（仓位 50%）
+        
+        返回: (signal_type, side, stop_loss, limit_price, base_height, entry_mode, is_high_risk) 或 None
         """
-        if i < 10:  # 需要更多历史数据
+        # 需要至少 12 根历史（Signal Bar=i-1，过去10根=i-11..i-2）
+        if i < 12:
             return None
         
-        # ⭐ 优化：在 BREAKOUT 和 CHANNEL 状态都可触发
-        # Al Brooks: 通道中的突破也是有效信号，只要有足够的动能
         if market_state not in [MarketState.BREAKOUT, MarketState.CHANNEL, MarketState.STRONG_TREND]:
             return None
         
-        # ===== 条件1: 实体大小 =====
-        # ⭐ 优化：从 3x 降回 2x（Al Brooks 标准）
-        # 使用预计算的 body_size 列（向量化）
-        if "body_size" not in df.columns:
+        if "body_size" not in df.columns or "kline_range" not in df.columns:
             return None
         
-        recent_bodies = df["body_size"].iloc[max(0, i - 10):i]
-        if len(recent_bodies) == 0:
+        signal_bar = df.iloc[i - 1]
+        entry_bar = df.iloc[i]
+        
+        s_high = float(signal_bar["high"])
+        s_low = float(signal_bar["low"])
+        s_open = float(signal_bar["open"])
+        s_close = float(signal_bar["close"])
+        s_body = float(signal_bar["body_size"])
+        s_range = float(signal_bar["kline_range"]) if signal_bar["kline_range"] > 0 else (s_high - s_low)
+        
+        e_close = float(entry_bar["close"])
+        e_open = float(entry_bar["open"])
+        e_high = float(entry_bar["high"])
+        e_low = float(entry_bar["low"])
+        e_body = float(entry_bar["body_size"])
+        e_range = float(entry_bar["kline_range"]) if entry_bar["kline_range"] > 0 else (e_high - e_low)
+        
+        # 过去 10 根 K 线（不含 Signal Bar）= i-11 到 i-2
+        lookback = df.iloc[i - 11 : i - 1]
+        max_10_high = lookback["high"].max()
+        min_10_low = lookback["low"].min()
+        
+        # ATR 过滤：Entry Bar 范围过大视为 Climax 不追
+        if atr is not None and atr > 0 and e_range > atr * self._params.atr_spike_filter_mult:
             return None
         
-        avg_body = recent_bodies.mean()
-        current_body = df.iloc[i]["body_size"]
-        
-        # ⭐ 实体阈值从 3x 降到 2x
-        if avg_body == 0 or current_body < avg_body * 2:
-            return None
-        
-        # 一次性提取当前行数据（减少多次 iloc 访问）
-        current_row = df.iloc[i]
-        close = current_row["close"]
-        high = current_row["high"]
-        low = current_row["low"]
-        open_price = current_row["open"]
-        kline_range = current_row["kline_range"] if "kline_range" in df.columns else (high - low)
-        
-        # 一次性提取前几根 K 线
-        prev_bar_1 = df.iloc[i - 1]
-        prev_bar_2 = df.iloc[i - 2]
-        
-        # ATR 过滤：Climax 不追涨（周期自适应）
-        if atr is not None and atr > 0:
-            if kline_range > atr * self._params.atr_spike_filter_mult:
+        # ---------- 向上突破 ----------
+        if s_close > s_open and e_close > e_open:
+            # Signal Bar: 实体占比 > 70%，且突破过去 10 根最高点
+            if s_range <= 0:
                 return None
+            signal_body_ratio = s_body / s_range
+            if signal_body_ratio <= 0.70:
+                return None
+            if s_high <= max_10_high:
+                return None
+            
+            # Entry Bar: 同向强 K 线，实体 > 50%
+            if e_range <= 0:
+                return None
+            entry_body_ratio = e_body / e_range
+            if entry_body_ratio <= 0.50:
+                return None
+            
+            # 价格需在 EMA 上方（顺势）
+            if e_close <= ema:
+                return None
+            
+            # 动态止损：Signal Bar 极值外 0.1%
+            stop_loss = self._spike_stop_at_signal_bar_extreme(s_high, s_low, "buy", buffer_pct=0.001)
+            entry_price = e_close
+            risk_distance = entry_price - stop_loss
+            is_high_risk = atr is not None and atr > 0 and risk_distance > 2.5 * atr
+            
+            base_height = self.calculate_measured_move(df, i, "buy", market_state, atr)
+            
+            # 入场模式：EMA 偏离度
+            ema_deviation = abs(entry_price - ema) if ema > 0 else 0.0
+            if atr is not None and atr > 0 and ema_deviation > 1.5 * atr:
+                entry_mode = "Limit_Entry"
+                limit_price = (s_open + s_close) / 2.0  # Signal Bar 实体 50% 处
+            else:
+                entry_mode = "Market_Entry"
+                limit_price = None
+            
+            return (
+                "Spike_Buy", "buy", stop_loss, limit_price, base_height,
+                entry_mode, is_high_risk
+            )
         
-        # ===== 条件3: 突破前 10 根 K 线的高/低点（向量化）=====
-        lookback_slice = df.iloc[max(0, i - 10):i]
-        max_lookback_high = lookback_slice["high"].max() if len(lookback_slice) > 0 else high
-        min_lookback_low = lookback_slice["low"].min() if len(lookback_slice) > 0 else low
-        
-        # 向上突破
-        if close > ema and close > open_price:
-            # ⭐ 优化：body_ratio 从 0.8 降到 0.7
-            body_ratio = (close - low) / (high - low) if (high - low) > 0 else 0
-            if body_ratio > 0.7:
-                # ⭐ 优化：从 3 根同向 K 线降到 2 根（Al Brooks 标准是 2 根）
-                is_consecutive_bullish = (
-                    prev_bar_1["close"] > prev_bar_1["open"] and
-                    prev_bar_2["close"] > prev_bar_2["open"]
-                )
-                if not is_consecutive_bullish:
-                    return None
-                
-                # 必须突破前 10 根 K 线的最高点
-                if high <= max_lookback_high:
-                    return None
-                
-                stop_loss = self.calculate_unified_stop_loss(df, i, "buy", close, atr)
-                base_height = self.calculate_measured_move(df, i, "buy", market_state, atr)
-                
-                distance_from_ema = abs(close - ema)
-                if atr is not None and atr > 0 and distance_from_ema > atr * 3:
-                    prev_body_mid = (prev_bar_1["open"] + prev_bar_1["close"]) / 2
-                    limit_price = max(prev_body_mid, prev_bar_1["close"])
-                    return ("Spike_Buy", "buy", stop_loss, limit_price, base_height)
-                
-                return ("Spike_Buy", "buy", stop_loss, None, base_height)
-        
-        # 向下突破
-        elif close < ema and close < open_price:
-            # ⭐ 优化：body_ratio 从 0.8 降到 0.7
-            body_ratio = (high - close) / (high - low) if (high - low) > 0 else 0
-            if body_ratio > 0.7:
-                # ⭐ 优化：从 3 根同向 K 线降到 2 根（Al Brooks 标准）
-                is_consecutive_bearish = (
-                    prev_bar_1["close"] < prev_bar_1["open"] and
-                    prev_bar_2["close"] < prev_bar_2["open"]
-                )
-                if not is_consecutive_bearish:
-                    return None
-                
-                # 必须突破前 10 根 K 线的最低点
-                if low >= min_lookback_low:
-                    return None
-                
-                stop_loss = self.calculate_unified_stop_loss(df, i, "sell", close, atr)
-                base_height = self.calculate_measured_move(df, i, "sell", market_state, atr)
-                
-                distance_from_ema = abs(ema - close)
-                if atr is not None and atr > 0 and distance_from_ema > atr * 3:
-                    prev_body_mid = (prev_bar_1["open"] + prev_bar_1["close"]) / 2
-                    limit_price = min(prev_body_mid, prev_bar_1["close"])
-                    return ("Spike_Sell", "sell", stop_loss, limit_price, base_height)
-                
-                return ("Spike_Sell", "sell", stop_loss, None, base_height)
+        # ---------- 向下突破 ----------
+        if s_close < s_open and e_close < e_open:
+            if s_range <= 0:
+                return None
+            signal_body_ratio = s_body / s_range
+            if signal_body_ratio <= 0.70:
+                return None
+            if s_low >= min_10_low:
+                return None
+            
+            if e_range <= 0:
+                return None
+            entry_body_ratio = e_body / e_range
+            if entry_body_ratio <= 0.50:
+                return None
+            
+            if e_close >= ema:
+                return None
+            
+            stop_loss = self._spike_stop_at_signal_bar_extreme(s_high, s_low, "sell", buffer_pct=0.001)
+            entry_price = e_close
+            risk_distance = stop_loss - entry_price
+            is_high_risk = atr is not None and atr > 0 and risk_distance > 2.5 * atr
+            
+            base_height = self.calculate_measured_move(df, i, "sell", market_state, atr)
+            
+            ema_deviation = abs(ema - entry_price) if ema > 0 else 0.0
+            if atr is not None and atr > 0 and ema_deviation > 1.5 * atr:
+                entry_mode = "Limit_Entry"
+                limit_price = (s_open + s_close) / 2.0
+            else:
+                entry_mode = "Market_Entry"
+                limit_price = None
+            
+            return (
+                "Spike_Sell", "sell", stop_loss, limit_price, base_height,
+                entry_mode, is_high_risk
+            )
         
         return None
     
@@ -594,31 +635,46 @@ class PatternDetector:
         return None
     
     def detect_wedge_reversal(
-        self, df: pd.DataFrame, i: int, ema: float, atr: Optional[float] = None
-    ) -> Optional[Tuple[str, str, float, float]]:
+        self,
+        df: pd.DataFrame,
+        i: int,
+        ema: float,
+        atr: Optional[float] = None,
+        market_state: Optional[MarketState] = None,
+    ) -> Optional[Tuple[str, str, float, float, float, float, bool]]:
         """
-        检测 Wedge Reversal（楔形反转，三次推进）
+        检测 Wedge Reversal（楔形反转，三次推进）- Al Brooks 加固版
         
-        Al Brooks 定义：
-        - 三次推进形成收敛的楔形
-        - 每次推进的动能递减（实体缩小）
-        - 第三次推进显示疲软（影线增加）
+        三推验证：
+        - 指数间隔：idx2 - idx1 >= 3 且 idx3 - idx2 >= 3
+        - 动能递减：(Price3 - Price2) < (Price2 - Price1)
         
-        优化条件（适配加密货币市场）：
-        1. 第1次和第3次推进之间至少相隔 8-20 根 K 线（动态调整）
-        2. 相邻推进间隔至少 2 根 K 线
-        3. 实体缩减（第三次 < 第一次）
-        4. 第3次推进显示疲软（阴线或长影线）
+        上下文过滤：
+        - 禁止在 TIGHT_CHANNEL 中触发反转
+        - 必须在价格偏离 EMA 超过 1.2 * ATR 时才考虑反转
         
-        返回: (signal_type, side, stop_loss, base_height) 或 None
+        止损与止盈：
+        - SL = 第三推极值 +/- 0.5 * ATR
+        - TP1 = EMA20 位置
+        - TP2 = 楔形起点（Measured Move 目标）
+        
+        返回: (signal_type, side, stop_loss, base_height, wedge_tp1, wedge_tp2, is_strong_reversal_bar) 或 None
         """
-        # 使用周期自适应参数
+        # 上下文过滤：禁止在紧凑通道中反转
+        if market_state == MarketState.TIGHT_CHANNEL:
+            return None
+        
+        # 必须在价格偏离 EMA 超过 1.2 * ATR 时才考虑反转
+        if atr is not None and atr > 0:
+            current_close = float(df.iloc[i]["close"])
+            if abs(current_close - ema) < 1.2 * atr:
+                return None
+        
+        # 三推指数间隔：至少 3 根 K 线
+        LEG_SPAN_MIN = 3
         min_total_span = self._params.wedge_min_total_span
-        min_leg_span = self._params.wedge_min_leg_span
         
-        # 动态调整：根据 ATR 判断市场波动性，高波动允许更短间隔
         if atr and atr > 0:
-            # 波动性越高，允许的最小间隔越短（但不低于周期参数的 60%）
             dynamic_span = max(
                 int(min_total_span * 0.6),
                 min(min_total_span, int(300 / atr))
@@ -628,7 +684,7 @@ class PatternDetector:
         if i < 15:
             return None
         
-        lookback_start = max(0, i - 25)  # 减少回看以更敏感
+        lookback_start = max(0, i - 25)
         recent_data = df.iloc[lookback_start : i + 1]
         
         # 检测 High 3（上升楔形）
@@ -648,28 +704,45 @@ class PatternDetector:
                 if (peak_values[0] < peak_values[1] < peak_values[2] and 
                     (peak_values[1] - peak_values[0]) > (peak_values[2] - peak_values[1])):
                     
-                    # 使用动态计算的间隔阈值
-                    if peak_indices[2] - peak_indices[0] < min_total_span:
-                        pass
-                    elif peak_indices[1] - peak_indices[0] < min_leg_span or peak_indices[2] - peak_indices[1] < min_leg_span:
-                        pass
-                    elif df.iloc[peak_indices[2]]["body_size"] >= df.iloc[peak_indices[0]]["body_size"]:
-                        pass
+                    # 纵向距离：第一推 (P1→P2) vs 第三推 (P2→P3)。若第三推 > 第一推的 120% 说明趋势在加速非衰减，跳过
+                    first_push = peak_values[1] - peak_values[0]
+                    third_push = peak_values[2] - peak_values[1]
+                    if first_push > 0 and third_push > 1.2 * first_push:
+                        logging.debug(
+                            f"Wedge_Sell 跳过: 第三推纵向({third_push:.2f}) > 第一推120%({1.2*first_push:.2f})，趋势加速"
+                        )
                     else:
-                        third_bar = df.iloc[peak_indices[2]]
-                        is_bearish = third_bar["close"] < third_bar["open"]
-                        upper_shadow = third_bar["high"] - max(third_bar["open"], third_bar["close"])
-                        body_size = abs(third_bar["close"] - third_bar["open"])
-                        has_long_upper = upper_shadow > body_size * 2 if body_size > 0 else upper_shadow > (third_bar["high"] - third_bar["low"]) * 0.3
-                        
-                        if is_bearish or has_long_upper:
-                            current_close = df.iloc[i]["close"]
-                            if current_close < peak_values[2] * 0.98:
-                                current_bar = df.iloc[i]
-                                if self.validate_signal_close(current_bar, "sell"):
-                                    stop_loss = self.calculate_unified_stop_loss(df, i, "sell", current_close, atr)
-                                    wedge_height = peak_values[2] - peak_values[0]
-                                    return ("Wedge_Sell", "sell", stop_loss, wedge_height)
+                        # 三推指数间隔：idx2-idx1>=3 且 idx3-idx2>=3
+                        if peak_indices[2] - peak_indices[0] < min_total_span:
+                            pass
+                        elif (peak_indices[1] - peak_indices[0] < LEG_SPAN_MIN
+                              or peak_indices[2] - peak_indices[1] < LEG_SPAN_MIN):
+                            pass
+                        elif df.iloc[peak_indices[2]]["body_size"] >= df.iloc[peak_indices[0]]["body_size"]:
+                            pass
+                        else:
+                            third_bar = df.iloc[peak_indices[2]]
+                            is_bearish = third_bar["close"] < third_bar["open"]
+                            upper_shadow = third_bar["high"] - max(third_bar["open"], third_bar["close"])
+                            body_size = abs(third_bar["close"] - third_bar["open"])
+                            has_long_upper = upper_shadow > body_size * 2 if body_size > 0 else upper_shadow > (third_bar["high"] - third_bar["low"]) * 0.3
+                            
+                            if is_bearish or has_long_upper:
+                                current_close = float(df.iloc[i]["close"])
+                                if current_close < peak_values[2] * 0.98:
+                                    current_bar = df.iloc[i]
+                                    if self.validate_signal_close(current_bar, "sell"):
+                                        third_high = peak_values[2]
+                                        # SL = 极值 + 0.5 * ATR
+                                        stop_loss = third_high + (0.5 * atr) if atr and atr > 0 else third_high * 1.001
+                                        wedge_height = peak_values[2] - peak_values[0]
+                                        wedge_tp1 = ema  # TP1 = EMA20
+                                        wedge_tp2 = float(df.iloc[peak_indices[0]]["low"])  # TP2 = 楔形起点
+                                        # Signal Bar 强反转棒：上影线占比 > 30%
+                                        sb_range = float(current_bar["high"]) - float(current_bar["low"])
+                                        sb_upper = float(current_bar["high"]) - max(float(current_bar["open"]), float(current_bar["close"]))
+                                        is_strong_reversal_bar = sb_range > 0 and (sb_upper / sb_range) > 0.3
+                                        return ("Wedge_Sell", "sell", stop_loss, wedge_height, wedge_tp1, wedge_tp2, is_strong_reversal_bar)
         
         # 检测 Low 3（下降楔形）
         recent_lows = [recent_data.iloc[j]["low"] for j in range(len(recent_data))]
@@ -688,27 +761,59 @@ class PatternDetector:
                 if (trough_values[0] > trough_values[1] > trough_values[2] and 
                     (trough_values[0] - trough_values[1]) > (trough_values[1] - trough_values[2])):
                     
-                    # 使用动态计算的间隔阈值
-                    if trough_indices[2] - trough_indices[0] < min_total_span:
-                        pass
-                    elif trough_indices[1] - trough_indices[0] < min_leg_span or trough_indices[2] - trough_indices[1] < min_leg_span:
-                        pass
-                    elif df.iloc[trough_indices[2]]["body_size"] >= df.iloc[trough_indices[0]]["body_size"]:
-                        pass
+                    # 纵向距离：第一推 (P1→P2) vs 第三推 (P2→P3)。若第三推 > 第一推的 120% 说明趋势在加速非衰减，跳过
+                    first_push = trough_values[0] - trough_values[1]
+                    third_push = trough_values[1] - trough_values[2]
+                    if first_push > 0 and third_push > 1.2 * first_push:
+                        logging.debug(
+                            f"Wedge_Buy 跳过: 第三推纵向({third_push:.2f}) > 第一推120%({1.2*first_push:.2f})，趋势加速"
+                        )
                     else:
-                        third_bar = df.iloc[trough_indices[2]]
-                        is_bullish = third_bar["close"] > third_bar["open"]
-                        lower_shadow = min(third_bar["open"], third_bar["close"]) - third_bar["low"]
-                        body_size = abs(third_bar["close"] - third_bar["open"])
-                        has_long_lower = lower_shadow > body_size * 2 if body_size > 0 else lower_shadow > (third_bar["high"] - third_bar["low"]) * 0.3
-                        
-                        if is_bullish or has_long_lower:
-                            current_close = df.iloc[i]["close"]
-                            if current_close > trough_values[2] * 1.02:
-                                current_bar = df.iloc[i]
-                                if self.validate_signal_close(current_bar, "buy"):
-                                    stop_loss = self.calculate_unified_stop_loss(df, i, "buy", current_close, atr)
-                                    wedge_height = trough_values[0] - trough_values[2]
-                                    return ("Wedge_Buy", "buy", stop_loss, wedge_height)
+                        # 三推指数间隔：idx2-idx1>=3 且 idx3-idx2>=3
+                        if trough_indices[2] - trough_indices[0] < min_total_span:
+                            pass
+                        elif (trough_indices[1] - trough_indices[0] < LEG_SPAN_MIN
+                              or trough_indices[2] - trough_indices[1] < LEG_SPAN_MIN):
+                            pass
+                        elif df.iloc[trough_indices[2]]["body_size"] >= df.iloc[trough_indices[0]]["body_size"]:
+                            pass
+                        else:
+                            third_bar = df.iloc[trough_indices[2]]
+                            is_bullish = third_bar["close"] > third_bar["open"]
+                            lower_shadow = min(third_bar["open"], third_bar["close"]) - third_bar["low"]
+                            body_size = abs(third_bar["close"] - third_bar["open"])
+                            has_long_lower = lower_shadow > body_size * 2 if body_size > 0 else lower_shadow > (third_bar["high"] - third_bar["low"]) * 0.3
+                            
+                            if is_bullish or has_long_lower:
+                                current_close = float(df.iloc[i]["close"])
+                                if current_close > trough_values[2] * 1.02:
+                                    current_bar = df.iloc[i]
+                                    if not self.validate_signal_close(current_bar, "buy"):
+                                        logging.debug("Wedge_Buy 跳过: Signal Bar 收盘未在全长前25%区域")
+                                        pass
+                                    else:
+                                        sb_high = float(current_bar["high"])
+                                        sb_low = float(current_bar["low"])
+                                        sb_open = float(current_bar["open"])
+                                        sb_close = float(current_bar["close"])
+                                        sb_body = abs(sb_close - sb_open)
+                                        sb_lower_shadow = min(sb_open, sb_close) - sb_low
+                                        if sb_body > 0 and sb_lower_shadow <= 1.5 * sb_body:
+                                            logging.debug(
+                                                f"Wedge_Buy 跳过: Signal Bar 下影线未大于实体1.5倍，非探底回升"
+                                            )
+                                        elif sb_body == 0 and sb_lower_shadow <= 0:
+                                            logging.debug("Wedge_Buy 跳过: Signal Bar 无实体且无下影线")
+                                        else:
+                                            third_low = trough_values[2]
+                                            # SL = 极值 - 0.5 * ATR
+                                            stop_loss = third_low - (0.5 * atr) if atr and atr > 0 else third_low * 0.999
+                                            wedge_height = trough_values[0] - trough_values[2]
+                                            wedge_tp1 = ema  # TP1 = EMA20
+                                            wedge_tp2 = float(df.iloc[trough_indices[0]]["high"])  # TP2 = 楔形起点
+                                            # Signal Bar 强反转棒：下影线占比 > 30%
+                                            sb_range = sb_high - sb_low
+                                            is_strong_reversal_bar = sb_range > 0 and (sb_lower_shadow / sb_range) > 0.3
+                                            return ("Wedge_Buy", "buy", stop_loss, wedge_height, wedge_tp1, wedge_tp2, is_strong_reversal_bar)
         
         return None
