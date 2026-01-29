@@ -264,15 +264,18 @@ async def _check_stop_loss_take_profit(
             if not OBSERVE_MODE and user_name in close_queues:
                 tp1_request = {
                     "action": "tp1",
-                    "side": tp1_info["trade"].side,
+                    "side": "SELL" if tp1_info["trade"].side.lower() == "buy" else "BUY",  # 平仓方向
                     "close_quantity": tp1_info["close_quantity"],
                     "close_price": tp1_info["close_price"],
                     "new_stop_loss": tp1_info["new_stop_loss"],
                     "tp2_price": tp1_info["tp2_price"],
                     "remaining_quantity": tp1_info["trade"].remaining_quantity,
+                    # OCO 风格订单所需字段
+                    "entry_price": float(tp1_info["trade"].entry_price),
+                    "position_side": tp1_info["trade"].side,
                 }
                 await close_queues[user_name].put(tp1_request)
-                logging.info(f"[{user_name}] 已发送TP1请求到队列")
+                logging.info(f"[{user_name}] 已发送TP1请求到队列（含OCO字段）")
         
         else:
             # 完全平仓（Trade对象）

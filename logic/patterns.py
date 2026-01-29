@@ -1,13 +1,15 @@
 """
 模式检测器
 
-负责 Wedge、Failed Breakout、Spike、Climax 的检测逻辑
+负责 Wedge、Failed Breakout、Spike、Climax、MTR 的检测逻辑
 
 Al Brooks 核心模式：
 - Strong Spike: 强突破直接入场
 - Failed Breakout: 失败突破反转
 - Wedge Reversal: 楔形反转（三次推进）
 - Climax Reversal: 高潮竭尽反转
+- MTR (Major Trend Reversal): 主要趋势反转（强趋势→突破 EMA→回测极值→强反转棒/H2/L2）
+- Final Flag Reversal: 终极旗形反转（TightChannel 后远离 EMA 处的横盘失败突破）
 """
 
 import logging
@@ -15,6 +17,14 @@ import pandas as pd
 from typing import Optional, Tuple, List
 from .market_analyzer import MarketState
 from .interval_params import get_interval_params, IntervalParams
+from .wedge_reversal import (
+    find_swing_peaks,
+    find_swing_troughs,
+    find_three_lower_highs,
+    find_three_higher_lows,
+    detect_wedge_reversal_impl,
+)
+from .final_flag_reversal import detect_final_flag_reversal_impl
 
 
 class PatternDetector:
@@ -563,7 +573,7 @@ class PatternDetector:
         
         return None
     
-    # ========== 三推楔形：递归波动峰/谷识别（Al Brooks 数字化）==========
+    # ========== 三推楔形：递归波动峰/谷识别（已提取到 wedge_reversal.py）==========
     
     @staticmethod
     def _find_swing_peaks(
@@ -573,25 +583,8 @@ class PatternDetector:
         min_left: int = 2,
         min_right: int = 2,
     ) -> List[Tuple[int, float]]:
-        """
-        递归识别波动峰值（局部高点）：high[i] 为峰当且仅当
-        左侧至少 min_left 根、右侧至少 min_right 根 K 线的高点均严格低于 high[i]。
-        
-        用于三推楔形：高点逐渐降低的三个连续峰值 / 高点逐渐升高的三个连续峰值。
-        
-        Returns:
-            [(index, high), ...] 按 index 升序
-        """
-        peaks: List[Tuple[int, float]] = []
-        for j in range(start + min_left, end - min_right):
-            if j < 0 or j >= len(df):
-                continue
-            h = float(df.iloc[j]["high"])
-            left_ok = all(float(df.iloc[k]["high"]) < h for k in range(j - min_left, j))
-            right_ok = all(float(df.iloc[k]["high"]) < h for k in range(j + 1, j + 1 + min_right))
-            if left_ok and right_ok:
-                peaks.append((j, h))
-        return peaks
+        """调用入口 - 实际逻辑已提取到 wedge_reversal.py"""
+        return find_swing_peaks(df, start, end, min_left, min_right)
     
     @staticmethod
     def _find_swing_troughs(
@@ -601,25 +594,8 @@ class PatternDetector:
         min_left: int = 2,
         min_right: int = 2,
     ) -> List[Tuple[int, float]]:
-        """
-        递归识别波动谷底（局部低点）：low[i] 为谷当且仅当
-        左侧至少 min_left 根、右侧至少 min_right 根 K 线的低点均严格高于 low[i]。
-        
-        用于三推楔形：低点逐渐升高的三个连续谷底 / 低点逐渐降低的三个连续谷底。
-        
-        Returns:
-            [(index, low), ...] 按 index 升序
-        """
-        troughs: List[Tuple[int, float]] = []
-        for j in range(start + min_left, end - min_right):
-            if j < 0 or j >= len(df):
-                continue
-            l = float(df.iloc[j]["low"])
-            left_ok = all(float(df.iloc[k]["low"]) > l for k in range(j - min_left, j))
-            right_ok = all(float(df.iloc[k]["low"]) > l for k in range(j + 1, j + 1 + min_right))
-            if left_ok and right_ok:
-                troughs.append((j, l))
-        return troughs
+        """调用入口 - 实际逻辑已提取到 wedge_reversal.py"""
+        return find_swing_troughs(df, start, end, min_left, min_right)
     
     @staticmethod
     def _find_three_lower_highs(
@@ -627,32 +603,8 @@ class PatternDetector:
         min_span: int = 3,
         require_convergence: bool = False,
     ) -> Optional[Tuple[List[int], List[float]]]:
-        """
-        从波动峰值序列中找出「高点逐渐降低」的最近三峰：P1 > P2 > P3。
-        可选：要求动能递减（第二推幅度 < 第一推幅度）。
-        
-        Returns:
-            (peak_indices, peak_values) 或 None
-        """
-        if len(peaks) < 3:
-            return None
-        for k in range(len(peaks) - 2, -1, -1):
-            if k + 2 >= len(peaks):
-                continue
-            idx1, p1 = peaks[k]
-            idx2, p2 = peaks[k + 1]
-            idx3, p3 = peaks[k + 2]
-            if p1 <= p2 or p2 <= p3:
-                continue
-            if idx2 - idx1 < min_span or idx3 - idx2 < min_span:
-                continue
-            if require_convergence:
-                push1 = p1 - p2  # 第一推（从 P1 到 P2 的跌幅）
-                push2 = p2 - p3  # 第二推（从 P2 到 P3 的跌幅）
-                if push1 <= 0 or push2 >= push1:
-                    continue
-            return ([idx1, idx2, idx3], [p1, p2, p3])
-        return None
+        """调用入口 - 实际逻辑已提取到 wedge_reversal.py"""
+        return find_three_lower_highs(peaks, min_span, require_convergence)
     
     @staticmethod
     def _find_three_higher_lows(
@@ -660,32 +612,8 @@ class PatternDetector:
         min_span: int = 3,
         require_convergence: bool = False,
     ) -> Optional[Tuple[List[int], List[float]]]:
-        """
-        从波动谷底序列中找出「低点逐渐升高」的最近三谷：T1 < T2 < T3。
-        可选：要求动能递减（第二推幅度 < 第一推幅度）。
-        
-        Returns:
-            (trough_indices, trough_values) 或 None
-        """
-        if len(troughs) < 3:
-            return None
-        for k in range(len(troughs) - 2, -1, -1):
-            if k + 2 >= len(troughs):
-                continue
-            idx1, t1 = troughs[k]
-            idx2, t2 = troughs[k + 1]
-            idx3, t3 = troughs[k + 2]
-            if t1 >= t2 or t2 >= t3:
-                continue
-            if idx2 - idx1 < min_span or idx3 - idx2 < min_span:
-                continue
-            if require_convergence:
-                push1 = t2 - t1  # 第一推（从 T1 到 T2 的升幅）
-                push2 = t3 - t2  # 第二推（从 T2 到 T3 的升幅）
-                if push1 <= 0 or push2 >= push1:
-                    continue
-            return ([idx1, idx2, idx3], [t1, t2, t3])
-        return None
+        """调用入口 - 实际逻辑已提取到 wedge_reversal.py"""
+        return find_three_higher_lows(troughs, min_span, require_convergence)
     
     def detect_failed_breakout(
         self, df: pd.DataFrame, i: int, ema: float, atr: Optional[float] = None,
@@ -870,219 +798,244 @@ class PatternDetector:
         """
         检测 Wedge Reversal（楔形反转，三次推进）- Al Brooks 加固版
         
+        调用入口 - 实际逻辑已提取到 wedge_reversal.py
+        
         relaxed_signal_bar: 交易区间 BLSH 时 True，信号棒门槛降为 40% 实体、35% 收盘区域
         
         返回: (signal_type, side, stop_loss, base_height, wedge_tp1, wedge_tp2, is_strong_reversal_bar) 或 None
         """
-        close_ratio = 0.65 if relaxed_signal_bar else 0.75
-        body_ratio = 0.40 if relaxed_signal_bar else self.BTC_MIN_BODY_RATIO
-        position_pct = 0.35 if relaxed_signal_bar else self.BTC_CLOSE_POSITION_PCT
-        # 上下文过滤：禁止在紧凑通道中反转
-        if market_state == MarketState.TIGHT_CHANNEL:
+        return detect_wedge_reversal_impl(
+            df=df,
+            i=i,
+            ema=ema,
+            atr=atr,
+            market_state=market_state,
+            relaxed_signal_bar=relaxed_signal_bar,
+            params=self._params,
+            btc_min_body_ratio=self.BTC_MIN_BODY_RATIO,
+            btc_close_position_pct=self.BTC_CLOSE_POSITION_PCT,
+            validate_signal_close_func=self.validate_signal_close,
+        )
+    
+    def detect_mtr_reversal(
+        self,
+        df: pd.DataFrame,
+        i: int,
+        ema: float,
+        atr: Optional[float] = None,
+        market_state: Optional[MarketState] = None,
+    ) -> Optional[Tuple[str, str, float, float]]:
+        """
+        检测 MTR（Major Trend Reversal）主要趋势反转 - Al Brooks 理论
+        
+        逻辑要求：
+        1. 识别上下文：必须先有强趋势（EMA 倾斜且价格在 EMA 一侧）
+        2. 突破趋势线：监测价格穿越 EMA20 并收盘在另一侧
+        3. 极值测试：记录突破前趋势的极值点（高点/低点），价格需再次回测该点
+        4. 信号入场：在回测极值点时，若出现强反转棒（Signal Bar）或二阶段信号（H2/L2），触发 MTR
+        
+        返回: (signal_type, side, stop_loss, base_height) 或 None
+        """
+        MTR_LOOKBACK = 30
+        MIN_TREND_BARS = 5
+        EMA_SLOPE_LOOKBACK = 5
+        RETEST_TOLERANCE = 0.002  # 极值回测容差 0.2%
+        
+        if i < MTR_LOOKBACK + 2:
+            return None
+        if "ema" not in df.columns:
             return None
         
-        # 必须在价格偏离 EMA 超过 1.2 * ATR 时才考虑反转
-        if atr is not None and atr > 0:
-            current_close = float(df.iloc[i]["close"])
-            if abs(current_close - ema) < 1.2 * atr:
-                return None
+        current_bar = df.iloc[i]
+        current_high = float(current_bar["high"])
+        current_low = float(current_bar["low"])
+        current_close = float(current_bar["close"])
+        current_open = float(current_bar["open"])
+        prev_bar = df.iloc[i - 1]
+        prev_high = float(prev_bar["high"])
+        prev_low = float(prev_bar["low"])
+        prev_close = float(prev_bar["close"])
+        prev_ema = float(prev_bar["ema"]) if "ema" in prev_bar.index else ema
         
-        # 三推指数间隔：至少 3 根 K 线
-        LEG_SPAN_MIN = 3
-        min_total_span = self._params.wedge_min_total_span
-        
-        if atr and atr > 0:
-            dynamic_span = max(
-                int(min_total_span * 0.6),
-                min(min_total_span, int(300 / atr))
+        # ---------- MTR_Sell：先有上涨趋势 → 跌破 EMA → 回测前高 → 强反转棒做空 ----------
+        for break_idx in range(i - 1, max(0, i - MTR_LOOKBACK), -1):
+            break_row = df.iloc[break_idx]
+            break_close = float(break_row["close"])
+            break_ema = float(break_row["ema"])
+            if break_close >= break_ema:
+                continue
+            # 突破棒：当前收盘在 EMA 下方
+            prev_to_break = break_idx - 1
+            if prev_to_break < 0:
+                continue
+            prev_break_row = df.iloc[prev_to_break]
+            prev_break_close = float(prev_break_row["close"])
+            prev_break_ema = float(prev_break_row["ema"])
+            if prev_break_close <= prev_break_ema:
+                continue
+            # 突破前为上涨：前一根在 EMA 上方
+            # 强趋势：突破前至少 MIN_TREND_BARS 根在 EMA 上方，且 EMA 倾斜向上
+            trend_start = prev_to_break
+            while trend_start > 0 and float(df.iloc[trend_start]["close"]) > float(df.iloc[trend_start]["ema"]):
+                trend_start -= 1
+            trend_start += 1
+            trend_bars = prev_to_break - trend_start + 1
+            if trend_bars < MIN_TREND_BARS:
+                continue
+            ema_at_end = float(df.iloc[prev_to_break]["ema"])
+            ema_early_idx = max(0, prev_to_break - EMA_SLOPE_LOOKBACK)
+            ema_early = float(df.iloc[ema_early_idx]["ema"])
+            if ema_at_end <= ema_early:
+                continue
+            # EMA 倾斜且价格在 EMA 一侧（强趋势）✓
+            extreme_high = float(df.iloc[trend_start : prev_to_break + 1]["high"].max())
+            # 突破后是否回测前高
+            retest_occurred = False
+            for j in range(break_idx + 1, i + 1):
+                if float(df.iloc[j]["high"]) >= extreme_high * (1.0 - RETEST_TOLERANCE):
+                    retest_occurred = True
+                    break
+            if not retest_occurred:
+                continue
+            # 当前棒或前一根处于/接近回测区（触及前高附近）
+            at_retest = (
+                current_high >= extreme_high * (1.0 - RETEST_TOLERANCE) or
+                prev_high >= extreme_high * (1.0 - RETEST_TOLERANCE)
             )
-            min_total_span = dynamic_span
-        
-        if i < 15:
-            return None
-        
-        lookback_start = max(0, i - 30)
-        recent_data = df.iloc[lookback_start : i + 1]
-        leg_span = max(3, self._params.wedge_min_leg_span)
-        
-        # ========== 递归三推：高点逐渐降低的三个峰值（Al Brooks 数字化）==========
-        peaks_rec = self._find_swing_peaks(df, lookback_start, i + 1, min_left=2, min_right=2)
-        three_lower = self._find_three_lower_highs(peaks_rec, min_span=leg_span, require_convergence=False)
-        if three_lower is not None:
-            peak_indices, peak_values = three_lower
-            idx3 = peak_indices[2]
-            if idx3 <= i and (i - idx3) <= 8:  # 第三峰后 8 根内视为有效
-                current_bar = df.iloc[i]
-                current_close = float(current_bar["close"])
-                current_open = float(current_bar["open"])
-                third_high = peak_values[2]
-                if current_close < peak_values[2] * 0.99 and current_close < current_open:
-                    if self.validate_signal_close(current_bar, "sell", min_close_ratio=close_ratio):
-                        stop_loss = third_high + (0.5 * atr) if atr and atr > 0 else third_high * 1.001
-                        wedge_height = peak_values[0] - peak_values[2]
-                        wedge_tp1 = ema
-                        wedge_tp2 = float(df.iloc[peak_indices[0]]["low"])
-                        sb_range = float(current_bar["high"]) - float(current_bar["low"])
-                        sb_upper = float(current_bar["high"]) - max(float(current_bar["open"]), float(current_bar["close"]))
-                        is_strong = sb_range > 0 and (sb_upper / sb_range) > 0.3
-                        logging.debug("✅ Wedge_Sell(三推高点递降) 递归识别触发")
-                        return ("Wedge_Sell", "sell", stop_loss, wedge_height, wedge_tp1, wedge_tp2, is_strong)
-        
-        # ========== 递归三推：低点逐渐升高的三个谷底 ==========
-        troughs_rec = self._find_swing_troughs(df, lookback_start, i + 1, min_left=2, min_right=2)
-        three_higher = self._find_three_higher_lows(troughs_rec, min_span=leg_span, require_convergence=False)
-        if three_higher is not None:
-            trough_indices, trough_values = three_higher
-            idx3 = trough_indices[2]
-            if idx3 <= i and (i - idx3) <= 8:
-                current_bar = df.iloc[i]
-                current_close = float(current_bar["close"])
-                third_low = trough_values[2]
-                if current_close > third_low * 1.01 and self.validate_signal_close(current_bar, "buy", min_close_ratio=close_ratio):
-                    sb_high = float(current_bar["high"])
-                    sb_low = float(current_bar["low"])
-                    sb_open = float(current_bar["open"])
-                    sb_close = float(current_bar["close"])
-                    sb_body = abs(sb_close - sb_open)
-                    sb_lower = min(sb_open, sb_close) - sb_low
-                    if sb_body > 0 and sb_lower > 1.5 * sb_body:
-                        stop_loss = third_low - (0.5 * atr) if atr and atr > 0 else third_low * 0.999
-                        wedge_height = trough_values[2] - trough_values[0]
-                        wedge_tp1 = ema
-                        wedge_tp2 = float(df.iloc[trough_indices[0]]["high"])
-                        sb_range = sb_high - sb_low
-                        is_strong = sb_range > 0 and (sb_lower / sb_range) > 0.3
-                        logging.debug("✅ Wedge_Buy(三推低点递升) 递归识别触发")
-                        return ("Wedge_Buy", "buy", stop_loss, wedge_height, wedge_tp1, wedge_tp2, is_strong)
-        
-        # ========== 原有逻辑：上升楔形（高点递升 + 动能递减）、下降楔形（低点递降 + 动能递减）==========
-        # 检测 High 3（上升楔形）
-        recent_highs = [recent_data.iloc[j]["high"] for j in range(len(recent_data))]
-        if len(recent_highs) >= 10:
-            peaks = []
-            for j in range(1, len(recent_highs) - 1):
-                if recent_highs[j] > recent_highs[j - 1] and recent_highs[j] > recent_highs[j + 1]:
-                    actual_idx = lookback_start + j
-                    peaks.append((actual_idx, recent_highs[j]))
-            
-            if len(peaks) >= 3:
-                last_3_peaks = peaks[-3:]
-                peak_indices = [p[0] for p in last_3_peaks]
-                peak_values = [p[1] for p in last_3_peaks]
-                
-                if (peak_values[0] < peak_values[1] < peak_values[2] and 
-                    (peak_values[1] - peak_values[0]) > (peak_values[2] - peak_values[1])):
-                    
-                    # 纵向距离：第一推 (P1→P2) vs 第三推 (P2→P3)。若第三推 > 第一推的 120% 说明趋势在加速非衰减，跳过
-                    first_push = peak_values[1] - peak_values[0]
-                    third_push = peak_values[2] - peak_values[1]
-                    if first_push > 0 and third_push > 1.2 * first_push:
+            if not at_retest:
+                continue
+            # 强反转棒（阴线、实体占比与收盘位置合格）或二阶段：用信号棒质量验证
+            valid_sell, reason = self.validate_btc_signal_bar(current_bar, "sell")
+            if valid_sell:
+                stop_loss = self.calculate_unified_stop_loss(df, i, "sell", current_close, atr)
+                base_height = extreme_high - current_close
+                if atr and atr > 0 and base_height < atr * 0.5:
+                    base_height = atr * 2.0
+                logging.debug(
+                    f"✅ MTR_Sell 触发: 前高={extreme_high:.2f} 回测后强反转棒, "
+                    f"突破棒@={break_idx}, 趋势棒数={trend_bars}"
+                )
+                return ("MTR_Sell", "sell", stop_loss, base_height)
+            # 二阶段（H2/L2 风格）：前一根为第一次回测高点，当前为第二次回测且反转
+            if i >= 2:
+                bar_before = df.iloc[i - 2]
+                high_before = float(bar_before["high"])
+                if high_before >= extreme_high * (1.0 - RETEST_TOLERANCE):
+                    valid_sell_2, _ = self.validate_btc_signal_bar(current_bar, "sell")
+                    if valid_sell_2 and current_close < current_open:
+                        stop_loss = self.calculate_unified_stop_loss(df, i, "sell", current_close, atr)
+                        base_height = extreme_high - current_close
+                        if atr and atr > 0 and base_height < atr * 0.5:
+                            base_height = atr * 2.0
                         logging.debug(
-                            f"Wedge_Sell 跳过: 第三推纵向({third_push:.2f}) > 第一推120%({1.2*first_push:.2f})，趋势加速"
+                            f"✅ MTR_Sell 触发(二阶段): 前高={extreme_high:.2f} 二次回测反转"
                         )
-                    else:
-                        # 三推指数间隔：idx2-idx1>=3 且 idx3-idx2>=3
-                        if peak_indices[2] - peak_indices[0] < min_total_span:
-                            pass
-                        elif (peak_indices[1] - peak_indices[0] < LEG_SPAN_MIN
-                              or peak_indices[2] - peak_indices[1] < LEG_SPAN_MIN):
-                            pass
-                        elif df.iloc[peak_indices[2]]["body_size"] >= df.iloc[peak_indices[0]]["body_size"]:
-                            pass
-                        else:
-                            third_bar = df.iloc[peak_indices[2]]
-                            is_bearish = third_bar["close"] < third_bar["open"]
-                            upper_shadow = third_bar["high"] - max(third_bar["open"], third_bar["close"])
-                            body_size = abs(third_bar["close"] - third_bar["open"])
-                            has_long_upper = upper_shadow > body_size * 2 if body_size > 0 else upper_shadow > (third_bar["high"] - third_bar["low"]) * 0.3
-                            
-                            if is_bearish or has_long_upper:
-                                current_close = float(df.iloc[i]["close"])
-                                if current_close < peak_values[2] * 0.98:
-                                    current_bar = df.iloc[i]
-                                    if self.validate_signal_close(current_bar, "sell", min_close_ratio=close_ratio):
-                                        third_high = peak_values[2]
-                                        # SL = 极值 + 0.5 * ATR
-                                        stop_loss = third_high + (0.5 * atr) if atr and atr > 0 else third_high * 1.001
-                                        wedge_height = peak_values[2] - peak_values[0]
-                                        wedge_tp1 = ema  # TP1 = EMA20
-                                        wedge_tp2 = float(df.iloc[peak_indices[0]]["low"])  # TP2 = 楔形起点
-                                        # Signal Bar 强反转棒：上影线占比 > 30%
-                                        sb_range = float(current_bar["high"]) - float(current_bar["low"])
-                                        sb_upper = float(current_bar["high"]) - max(float(current_bar["open"]), float(current_bar["close"]))
-                                        is_strong_reversal_bar = sb_range > 0 and (sb_upper / sb_range) > 0.3
-                                        return ("Wedge_Sell", "sell", stop_loss, wedge_height, wedge_tp1, wedge_tp2, is_strong_reversal_bar)
+                        return ("MTR_Sell", "sell", stop_loss, base_height)
+            break
         
-        # 检测 Low 3（下降楔形）
-        recent_lows = [recent_data.iloc[j]["low"] for j in range(len(recent_data))]
-        if len(recent_lows) >= 10:
-            troughs = []
-            for j in range(1, len(recent_lows) - 1):
-                if recent_lows[j] < recent_lows[j - 1] and recent_lows[j] < recent_lows[j + 1]:
-                    actual_idx = lookback_start + j
-                    troughs.append((actual_idx, recent_lows[j]))
-            
-            if len(troughs) >= 3:
-                last_3_troughs = troughs[-3:]
-                trough_indices = [t[0] for t in last_3_troughs]
-                trough_values = [t[1] for t in last_3_troughs]
-                
-                if (trough_values[0] > trough_values[1] > trough_values[2] and 
-                    (trough_values[0] - trough_values[1]) > (trough_values[1] - trough_values[2])):
-                    
-                    # 纵向距离：第一推 (P1→P2) vs 第三推 (P2→P3)。若第三推 > 第一推的 120% 说明趋势在加速非衰减，跳过
-                    first_push = trough_values[0] - trough_values[1]
-                    third_push = trough_values[1] - trough_values[2]
-                    if first_push > 0 and third_push > 1.2 * first_push:
+        # ---------- MTR_Buy：先有下跌趋势 → 上破 EMA → 回测前低 → 强反转棒做多 ----------
+        for break_idx in range(i - 1, max(0, i - MTR_LOOKBACK), -1):
+            break_row = df.iloc[break_idx]
+            break_close = float(break_row["close"])
+            break_ema = float(break_row["ema"])
+            if break_close <= break_ema:
+                continue
+            prev_to_break = break_idx - 1
+            if prev_to_break < 0:
+                continue
+            prev_break_row = df.iloc[prev_to_break]
+            prev_break_close = float(prev_break_row["close"])
+            prev_break_ema = float(prev_break_row["ema"])
+            if prev_break_close >= prev_break_ema:
+                continue
+            trend_start = prev_to_break
+            while trend_start > 0 and float(df.iloc[trend_start]["close"]) < float(df.iloc[trend_start]["ema"]):
+                trend_start -= 1
+            trend_start += 1
+            trend_bars = prev_to_break - trend_start + 1
+            if trend_bars < MIN_TREND_BARS:
+                continue
+            ema_at_end = float(df.iloc[prev_to_break]["ema"])
+            ema_early_idx = max(0, prev_to_break - EMA_SLOPE_LOOKBACK)
+            ema_early = float(df.iloc[ema_early_idx]["ema"])
+            if ema_at_end >= ema_early:
+                continue
+            extreme_low = float(df.iloc[trend_start : prev_to_break + 1]["low"].min())
+            retest_occurred = False
+            for j in range(break_idx + 1, i + 1):
+                if float(df.iloc[j]["low"]) <= extreme_low * (1.0 + RETEST_TOLERANCE):
+                    retest_occurred = True
+                    break
+            if not retest_occurred:
+                continue
+            at_retest = (
+                current_low <= extreme_low * (1.0 + RETEST_TOLERANCE) or
+                prev_low <= extreme_low * (1.0 + RETEST_TOLERANCE)
+            )
+            if not at_retest:
+                continue
+            valid_buy, reason = self.validate_btc_signal_bar(current_bar, "buy")
+            if valid_buy:
+                stop_loss = self.calculate_unified_stop_loss(df, i, "buy", current_close, atr)
+                base_height = current_close - extreme_low
+                if atr and atr > 0 and base_height < atr * 0.5:
+                    base_height = atr * 2.0
+                logging.debug(
+                    f"✅ MTR_Buy 触发: 前低={extreme_low:.2f} 回测后强反转棒, "
+                    f"突破棒@={break_idx}, 趋势棒数={trend_bars}"
+                )
+                return ("MTR_Buy", "buy", stop_loss, base_height)
+            if i >= 2:
+                bar_before = df.iloc[i - 2]
+                low_before = float(bar_before["low"])
+                if low_before <= extreme_low * (1.0 + RETEST_TOLERANCE):
+                    valid_buy_2, _ = self.validate_btc_signal_bar(current_bar, "buy")
+                    if valid_buy_2 and current_close > current_open:
+                        stop_loss = self.calculate_unified_stop_loss(df, i, "buy", current_close, atr)
+                        base_height = current_close - extreme_low
+                        if atr and atr > 0 and base_height < atr * 0.5:
+                            base_height = atr * 2.0
                         logging.debug(
-                            f"Wedge_Buy 跳过: 第三推纵向({third_push:.2f}) > 第一推120%({1.2*first_push:.2f})，趋势加速"
+                            f"✅ MTR_Buy 触发(二阶段): 前低={extreme_low:.2f} 二次回测反转"
                         )
-                    else:
-                        # 三推指数间隔：idx2-idx1>=3 且 idx3-idx2>=3
-                        if trough_indices[2] - trough_indices[0] < min_total_span:
-                            pass
-                        elif (trough_indices[1] - trough_indices[0] < LEG_SPAN_MIN
-                              or trough_indices[2] - trough_indices[1] < LEG_SPAN_MIN):
-                            pass
-                        elif df.iloc[trough_indices[2]]["body_size"] >= df.iloc[trough_indices[0]]["body_size"]:
-                            pass
-                        else:
-                            third_bar = df.iloc[trough_indices[2]]
-                            is_bullish = third_bar["close"] > third_bar["open"]
-                            lower_shadow = min(third_bar["open"], third_bar["close"]) - third_bar["low"]
-                            body_size = abs(third_bar["close"] - third_bar["open"])
-                            has_long_lower = lower_shadow > body_size * 2 if body_size > 0 else lower_shadow > (third_bar["high"] - third_bar["low"]) * 0.3
-                            
-                            if is_bullish or has_long_lower:
-                                current_close = float(df.iloc[i]["close"])
-                                if current_close > trough_values[2] * 1.02:
-                                    current_bar = df.iloc[i]
-                                    if not self.validate_signal_close(current_bar, "buy", min_close_ratio=close_ratio):
-                                        logging.debug("Wedge_Buy 跳过: Signal Bar 收盘未在全长前25%区域")
-                                        pass
-                                    else:
-                                        sb_high = float(current_bar["high"])
-                                        sb_low = float(current_bar["low"])
-                                        sb_open = float(current_bar["open"])
-                                        sb_close = float(current_bar["close"])
-                                        sb_body = abs(sb_close - sb_open)
-                                        sb_lower_shadow = min(sb_open, sb_close) - sb_low
-                                        if sb_body > 0 and sb_lower_shadow <= 1.5 * sb_body:
-                                            logging.debug(
-                                                f"Wedge_Buy 跳过: Signal Bar 下影线未大于实体1.5倍，非探底回升"
-                                            )
-                                        elif sb_body == 0 and sb_lower_shadow <= 0:
-                                            logging.debug("Wedge_Buy 跳过: Signal Bar 无实体且无下影线")
-                                        else:
-                                            third_low = trough_values[2]
-                                            # SL = 极值 - 0.5 * ATR
-                                            stop_loss = third_low - (0.5 * atr) if atr and atr > 0 else third_low * 0.999
-                                            wedge_height = trough_values[0] - trough_values[2]
-                                            wedge_tp1 = ema  # TP1 = EMA20
-                                            wedge_tp2 = float(df.iloc[trough_indices[0]]["high"])  # TP2 = 楔形起点
-                                            # Signal Bar 强反转棒：下影线占比 > 30%
-                                            sb_range = sb_high - sb_low
-                                            is_strong_reversal_bar = sb_range > 0 and (sb_lower_shadow / sb_range) > 0.3
-                                            return ("Wedge_Buy", "buy", stop_loss, wedge_height, wedge_tp1, wedge_tp2, is_strong_reversal_bar)
+                        return ("MTR_Buy", "buy", stop_loss, base_height)
+            break
         
         return None
+    
+    def detect_final_flag_reversal(
+        self,
+        df: pd.DataFrame,
+        i: int,
+        ema: float,
+        atr: Optional[float] = None,
+        market_state: Optional[MarketState] = None,
+        final_flag_info: Optional[dict] = None,
+    ) -> Optional[Tuple[str, str, float, float]]:
+        """
+        检测 Final Flag Reversal（终极旗形反转）- Al Brooks 高胜率反转
+        
+        调用入口 - 实际逻辑已提取到 final_flag_reversal.py
+        
+        Al Brooks: "Final Flag 是趋势耗尽的最后挣扎。当价格突破旗形后迅速失败，
+        这是高胜率的反转入场点，因为趋势已经耗尽了所有动能。"
+        
+        Args:
+            df: K线数据
+            i: 当前 K 线索引
+            ema: EMA20 值
+            atr: ATR 值
+            market_state: 市场状态（必须是 FINAL_FLAG）
+            final_flag_info: Final Flag 信息（来自 MarketAnalyzer）
+        
+        返回: (signal_type, side, stop_loss, base_height) 或 None
+        """
+        return detect_final_flag_reversal_impl(
+            df=df,
+            i=i,
+            ema=ema,
+            atr=atr,
+            market_state=market_state,
+            final_flag_info=final_flag_info,
+            validate_btc_signal_bar_func=self.validate_btc_signal_bar,
+        )

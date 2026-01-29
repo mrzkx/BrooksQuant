@@ -4,10 +4,12 @@
 负责观察模式和实盘模式的订单执行逻辑
 将下单逻辑从 main.py 中抽离，提高代码可维护性
 
-实盘开仓逻辑：
+实盘开仓逻辑（加固版 - OCO 风格止盈止损）：
 - 开仓后用币安真实持仓更新内部状态与数量
-- 开仓后挂 TP1 止盈单（仅 TP1 挂单）
-- TP1 触发后由程序决定移动止盈止损（不挂 TP2/止损单，程序监控后市价平仓）
+- 开仓后挂 TP1 止盈市价单
+- TP1 触发后立即挂 TP2 限价止盈单 + 止损市价单（OCO 风格）
+- 平仓前先撤销所有关联挂单，避免重复平仓
+- 使用限价止盈单（TAKE_PROFIT）替代市价止盈单，降低滑点风险
 """
 
 import asyncio
@@ -288,23 +290,24 @@ async def execute_live_order(
         except Exception as sync_err:
             logging.warning(f"[{user.name}] 开仓后同步币安持仓失败: {sync_err}，使用下单数量")
         
-        # 开仓后挂 TP1 止盈单；TP1 触发后由程序决定移动止盈止损
+        # 开仓后挂 TP1 止盈单；TP1 触发后立即挂 TP2 限价止盈单 + 止损单（OCO 风格）
         if params.get("tp1_price") and actual_qty > 0:
             tp1_close_ratio = params.get("tp1_close_ratio", 0.5)
             tp1_qty = round_quantity_to_step_size(actual_qty * tp1_close_ratio)
             stop_side = "SELL" if signal["side"].lower() == "buy" else "BUY"
             try:
-                await user.create_take_profit_market_order(
+                tp1_response = await user.create_take_profit_market_order(
                     symbol=SYMBOL,
                     side=stop_side,
                     quantity=tp1_qty,
                     stop_price=round(float(params["tp1_price"]), 2),
                     reduce_only=True,
                 )
-                trade_logger.mark_tp1_order_placed(user.name)
+                tp1_order_id = tp1_response.get("orderId")
+                trade_logger.mark_tp1_order_placed(user.name, order_id=tp1_order_id)
                 logging.info(
-                    f"[{user.name}] ✅ TP1 止盈单已挂: 触发价={params['tp1_price']:.2f}, "
-                    f"数量={tp1_qty:.4f} ({int(tp1_close_ratio*100)}%)，TP1 触发后由程序决定止盈止损"
+                    f"[{user.name}] ✅ TP1 止盈单已挂: ID={tp1_order_id}, 触发价={params['tp1_price']:.2f}, "
+                    f"数量={tp1_qty:.4f} ({int(tp1_close_ratio*100)}%)，TP1 触发后将自动挂 TP2+止损"
                 )
             except Exception as tp1_err:
                 logging.error(f"[{user.name}] ⚠️ TP1 止盈单挂单失败: {tp1_err}")
@@ -324,15 +327,132 @@ async def execute_live_order(
         return False
 
 
+async def _cancel_related_orders(
+    user: TradingUser,
+    trade_logger: TradeLogger,
+    reason: str = "平仓前撤单",
+) -> None:
+    """
+    撤销当前持仓关联的所有挂单（TP1/TP2/SL）
+    
+    在平仓前调用，避免重复平仓或挂单残留
+    
+    Args:
+        user: 交易用户
+        trade_logger: 交易日志器
+        reason: 撤单原因（用于日志）
+    """
+    order_ids = trade_logger.get_pending_order_ids(user.name)
+    cancelled = []
+    
+    for order_type, order_id in order_ids.items():
+        if order_id:
+            try:
+                await user.cancel_order(SYMBOL, order_id)
+                cancelled.append(f"{order_type}={order_id}")
+            except Exception as e:
+                logging.warning(f"[{user.name}] 撤销 {order_type}={order_id} 失败: {e}")
+    
+    if cancelled:
+        logging.info(f"[{user.name}] 🗑️ {reason} - 已撤销: {', '.join(cancelled)}")
+        trade_logger.clear_order_ids(user.name)
+
+
+async def _place_tp2_and_sl_orders(
+    user: TradingUser,
+    trade_logger: TradeLogger,
+    remaining_qty: float,
+    tp2_price: float,
+    sl_price: float,
+    position_side: str,
+    entry_price: float,
+) -> bool:
+    """
+    TP1 触发后挂 TP2 限价止盈单 + 止损市价单（OCO 风格）
+    
+    使用限价止盈单（TAKE_PROFIT）替代市价止盈单，降低滑点风险。
+    
+    Args:
+        user: 交易用户
+        trade_logger: 交易日志器
+        remaining_qty: 剩余仓位数量
+        tp2_price: TP2 止盈价格
+        sl_price: 止损价格（保本止损）
+        position_side: 原始开仓方向（"buy" 或 "sell"）
+        entry_price: 入场价（用于计算限价偏移）
+    
+    Returns:
+        bool: 是否成功挂单
+    """
+    # 平仓方向：买入开仓用卖出平仓，反之亦然
+    close_side = "SELL" if position_side.lower() == "buy" else "BUY"
+    qty = round_quantity_to_step_size(remaining_qty)
+    
+    tp2_order_id = None
+    sl_order_id = None
+    
+    # ========== 挂 TP2 限价止盈单 ==========
+    # 使用 TAKE_PROFIT 类型（限价止盈）：触发价 = TP2，限价 = TP2 - 小偏移（确保成交）
+    try:
+        # 限价略微让利以确保成交（买入平仓加价，卖出平仓减价）
+        if close_side == "SELL":
+            # 做多平仓：限价略低于触发价
+            tp2_limit_price = round(tp2_price * 0.9995, 2)  # 0.05% 让利
+        else:
+            # 做空平仓：限价略高于触发价
+            tp2_limit_price = round(tp2_price * 1.0005, 2)
+        
+        tp2_response = await user.create_take_profit_limit_order(
+            symbol=SYMBOL,
+            side=close_side,
+            quantity=qty,
+            price=tp2_limit_price,
+            stop_price=round(tp2_price, 2),
+            reduce_only=True,
+        )
+        tp2_order_id = tp2_response.get("orderId")
+        logging.info(
+            f"[{user.name}] ✅ TP2 限价止盈单已挂: ID={tp2_order_id}, "
+            f"触发价={tp2_price:.2f}, 限价={tp2_limit_price:.2f}, 数量={qty:.4f}"
+        )
+    except Exception as tp2_err:
+        logging.error(f"[{user.name}] ⚠️ TP2 限价止盈单挂单失败: {tp2_err}")
+    
+    # ========== 挂止损市价单 ==========
+    try:
+        sl_response = await user.create_stop_market_order(
+            symbol=SYMBOL,
+            side=close_side,
+            quantity=qty,
+            stop_price=round(sl_price, 2),
+            reduce_only=True,
+        )
+        sl_order_id = sl_response.get("orderId")
+        logging.info(
+            f"[{user.name}] ✅ 止损市价单已挂: ID={sl_order_id}, "
+            f"触发价={sl_price:.2f}, 数量={qty:.4f}"
+        )
+    except Exception as sl_err:
+        logging.error(f"[{user.name}] ⚠️ 止损市价单挂单失败: {sl_err}")
+    
+    # 更新订单 ID 到 trade_logger
+    if tp2_order_id or sl_order_id:
+        trade_logger.update_tp2_sl_order_ids(user.name, tp2_order_id, sl_order_id)
+        return True
+    
+    return False
+
+
 async def handle_close_request(
     user: TradingUser,
     close_request: Dict,
     trade_logger: TradeLogger,
 ) -> bool:
     """
-    处理平仓请求（止盈止损由程序执行，不挂委托）
+    处理平仓请求（加固版 - OCO 风格止盈止损）
     
-    程序根据 K 线监控判断止损/TP1/TP2 触发后，在此执行市价平仓。
+    TP1 触发：立即挂 TP2 限价止盈单 + 止损市价单
+    完全平仓：先撤销所有关联挂单，再执行市价平仓
     
     Args:
         user: 交易用户
@@ -346,15 +466,16 @@ async def handle_close_request(
     
     try:
         if action_type == "tp1":
-            # TP1触发：执行动态比例平仓并更新止损（动态保本）
+            # ========== TP1 触发：平仓部分仓位 + 挂 TP2/SL ==========
             close_qty = close_request["close_quantity"]
-            total_qty = close_qty + close_request.get("remaining_quantity", close_qty)
+            remaining_qty = close_request.get("remaining_quantity", close_qty)
+            total_qty = close_qty + remaining_qty
             close_pct = int((close_qty / total_qty) * 100) if total_qty > 0 else 50
             
-            logging.info(f"[{user.name}] 🎯 执行TP1: 平仓{close_pct}%")
+            logging.info(f"[{user.name}] 🎯 执行TP1: 平仓{close_pct}%，剩余{remaining_qty:.4f} BTC")
             
-            # 按 stepSize 截断数量（修复精度问题）
-            tp1_qty = round_quantity_to_step_size(close_request["close_quantity"])
+            # 按 stepSize 截断数量
+            tp1_qty = round_quantity_to_step_size(close_qty)
             await user.close_position_market(
                 symbol=SYMBOL,
                 side=close_request["side"],
@@ -363,7 +484,7 @@ async def handle_close_request(
             
             # 查询实际成交价
             try:
-                await asyncio.sleep(1)  # 等待成交记录更新
+                await asyncio.sleep(1)
                 trade_details = await user.get_trade_details(SYMBOL, tp1_qty)
                 actual_tp1_price = trade_details["avg_price"] if trade_details["avg_price"] > 0 else close_request['close_price']
                 tp1_commission = trade_details["commission"]
@@ -377,11 +498,42 @@ async def handle_close_request(
                 f"实际价格={actual_tp1_price:.2f}, 手续费={tp1_commission:.4f}"
             )
             print(f"[{user.name}] ✅ TP1平仓成功: 数量={tp1_qty:.4f} BTC ({close_pct}%), 价格={actual_tp1_price:.2f}")
-            # 保本止损与 TP2 由程序监控执行，不挂委托
+            
+            # ========== TP1 触发后立即挂 TP2 限价止盈单 + 止损单（OCO 风格）==========
+            tp2_price = close_request.get("tp2_price")
+            entry_price = close_request.get("entry_price", actual_tp1_price)
+            position_side = close_request.get("position_side", "buy")
+            
+            # 计算保本止损价（入场价 + 手续费缓冲）
+            fee_buffer = entry_price * 0.001
+            if position_side.lower() == "buy":
+                breakeven_sl = entry_price + fee_buffer
+            else:
+                breakeven_sl = entry_price - fee_buffer
+            
+            if tp2_price and remaining_qty > 0:
+                await _place_tp2_and_sl_orders(
+                    user=user,
+                    trade_logger=trade_logger,
+                    remaining_qty=remaining_qty,
+                    tp2_price=float(tp2_price),
+                    sl_price=breakeven_sl,
+                    position_side=position_side,
+                    entry_price=entry_price,
+                )
+                logging.info(
+                    f"[{user.name}] 🔐 TP1后已挂OCO风格订单: TP2={tp2_price:.2f}, 保本止损={breakeven_sl:.2f}"
+                )
+            else:
+                logging.warning(f"[{user.name}] ⚠️ 无TP2价格或剩余仓位为0，跳过TP2/SL挂单")
         
         else:
-            # 完全平仓（止盈/止损由程序触发，此处执行市价平仓）
-            logging.info(f"[{user.name}] 🔴 执行平仓: {close_request}")
+            # ========== 完全平仓：先撤销所有关联挂单 ==========
+            exit_reason = close_request.get('exit_reason', 'close')
+            logging.info(f"[{user.name}] 🔴 执行平仓: {exit_reason}")
+            
+            # 先撤销所有关联挂单（TP1/TP2/SL）
+            await _cancel_related_orders(user, trade_logger, reason=f"平仓({exit_reason})前撤单")
             
             try:
                 has_position = await user.has_open_position(SYMBOL)
@@ -397,11 +549,11 @@ async def handle_close_request(
                     quantity=close_qty,
                 )
                 logging.info(
-                    f"[{user.name}] ✅ 平仓成功: {close_request['exit_reason']}, "
+                    f"[{user.name}] ✅ 平仓成功: {exit_reason}, "
                     f"数量={close_request['quantity']:.4f} BTC"
                 )
                 print(
-                    f"[{user.name}] ✅ 平仓成功: {close_request['exit_reason']}, "
+                    f"[{user.name}] ✅ 平仓成功: {exit_reason}, "
                     f"数量={close_request['quantity']:.4f} BTC"
                 )
                 try:
@@ -428,7 +580,9 @@ async def handle_close_request(
                 except Exception as pnl_err:
                     logging.warning(f"[{user.name}] 更新实际盈亏失败: {pnl_err}")
             
-            await user.cancel_all_orders(SYMBOL)  # 清理可能存在的其他挂单
+            # 最后确保清理所有挂单（双重保险）
+            await user.cancel_all_orders(SYMBOL)
+            trade_logger.clear_order_ids(user.name)
         
         return True
         

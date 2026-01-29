@@ -1,7 +1,14 @@
 """
 策略 H2/L2 状态机信号处理
 
-供 strategy 通过 H2L2Processor 统一调用，冷却期与 Delta 调节由回调注入。
+职责（关注点分离）：
+- 形态识别：通过 H2/L2 状态机检测回调信号
+- 信号棒校验：验证 Signal Bar 质量
+- Delta 基础过滤：基于订单流过滤明显逆势信号
+
+不负责（由 strategy.py 统一处理）：
+- HTF 过滤：是否允许 H2/L2 入场
+- HTF 权重调节：信号强度加权
 """
 
 import logging
@@ -11,7 +18,6 @@ import pandas as pd
 
 from .market_analyzer import MarketCycle
 from .patterns import PatternDetector
-from .htf_filter import HTFFilter, HTFTrend
 from .signal_models import BarContext, SignalResult
 from .state_machines import H2StateMachine, L2StateMachine
 
@@ -27,17 +33,19 @@ def _default_delta_modifier(_snapshot, _side: str, _pct: float) -> Tuple[float, 
 
 class H2L2Processor:
     """
-    H2/L2 状态机信号处理器：冷却期与 Delta 调节通过回调注入。
+    H2/L2 状态机信号处理器（纯形态识别 + Delta 基础过滤）
+    
+    关注点分离：
+    - 本类只负责形态识别和 Delta 过滤
+    - HTF 过滤和权重调节由 strategy.py 统一处理
     """
 
     def __init__(
         self,
-        htf_filter: HTFFilter,
         pattern_detector: PatternDetector,
         check_signal_cooldown: Optional[Callable[[str, str, int, bool], bool]] = None,
         calculate_delta_modifier: Optional[Callable[..., Tuple[float, str]]] = None,
     ):
-        self.htf_filter = htf_filter
         self.pattern_detector = pattern_detector
         self._check_cooldown = check_signal_cooldown or _noop_cooldown
         self._calc_delta = calculate_delta_modifier or _default_delta_modifier
@@ -58,30 +66,45 @@ class H2L2Processor:
         data: pd.DataFrame,
         ctx: BarContext,
         cached_delta_snapshot: Optional[object],
-        htf_trend: HTFTrend,
     ) -> Optional[SignalResult]:
-        """处理 H2 状态机信号。cached_delta_snapshot 为 DeltaSnapshot 或 None。"""
+        """
+        处理 H2 状态机信号（纯形态识别 + Delta 基础过滤）
+        
+        注意：HTF 过滤由 strategy.py 在调用此方法前完成
+        
+        Args:
+            h2_machine: H2 状态机
+            data: K线数据
+            ctx: 当前 K 线上下文
+            cached_delta_snapshot: Delta 快照（可选）
+        
+        Returns:
+            SignalResult 或 None
+        """
+        # ========== 形态识别：H2 状态机 ==========
         h2_signal = h2_machine.update(
             ctx.close, ctx.high, ctx.low, ctx.ema, ctx.atr, data, ctx.i,
             self.pattern_detector.calculate_unified_stop_loss,
         )
         if not h2_signal:
             return None
+        
+        # ========== 冷却期检查 ==========
         if self._check_cooldown(h2_signal.signal_type, h2_signal.side, ctx.i, ctx.is_latest_bar):
             return None
-        allowed, reason = self.htf_filter.allows_h2_buy(ctx.close)
-        if not allowed:
-            if ctx.is_latest_bar:
-                logging.info(f"🚫 H2 背景过滤: {reason}")
-            return None
+        
+        # ========== 信号棒质量校验 ==========
         bar_valid, bar_reason = self.validate_h2l2_signal_bar(ctx, data, h2_signal.side, ctx.i)
         if not bar_valid:
             if ctx.is_latest_bar:
                 logging.info(f"🚫 H2信号棒质量不合格: {h2_signal.signal_type} - {bar_reason}")
             return None
+        
+        # ========== Delta 基础过滤（订单流）==========
         delta_modifier = 1.0
         if cached_delta_snapshot is not None and getattr(cached_delta_snapshot, "trade_count", 0) > 0:
             delta_ratio = getattr(cached_delta_snapshot, "delta_ratio", 0.0)
+            # 强烈反向：买入信号但 Delta < -0.3（强卖压）→ 阻止
             if delta_ratio < -0.3:
                 if ctx.is_latest_bar:
                     logging.info(
@@ -89,6 +112,7 @@ class H2L2Processor:
                         f"买入信号但Delta={delta_ratio:.2f}<-0.3，强卖压"
                     )
                 return None
+            # 轻微反向：Delta < 0 → 信号减弱
             elif delta_ratio < 0:
                 delta_modifier = 0.7
                 if ctx.is_latest_bar:
@@ -96,6 +120,7 @@ class H2L2Processor:
                         f"⚠️ H2 Delta轻微反向: {h2_signal.signal_type} - "
                         f"Delta={delta_ratio:.2f}，信号减弱"
                     )
+            # 顺向：使用回调计算调节因子
             else:
                 kline_open = data.iloc[ctx.i]["open"]
                 price_change_pct = ((ctx.close - kline_open) / kline_open * 100) if kline_open > 0 else 0.0
@@ -111,10 +136,8 @@ class H2L2Processor:
                         f"{'✅' if delta_modifier > 1 else '⚠️'} H2 Delta{'增强' if delta_modifier > 1 else '减弱'}: "
                         f"{h2_signal.signal_type} (调节={delta_modifier:.2f}) - {delta_reason}"
                     )
-        if htf_trend == HTFTrend.BULLISH:
-            delta_modifier *= 1.2
-            if ctx.is_latest_bar:
-                logging.info(f"✅ H2 HTF增强: 1h上升趋势，买入信号增强 x1.2")
+        
+        # 返回纯形态信号（HTF 权重由 strategy.py 统一应用）
         return SignalResult(
             signal_type=h2_signal.signal_type,
             side=h2_signal.side,
@@ -130,30 +153,45 @@ class H2L2Processor:
         data: pd.DataFrame,
         ctx: BarContext,
         cached_delta_snapshot: Optional[object],
-        htf_trend: HTFTrend,
     ) -> Optional[SignalResult]:
-        """处理 L2 状态机信号。"""
+        """
+        处理 L2 状态机信号（纯形态识别 + Delta 基础过滤）
+        
+        注意：HTF 过滤由 strategy.py 在调用此方法前完成
+        
+        Args:
+            l2_machine: L2 状态机
+            data: K线数据
+            ctx: 当前 K 线上下文
+            cached_delta_snapshot: Delta 快照（可选）
+        
+        Returns:
+            SignalResult 或 None
+        """
+        # ========== 形态识别：L2 状态机 ==========
         l2_signal = l2_machine.update(
             ctx.close, ctx.high, ctx.low, ctx.ema, ctx.atr, data, ctx.i,
             self.pattern_detector.calculate_unified_stop_loss,
         )
         if not l2_signal:
             return None
+        
+        # ========== 冷却期检查 ==========
         if self._check_cooldown(l2_signal.signal_type, l2_signal.side, ctx.i, ctx.is_latest_bar):
             return None
-        allowed, reason = self.htf_filter.allows_l2_sell(ctx.close)
-        if not allowed:
-            if ctx.is_latest_bar:
-                logging.info(f"🚫 L2 背景过滤: {reason}")
-            return None
+        
+        # ========== 信号棒质量校验 ==========
         bar_valid, bar_reason = self.validate_h2l2_signal_bar(ctx, data, l2_signal.side, ctx.i)
         if not bar_valid:
             if ctx.is_latest_bar:
                 logging.info(f"🚫 L2信号棒质量不合格: {l2_signal.signal_type} - {bar_reason}")
             return None
+        
+        # ========== Delta 基础过滤（订单流）==========
         delta_modifier = 1.0
         if cached_delta_snapshot is not None and getattr(cached_delta_snapshot, "trade_count", 0) > 0:
             delta_ratio = getattr(cached_delta_snapshot, "delta_ratio", 0.0)
+            # 强烈反向：卖出信号但 Delta > 0.3（强买压）→ 阻止
             if delta_ratio > 0.3:
                 if ctx.is_latest_bar:
                     logging.info(
@@ -161,6 +199,7 @@ class H2L2Processor:
                         f"卖出信号但Delta={delta_ratio:.2f}>0.3，强买压"
                     )
                 return None
+            # 轻微反向：Delta > 0 → 信号减弱
             elif delta_ratio > 0:
                 delta_modifier = 0.7
                 if ctx.is_latest_bar:
@@ -168,6 +207,7 @@ class H2L2Processor:
                         f"⚠️ L2 Delta轻微反向: {l2_signal.signal_type} - "
                         f"Delta={delta_ratio:.2f}，信号减弱"
                     )
+            # 顺向：使用回调计算调节因子
             else:
                 kline_open = data.iloc[ctx.i]["open"]
                 price_change_pct = ((ctx.close - kline_open) / kline_open * 100) if kline_open > 0 else 0.0
@@ -183,10 +223,8 @@ class H2L2Processor:
                         f"{'✅' if delta_modifier > 1 else '⚠️'} L2 Delta{'增强' if delta_modifier > 1 else '减弱'}: "
                         f"{l2_signal.signal_type} (调节={delta_modifier:.2f}) - {delta_reason}"
                     )
-        if htf_trend == HTFTrend.BEARISH:
-            delta_modifier *= 1.2
-            if ctx.is_latest_bar:
-                logging.info(f"✅ L2 HTF增强: 1h下降趋势，卖出信号增强 x1.2")
+        
+        # 返回纯形态信号（HTF 权重由 strategy.py 统一应用）
         return SignalResult(
             signal_type=l2_signal.signal_type,
             side=l2_signal.side,

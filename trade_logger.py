@@ -24,6 +24,11 @@ except ImportError:
 class Trade:
     """
     内存交易记录（与原先 DB 字段兼容，供持仓与统计使用）
+    
+    订单 ID 字段（实盘用于 OCO 风格止盈止损管理）：
+    - tp1_order_id: TP1 止盈单订单 ID
+    - tp2_order_id: TP2 止盈单订单 ID（TP1 触发后挂单）
+    - sl_order_id: 止损单订单 ID（TP1 触发后挂单）
     """
     id: int = 0
     user: str = ""
@@ -57,6 +62,10 @@ class Trade:
     is_observe: bool = True
     created_at: datetime = field(default_factory=datetime.utcnow)
     updated_at: datetime = field(default_factory=datetime.utcnow)
+    # OCO 风格订单 ID（实盘用）
+    tp1_order_id: Optional[int] = None
+    tp2_order_id: Optional[int] = None
+    sl_order_id: Optional[int] = None
 
     def __repr__(self):
         return f"<Trade(id={self.id}, user='{self.user}', signal='{self.signal}', status='{self.status}')>"
@@ -672,6 +681,11 @@ class TradeLogger:
                         "close_price": float(trade.tp1_price),
                         "new_stop_loss": breakeven_stop,
                         "tp2_price": float(trade.tp2_price) if trade.tp2_price else None,
+                        # OCO 风格订单所需字段
+                        "entry_price": float(trade.entry_price),
+                        "position_side": trade.side,
+                        "remaining_quantity": trade.remaining_quantity,
+                        "side": "SELL" if trade.side.lower() == "buy" else "BUY",  # 平仓方向
                     }
 
             if trade.exit_stage == 1 and trade.tp2_price:
@@ -725,14 +739,77 @@ class TradeLogger:
 
             return None
 
-    def mark_tp1_order_placed(self, user: str):
+    def mark_tp1_order_placed(self, user: str, order_id: Optional[int] = None):
         with self._lock:
             self._tp1_order_placed[user] = True
+            trade = self.positions.get(user)
+            if trade and order_id:
+                trade.tp1_order_id = order_id
+                self._redis_save_position(user, trade)
             self._redis_save_aux(user)
 
     def tp1_order_placed(self, user: str) -> bool:
         with self._lock:
             return bool(self._tp1_order_placed.get(user, False))
+
+    def update_tp2_sl_order_ids(
+        self, user: str, tp2_order_id: Optional[int] = None, sl_order_id: Optional[int] = None
+    ) -> bool:
+        """
+        更新 TP2 和止损单的订单 ID（TP1 触发后挂单时调用）
+        
+        Args:
+            user: 用户名
+            tp2_order_id: TP2 限价止盈单订单 ID
+            sl_order_id: 止损单订单 ID
+        
+        Returns:
+            bool: 是否成功更新
+        """
+        with self._lock:
+            trade = self.positions.get(user)
+            if not trade:
+                return False
+            if tp2_order_id is not None:
+                trade.tp2_order_id = tp2_order_id
+            if sl_order_id is not None:
+                trade.sl_order_id = sl_order_id
+            trade.updated_at = datetime.utcnow()
+            self._redis_save_position(user, trade)
+            logging.info(
+                f"[{user}] 已更新订单 ID: TP2={tp2_order_id}, SL={sl_order_id}"
+            )
+            return True
+
+    def get_pending_order_ids(self, user: str) -> Dict[str, Optional[int]]:
+        """
+        获取当前持仓的挂单 ID（用于平仓前撤单）
+        
+        Returns:
+            {'tp1_order_id': ..., 'tp2_order_id': ..., 'sl_order_id': ...}
+        """
+        with self._lock:
+            trade = self.positions.get(user)
+            if not trade:
+                return {'tp1_order_id': None, 'tp2_order_id': None, 'sl_order_id': None}
+            return {
+                'tp1_order_id': trade.tp1_order_id,
+                'tp2_order_id': trade.tp2_order_id,
+                'sl_order_id': trade.sl_order_id,
+            }
+
+    def clear_order_ids(self, user: str) -> None:
+        """
+        清除订单 ID（平仓或撤单后调用）
+        """
+        with self._lock:
+            trade = self.positions.get(user)
+            if trade:
+                trade.tp1_order_id = None
+                trade.tp2_order_id = None
+                trade.sl_order_id = None
+                trade.updated_at = datetime.utcnow()
+                self._redis_save_position(user, trade)
 
     def update_position_from_binance(
         self, user: str, quantity: float, entry_price: float

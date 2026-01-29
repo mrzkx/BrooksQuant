@@ -1,5 +1,5 @@
 """
-策略形态信号检测（Failed Breakout / Spike / Climax / Wedge）
+策略形态信号检测（Failed Breakout / Spike / Climax / Wedge / MTR / Final Flag）
 
 供 strategy 通过 SignalChecker 统一调用，冷却期与成交量由回调注入。
 """
@@ -26,7 +26,7 @@ def _noop_volume(_ctx: BarContext) -> bool:
 
 class SignalChecker:
     """
-    形态信号检测器：Failed Breakout、Spike、Climax、Wedge。
+    形态信号检测器：Failed Breakout、Spike、Climax、Wedge、MTR、Final Flag。
     冷却期与成交量确认通过回调注入，便于与 strategy 解耦。
     """
 
@@ -185,4 +185,70 @@ class SignalChecker:
             wedge_tp2_price=wedge_tp2,
             wedge_strong_reversal_bar=is_strong_reversal_bar,
             strength=strength,
+        )
+
+    def check_mtr(
+        self, data: pd.DataFrame, ctx: BarContext
+    ) -> Optional[SignalResult]:
+        """检测 MTR（Major Trend Reversal）主要趋势反转，利用 BarContext 市场状态。"""
+        if ctx.is_strong_trend_mode:
+            return None
+        result = self.pattern_detector.detect_mtr_reversal(
+            data, ctx.i, ctx.ema, ctx.atr, ctx.market_state
+        )
+        if not result:
+            return None
+        signal_type, side, stop_loss, base_height = result
+        if self._check_cooldown(signal_type, side, ctx.i, ctx.is_latest_bar):
+            return None
+        if ctx.allowed_side is not None and side != ctx.allowed_side:
+            if ctx.is_latest_bar:
+                logging.info(
+                    f"🚫 强趋势禁止反转: {signal_type} {side} - "
+                    f"趋势={ctx.trend_direction}，MTR 反转在强趋势中不触发"
+                )
+            return None
+        return SignalResult(
+            signal_type=signal_type,
+            side=side,
+            stop_loss=stop_loss,
+            base_height=base_height,
+            risk_reward=2.0,
+        )
+
+    def check_final_flag(
+        self, data: pd.DataFrame, ctx: BarContext, final_flag_info: dict
+    ) -> Optional[SignalResult]:
+        """
+        检测 Final Flag Reversal（终极旗形反转）- 高胜率反转点。
+        
+        Al Brooks: "Final Flag 是趋势耗尽的最后挣扎，突破失败后是高胜率反转入场点。"
+        
+        Args:
+            data: K线数据
+            ctx: 当前 K 线的市场上下文
+            final_flag_info: Final Flag 信息（来自 MarketAnalyzer.get_final_flag_info()）
+        """
+        # Final Flag 反转不受强趋势模式限制（因为本身就是趋势耗尽的信号）
+        if ctx.market_state != MarketState.FINAL_FLAG:
+            return None
+        
+        result = self.pattern_detector.detect_final_flag_reversal(
+            data, ctx.i, ctx.ema, ctx.atr, ctx.market_state, final_flag_info
+        )
+        if not result:
+            return None
+        
+        signal_type, side, stop_loss, base_height = result
+        if self._check_cooldown(signal_type, side, ctx.i, ctx.is_latest_bar):
+            return None
+        
+        # Final Flag 反转是高胜率信号，给予更高的风险回报比
+        return SignalResult(
+            signal_type=signal_type,
+            side=side,
+            stop_loss=stop_loss,
+            base_height=base_height,
+            risk_reward=2.5,  # 高胜率信号，风险回报比 2.5
+            strength=0.8,  # 高置信度
         )

@@ -728,25 +728,6 @@ def get_delta_analyzer(kline_interval: str = "5m") -> DeltaAnalyzer:
     return _delta_analyzer
 
 
-def reset_delta_analyzer(kline_interval: str = "5m") -> DeltaAnalyzer:
-    """
-    重置并重新创建全局 Delta 分析器（用于更换 K 线周期）
-    
-    Args:
-        kline_interval: 新的 K 线周期
-    
-    Returns:
-        DeltaAnalyzer: 新创建的实例
-    """
-    global _delta_analyzer, _delta_analyzer_kline_interval
-    
-    _delta_analyzer = DeltaAnalyzer(kline_interval=kline_interval)
-    _delta_analyzer_kline_interval = kline_interval
-    logging.info(f"Delta 分析器已重置为 {kline_interval} 周期")
-    
-    return _delta_analyzer
-
-
 async def aggtrade_worker(symbol: str = "BTCUSDT", redis_url: Optional[str] = None, kline_interval: str = "5m") -> None:
     """
     aggTrade 数据流工作线程

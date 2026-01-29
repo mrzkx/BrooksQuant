@@ -9,6 +9,7 @@ Al Brooks 核心市场状态：
 - CHANNEL: 通道模式，EMA附近有序运行
 - TRADING_RANGE: 交易区间，价格频繁穿越EMA
 - TIGHT_CHANNEL: 紧凑通道，强劲单边趋势（禁止反转）
+- FINAL_FLAG: 终极旗形（TightChannel 后远离 EMA 处的横盘，高胜率反转点）
 
 市场周期状态机（严格三阶段）：
 - SPIKE（尖峰）：强突破阶段，逻辑“Always In”，忽略小回调
@@ -26,11 +27,12 @@ from .interval_params import get_interval_params, IntervalParams
 
 class MarketState(Enum):
     """市场状态分类"""
-    STRONG_TREND = "StrongTrend"  # 新增：强劲趋势状态
+    STRONG_TREND = "StrongTrend"  # 强劲趋势状态
     BREAKOUT = "Breakout"
     CHANNEL = "Channel"
     TRADING_RANGE = "TradingRange"
     TIGHT_CHANNEL = "TightChannel"
+    FINAL_FLAG = "FinalFlag"  # 终极旗形：TightChannel 后远离 EMA 处的横盘/小回调
 
 
 class MarketCycle(Enum):
@@ -74,6 +76,12 @@ class MarketAnalyzer:
         self._last_cycle: Optional[MarketCycle] = None
         self._cycle_hold_bars: int = 0  # 剩余保持周期数（>0 时沿用上一周期）
         
+        # Final Flag 检测：TightChannel 历史追踪
+        self._tight_channel_bars: int = 0  # 连续 TightChannel 计数
+        self._tight_channel_direction: Optional[str] = None  # TightChannel 方向
+        self._tight_channel_extreme: Optional[float] = None  # TightChannel 期间的极值
+        self._last_tight_channel_end_bar: Optional[int] = None  # 最近 TightChannel 结束的 bar 索引
+        
         logging.info(
             f"📊 MarketAnalyzer 初始化: 周期={kline_interval}, "
             f"斜率阈值={self._params.slope_threshold_pct:.2%}, "
@@ -95,9 +103,10 @@ class MarketAnalyzer:
         优先级：
         1. Strong Trend（强趋势）- 最高优先级，禁止逆势交易
         2. Tight Channel（紧凑通道）
-        3. Breakout（强趋势突破）
-        4. Trading Range（交易区间）
-        5. Channel（通道模式）- 默认
+        3. Final Flag（终极旗形）- TightChannel 后远离 EMA 处的横盘
+        4. Breakout（强趋势突破）
+        5. Trading Range（交易区间）
+        6. Channel（通道模式）- 默认
         """
         if i < 10:
             self._trend_direction = None
@@ -108,12 +117,40 @@ class MarketAnalyzer:
         # Al Brooks: 连续同向K线 = 趋势，不要逆势交易
         strong_trend = self._detect_strong_trend(df, i, ema)
         if strong_trend is not None:
+            self._tight_channel_bars = 0  # 强趋势时重置 TightChannel 计数
             return strong_trend
         
         # 优先检测 TIGHT_CHANNEL
         tight_channel_state = self._detect_tight_channel(df, i, ema)
         if tight_channel_state is not None:
+            # 追踪 TightChannel 历史
+            self._tight_channel_bars += 1
+            tc_dir = self.get_tight_channel_direction(df, i)
+            self._tight_channel_direction = tc_dir
+            # 更新极值
+            if tc_dir == "up":
+                current_high = float(df.iloc[i]["high"])
+                if self._tight_channel_extreme is None or current_high > self._tight_channel_extreme:
+                    self._tight_channel_extreme = current_high
+            elif tc_dir == "down":
+                current_low = float(df.iloc[i]["low"])
+                if self._tight_channel_extreme is None or current_low < self._tight_channel_extreme:
+                    self._tight_channel_extreme = current_low
             return tight_channel_state
+        
+        # TightChannel 刚结束：记录结束点
+        if self._tight_channel_bars > 0:
+            self._last_tight_channel_end_bar = i - 1
+        
+        # ========== 检测 FINAL_FLAG（终极旗形）==========
+        final_flag = self._detect_final_flag(df, i, ema)
+        if final_flag is not None:
+            return final_flag
+        
+        # 重置 TightChannel 追踪（若不在 TightChannel 且不在 FinalFlag）
+        self._tight_channel_bars = 0
+        self._tight_channel_direction = None
+        self._tight_channel_extreme = None
         
         # 计算最近20根K线的EMA穿越次数（向量化）
         recent = df.iloc[max(0, i - 20) : i + 1]
@@ -551,3 +588,109 @@ class MarketAnalyzer:
             pass
         
         return None
+    
+    def _detect_final_flag(self, df: pd.DataFrame, i: int, ema: float) -> Optional[MarketState]:
+        """
+        检测 Final Flag（终极旗形）- Al Brooks 高胜率反转形态
+        
+        Al Brooks: "Final Flag 是趋势耗尽的最后挣扎，通常出现在长时间趋势后的
+        小幅横盘或回调中，是高胜率的反转入场点。"
+        
+        识别条件：
+        1. 之前必须有至少 5 根连续的 TightChannel（强趋势）
+        2. 当前价格处于横盘或小幅回调（非 TightChannel）
+        3. 价格仍远离 EMA20（距离 > 1% = Climax 区域）
+        4. 横盘/回调持续 3-8 根 K 线（旗形结构）
+        
+        返回:
+            MarketState.FINAL_FLAG 或 None
+        """
+        MIN_TIGHT_CHANNEL_BARS = 5  # TightChannel 至少持续 5 根
+        CLIMAX_DISTANCE_PCT = 0.01  # 价格与 EMA 距离 > 1% 视为 Climax 区域
+        FLAG_MIN_BARS = 3  # 旗形最少 3 根
+        FLAG_MAX_BARS = 8  # 旗形最多 8 根
+        
+        # 条件1：必须刚从至少 5 根的 TightChannel 退出
+        if self._tight_channel_bars < MIN_TIGHT_CHANNEL_BARS:
+            return None
+        if self._last_tight_channel_end_bar is None:
+            return None
+        
+        bars_since_tc_end = i - self._last_tight_channel_end_bar
+        if bars_since_tc_end < FLAG_MIN_BARS or bars_since_tc_end > FLAG_MAX_BARS:
+            return None
+        
+        # 条件2：价格仍远离 EMA（Climax 区域）
+        current_close = float(df.iloc[i]["close"])
+        distance_pct = (current_close - ema) / ema if ema > 0 else 0
+        
+        if self._tight_channel_direction == "up":
+            # 上涨趋势后：价格应仍在 EMA 上方且距离 > 1%
+            if distance_pct < CLIMAX_DISTANCE_PCT:
+                return None
+        elif self._tight_channel_direction == "down":
+            # 下跌趋势后：价格应仍在 EMA 下方且距离 > 1%
+            if distance_pct > -CLIMAX_DISTANCE_PCT:
+                return None
+        else:
+            return None
+        
+        # 条件3：当前处于横盘或小幅回调（旗形结构）
+        # 检查自 TightChannel 结束以来的波动幅度
+        flag_start = self._last_tight_channel_end_bar + 1
+        if flag_start >= len(df):
+            return None
+        flag_data = df.iloc[flag_start : i + 1]
+        if len(flag_data) < FLAG_MIN_BARS:
+            return None
+        
+        flag_high = float(flag_data["high"].max())
+        flag_low = float(flag_data["low"].min())
+        flag_range = flag_high - flag_low
+        
+        # 旗形波动幅度应小于之前 TightChannel 的 50%
+        # 用 ATR 或极值来估算 TightChannel 的波动
+        if self._tight_channel_extreme is not None:
+            if self._tight_channel_direction == "up":
+                tc_range = self._tight_channel_extreme - ema
+            else:
+                tc_range = ema - self._tight_channel_extreme
+            
+            if tc_range > 0 and flag_range > tc_range * 0.5:
+                # 回调幅度过大，不是旗形
+                return None
+        
+        # 条件4：旗形内没有强力突破（保持横盘特征）
+        if "body_size" in flag_data.columns:
+            avg_body = float(flag_data["body_size"].mean())
+            max_body = float(flag_data["body_size"].max())
+            if avg_body > 0 and max_body > avg_body * 2.5:
+                # 旗形内有强力 K 线，不是典型旗形
+                return None
+        
+        logging.debug(
+            f"🏁 检测到 Final Flag: 方向={self._tight_channel_direction}, "
+            f"TightChannel持续={self._tight_channel_bars}根, "
+            f"旗形持续={bars_since_tc_end}根, "
+            f"EMA距离={distance_pct:.2%}, 旗形波幅={flag_range:.2f}"
+        )
+        
+        return MarketState.FINAL_FLAG
+    
+    def get_final_flag_info(self) -> dict:
+        """
+        获取 Final Flag 相关信息（供 patterns 检测使用）
+        
+        返回:
+            dict: {
+                'direction': 'up'/'down',  # 之前趋势方向（反转方向相反）
+                'extreme': float,  # TightChannel 的极值（做空止损位/做多止损位）
+                'tc_bars': int,  # TightChannel 持续根数
+            }
+        """
+        return {
+            'direction': self._tight_channel_direction,
+            'extreme': self._tight_channel_extreme,
+            'tc_bars': self._tight_channel_bars,
+            'tc_end_bar': self._last_tight_channel_end_bar,
+        }

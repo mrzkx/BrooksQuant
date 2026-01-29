@@ -11,7 +11,7 @@ from typing import Dict, Optional
 from config import LEVERAGE, SYMBOL as CONFIG_SYMBOL, OBSERVE_MODE
 from trade_logger import TradeLogger
 from user_manager import TradingUser
-from order_executor import execute_observe_order, execute_live_order, handle_close_request
+from order_executor import execute_observe_order, execute_live_order, handle_close_request, _cancel_related_orders
 from workers.helpers import calculate_order_quantity
 
 SYMBOL = CONFIG_SYMBOL
@@ -234,20 +234,27 @@ async def _position_sync_alignment(user: TradingUser, trade_logger: TradeLogger)
         real = await user.sync_real_position(SYMBOL)
         local_pos = trade_logger.positions.get(user.name)
 
-        # 币安无仓位，本地有记录 -> 外部平仓（手动/强平等）
+        # 币安无仓位，本地有记录 -> 外部平仓（手动/强平/TP2/SL 被交易所触发等）
         if not real["has_position"] and local_pos is not None:
             try:
                 ticker = await user.client.futures_symbol_ticker(symbol=SYMBOL)
                 exit_price = float(ticker.get("price", 0))
             except Exception:
                 exit_price = float(local_pos.entry_price)
+            
+            # OCO 风格清理：取消所有关联挂单（TP2/SL 其中一个被触发时，取消另一个）
+            await _cancel_related_orders(user, trade_logger, reason="仓位已平仓（OCO清理）")
+            
+            # 确保清理所有挂单（双重保险）
+            await user.cancel_all_orders(SYMBOL)
+            
             closed = trade_logger.force_close_position(
                 user.name, exit_price, reason="externally_closed"
             )
             if closed:
                 logging.warning(
                     f"[{user.name}] 实盘对齐: 币安已无仓位，本地持仓已标记为外部平仓 "
-                    f"(exit_price={exit_price:.2f})"
+                    f"(exit_price={exit_price:.2f})，已清理所有挂单"
                 )
             return
 

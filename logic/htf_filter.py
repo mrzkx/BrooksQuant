@@ -1,6 +1,16 @@
 """
 高时间框架过滤器 (Higher Time Frame Filter)
 
+职责（关注点分离）：
+- 获取 1h EMA20 方向和斜率
+- 提供趋势判断（Bullish/Bearish/Neutral）
+- 提供硬过滤方法（allows_h2_buy/allows_l2_sell）供 strategy 调用
+- 提供软过滤权重（get_signal_modifier）供 strategy 调用
+
+不负责：
+- 直接修改信号强度（由 strategy 统一处理）
+- 直接阻止信号（由 strategy 决策）
+
 Al Brooks 核心原则：
 "背景（Context）胜过一切"
 "大周期的趋势是日内交易最好的保护伞"
@@ -170,18 +180,20 @@ class HTFFilter:
                     return self._snapshot
                 
                 # 转换为 DataFrame
-                df = pd.DataFrame(klines, columns=[
+                col_names = [
                     "timestamp", "open", "high", "low", "close", 
                     "volume", "close_time", "quote_volume", "trades",
                     "taker_buy_base", "taker_buy_quote", "ignore"
-                ])
+                ]
+                df = pd.DataFrame(klines, columns=pd.Index(col_names))
                 df["close"] = df["close"].astype(float)
                 df["high"] = df["high"].astype(float)
                 df["low"] = df["low"].astype(float)
                 df["open"] = df["open"].astype(float)
                 
                 # 计算 EMA (使用 TA-Lib)
-                df["ema"] = compute_ema(df["close"], self.ema_period)
+                close_series: pd.Series = df["close"]  # type: ignore[assignment]
+                df["ema"] = compute_ema(close_series, self.ema_period)
                 
                 # 获取最新数据
                 last_row = df.iloc[-1]
@@ -434,34 +446,3 @@ def get_htf_filter(htf_interval: str = "1h", ema_period: int = 20) -> HTFFilter:
         _htf_filter = HTFFilter(htf_interval=htf_interval, ema_period=ema_period)
     
     return _htf_filter
-
-
-async def htf_updater_worker(
-    client: AsyncClient,
-    symbol: str = "BTCUSDT",
-    update_interval: int = 300
-) -> None:
-    """
-    HTF 数据更新工作线程
-    
-    定期更新高时间框架数据（每 5 分钟）
-    
-    Args:
-        client: Binance 异步客户端
-        symbol: 交易对符号
-        update_interval: 更新间隔（秒）
-    """
-    htf_filter = get_htf_filter()
-    
-    logging.info(f"🔄 HTF 更新器已启动: 更新间隔={update_interval}秒")
-    
-    while True:
-        try:
-            await htf_filter.update(client, symbol)
-            await asyncio.sleep(update_interval)
-        except asyncio.CancelledError:
-            logging.info("HTF 更新器任务已取消")
-            break
-        except Exception as e:
-            logging.error(f"HTF 更新器错误: {e}", exc_info=True)
-            await asyncio.sleep(60)  # 出错后等待 1 分钟重试

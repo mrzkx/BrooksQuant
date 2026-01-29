@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from binance import AsyncClient
 
@@ -438,6 +438,97 @@ class TradingUser:
         except Exception as e:
             logging.error(f"[{self.name}] 取消挂单失败: {e}", exc_info=True)
             return False
+
+    async def cancel_order(self, symbol: str, order_id: int) -> bool:
+        """
+        取消单个挂单
+        
+        Args:
+            symbol: 交易对（如 "BTCUSDT"）
+            order_id: 订单 ID
+        
+        Returns:
+            bool: 是否成功
+        """
+        if self.client is None:
+            raise RuntimeError(f"用户 {self.name} 尚未连接客户端")
+        
+        try:
+            response = await self.client.futures_cancel_order(symbol=symbol, orderId=order_id)
+            logging.info(f"[{self.name}] 已取消订单 {order_id}: {response}")
+            return True
+        except Exception as e:
+            # 订单可能已成交或已取消，不视为错误
+            if "Unknown order" in str(e) or "Order does not exist" in str(e):
+                logging.info(f"[{self.name}] 订单 {order_id} 不存在或已成交")
+                return True
+            logging.error(f"[{self.name}] 取消订单 {order_id} 失败: {e}", exc_info=True)
+            return False
+
+    async def get_open_orders(self, symbol: str) -> List[Dict[str, Any]]:
+        """
+        获取指定交易对的所有挂单
+        
+        Args:
+            symbol: 交易对（如 "BTCUSDT"）
+        
+        Returns:
+            挂单列表
+        """
+        if self.client is None:
+            raise RuntimeError(f"用户 {self.name} 尚未连接客户端")
+        
+        try:
+            orders = await self.client.futures_get_open_orders(symbol=symbol)
+            logging.debug(f"[{self.name}] {symbol} 挂单列表: {len(orders)} 个")
+            return orders
+        except Exception as e:
+            logging.error(f"[{self.name}] 获取挂单列表失败: {e}", exc_info=True)
+            return []
+
+    async def create_take_profit_limit_order(
+        self,
+        symbol: str,
+        side: str,
+        quantity: float,
+        price: float,
+        stop_price: float,
+        reduce_only: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        创建限价止盈单（TP2 用，避免市价滑点）
+        
+        使用 TAKE_PROFIT 类型（限价止盈），当价格触及 stopPrice 后挂限价单
+        
+        Args:
+            symbol: 交易对（如 "BTCUSDT"）
+            side: 方向（"BUY" 平空仓 或 "SELL" 平多仓）
+            quantity: 数量
+            price: 限价（成交价格）
+            stop_price: 触发价格
+            reduce_only: 是否只减仓
+        
+        Returns:
+            订单响应
+        """
+        if self.client is None:
+            raise RuntimeError(f"用户 {self.name} 尚未连接客户端，无法下单。")
+        
+        order_params = {
+            "symbol": symbol,
+            "side": side.upper(),
+            "type": "TAKE_PROFIT",  # 限价止盈
+            "quantity": quantity,
+            "price": str(price),  # 限价
+            "stopPrice": str(stop_price),  # 触发价
+            "reduceOnly": "true" if reduce_only else "false",
+            "timeInForce": "GTC",
+        }
+        
+        logging.info(f"[{self.name}] 创建限价止盈单: {order_params}")
+        response = await self.client.futures_create_order(**order_params)
+        logging.info(f"[{self.name}] 限价止盈单响应: {response}")
+        return response
 
     async def get_order_book_best_prices(self, symbol: str, limit: int = 5) -> tuple[float, float]:
         """
