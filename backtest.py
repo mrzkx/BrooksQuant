@@ -24,11 +24,11 @@ import pandas as pd
 from binance import AsyncClient
 
 # 导入策略模块
-from logic.market_analyzer import MarketState, MarketAnalyzer
+from logic.market_analyzer import MarketState, MarketCycle, MarketAnalyzer
 from logic.patterns import PatternDetector
 from logic.state_machines import H2StateMachine, L2StateMachine
-from logic.talib_indicators import compute_ema, compute_atr
-from logic.htf_filter import HTFTrend
+from logic.talib_indicators import compute_ema, compute_atr, compute_ema_adaptive
+from logic.htf_filter import HTFTrend, HTFFilter
 
 
 # ============================================================================
@@ -54,8 +54,13 @@ class BacktestConfig:
     
     # 策略参数
     ema_period: int = 20
+    use_adaptive_ema: bool = True  # 波动率调节 σ：高 ATR 拉长 EMA 周期，低 ATR 缩短
     lookback_period: int = 20
-    stop_loss_atr_multiplier: float = 2.0  # 止损 ATR 乘数
+    stop_loss_atr_multiplier: float = 2.0  # 止损 ATR 乘数（两棒+ATR 模式时使用）
+    tick_size: float = 0.01  # 合约最小价格步长（信号棒极值±TickSize 止损时使用）
+    use_signal_bar_only_stop: bool = True  # True=信号棒极值±TickSize，False=两棒+ATR
+    trader_equation_enabled: bool = True  # 是否启用交易者方程过滤（WinRate×Reward>Risk）
+    trader_equation_win_rate: float = 0.4  # 交易者方程默认胜率
     
     # 风控参数
     cooldown_bars: int = 3  # 止损后冷却K线数
@@ -175,107 +180,116 @@ class BacktestStrategy:
     - 可配置止损 ATR 乘数
     """
     
-    def __init__(self, ema_period: int = 20, lookback_period: int = 20, stop_loss_atr_multiplier: float = 2.0, kline_interval: str = "5m", use_htf_filter_for_h2l2: bool = False, skip_h2l2_validation: bool = False, h2l2_only: bool = False, no_filters: bool = False):
+    def __init__(self, ema_period: int = 20, lookback_period: int = 20, stop_loss_atr_multiplier: float = 2.0, kline_interval: str = "5m", use_adaptive_ema: bool = True, use_htf_filter_for_h2l2: bool = False, skip_h2l2_validation: bool = False, h2l2_only: bool = False, no_filters: bool = False, tick_size: float = 0.01, use_signal_bar_only_stop: bool = True, trader_equation_enabled: bool = True, trader_equation_win_rate: float = 0.4):
         self.ema_period = ema_period
         self.lookback_period = lookback_period
-        self.stop_loss_atr_multiplier = stop_loss_atr_multiplier  # 止损 ATR 乘数
+        self.stop_loss_atr_multiplier = stop_loss_atr_multiplier
         self.kline_interval = kline_interval
-        self.use_htf_filter_for_h2l2 = use_htf_filter_for_h2l2  # 回测时默认 False，让 H2/L2 能触发
-        self.skip_h2l2_validation = skip_h2l2_validation  # 跳过 H2/L2 信号棒校验（诊断用）
-        self.h2l2_only = h2l2_only  # 仅 H2/L2，禁用其他形态
-        self.no_filters = no_filters  # 关闭所有过滤，完全 Al Brooks 原始逻辑
+        self.use_adaptive_ema = use_adaptive_ema  # 波动率调节 σ 自适应 EMA 周期
+        self.use_htf_filter_for_h2l2 = use_htf_filter_for_h2l2
+        self.skip_h2l2_validation = skip_h2l2_validation
+        self.h2l2_only = h2l2_only
+        self.no_filters = no_filters
+        self.tick_size = tick_size
+        self.use_signal_bar_only_stop = use_signal_bar_only_stop
+        self.trader_equation_enabled = trader_equation_enabled
+        self.trader_equation_win_rate = trader_equation_win_rate
 
-        # 初始化模块化组件
+        # 初始化模块化组件（止损模式与实盘一致）
         self.market_analyzer = MarketAnalyzer(ema_period=ema_period, kline_interval=kline_interval)
-        self.pattern_detector = PatternDetector(lookback_period=lookback_period, kline_interval=kline_interval)
+        self.pattern_detector = PatternDetector(
+            lookback_period=lookback_period,
+            kline_interval=kline_interval,
+            use_signal_bar_only_stop=use_signal_bar_only_stop,
+            tick_size=tick_size,
+        )
         
-        # HTF 趋势缓存（用于过滤 H2/L2 信号）
-        self._htf_trend_cache: Optional[Dict[int, HTFTrend]] = None
+        # HTF 缓存（用于过滤 H2/L2）：bar_index -> {"trend", "ema", "slope"}，满足强趋势+价格近 EMA 时方允许 H2/L2
+        self._htf_cache: Optional[Dict[int, Dict]] = None
         
-        # 覆盖 pattern_detector 的止损计算方法
+        # 回测覆盖止损计算（与配置一致：纯信号棒或两棒+ATR）
         self._override_stop_loss_calculation()
     
     def _override_stop_loss_calculation(self):
         """
-        Al Brooks 风格止损计算（优化版）
+        Al Brooks 风格止损计算（与实盘一致）
         
-        核心原则：止损放在 Signal Bar（前一根K线）的极值外
-        最小距离：1.5 * ATR（防止太紧）
-        最大距离：multiplier * ATR（防止太宽）
+        - use_signal_bar_only_stop=True：纯信号棒，stop = SignalBar.Low - TickSize（买）/ SignalBar.High + TickSize（卖）
+        - use_signal_bar_only_stop=False：两棒+ATR，最小 1.5*ATR，最大 multiplier*ATR
         """
-        multiplier = self.stop_loss_atr_multiplier  # 用作最大安全边界的 ATR 倍数
+        multiplier = self.stop_loss_atr_multiplier
+        tick_size = self.tick_size
+        use_signal_bar_only = self.use_signal_bar_only_stop
         
         def custom_unified_stop_loss(df, i, side, entry_price, atr=None):
+            if i < 1:
+                return entry_price * (0.98 if side == "buy" else 1.02)
+            signal_bar = df.iloc[i - 1]
+            if use_signal_bar_only and tick_size > 0:
+                if side == "buy":
+                    return float(signal_bar["low"]) - tick_size
+                else:
+                    return float(signal_bar["high"]) + tick_size
             if i < 2:
                 return entry_price * (0.98 if side == "buy" else 1.02)
-            
-            signal_bar = df.iloc[i - 1]  # Signal Bar = 前一根 K 线
-            prev_bar = df.iloc[i - 2]    # 前两根 K 线
-            
-            # Buffer = 0.15 * ATR 或最小 0.15%
+            prev_bar = df.iloc[i - 2]
             if atr and atr > 0:
                 buffer = atr * 0.15
             else:
                 buffer = entry_price * 0.0015
-            
             if side == "buy":
-                # 买入：止损在前两根 K 线低点下方（取较低者）
                 two_bar_low = min(signal_bar["low"], prev_bar["low"])
                 signal_bar_stop = two_bar_low - buffer
-                
                 if atr and atr > 0:
-                    # 最小距离：至少 1.5 * ATR
-                    min_stop_distance = atr * 1.5
-                    min_stop = entry_price - min_stop_distance
+                    min_stop = entry_price - atr * 1.5
                     if signal_bar_stop > min_stop:
                         signal_bar_stop = min_stop
-                    
-                    # 最大距离：不超过 multiplier * ATR
-                    max_stop_distance = atr * multiplier
-                    floor_stop = entry_price - max_stop_distance
+                    floor_stop = entry_price - atr * multiplier
                     signal_bar_stop = max(signal_bar_stop, floor_stop)
-                
                 return signal_bar_stop
             else:
-                # 卖出：止损在前两根 K 线高点上方（取较高者）
                 two_bar_high = max(signal_bar["high"], prev_bar["high"])
                 signal_bar_stop = two_bar_high + buffer
-                
                 if atr and atr > 0:
-                    # 最小距离：至少 1.5 * ATR
-                    min_stop_distance = atr * 1.5
-                    max_stop = entry_price + min_stop_distance
+                    max_stop = entry_price + atr * 1.5
                     if signal_bar_stop < max_stop:
                         signal_bar_stop = max_stop
-                    
-                    # 最大距离：不超过 multiplier * ATR
-                    max_stop_distance = atr * multiplier
-                    ceiling_stop = entry_price + max_stop_distance
+                    ceiling_stop = entry_price + atr * multiplier
                     signal_bar_stop = min(signal_bar_stop, ceiling_stop)
-                
                 return signal_bar_stop
         
-        # 替换 pattern_detector 的方法
         self.pattern_detector.calculate_unified_stop_loss = staticmethod(custom_unified_stop_loss)
     
     def _compute_ema(self, df: pd.DataFrame) -> pd.Series:
-        """计算 EMA (使用 TA-Lib)"""
+        """计算 EMA：自适应波动率时用 σ 调节周期，否则固定周期"""
+        if self.use_adaptive_ema:
+            return compute_ema_adaptive(
+                df["close"], df["high"], df["low"],
+                base_period=self.ema_period,
+                atr_period=14,
+                atr_lookback=50,
+                min_period=10,
+                max_period=35,
+            )
         return compute_ema(df["close"], self.ema_period)
     
     def _compute_atr(self, df: pd.DataFrame, period: int = 14) -> pd.Series:
         """计算 ATR (使用 TA-Lib)"""
         return compute_atr(df["high"], df["low"], df["close"], period)
     
-    async def _compute_htf_trend(self, df_5m: pd.DataFrame, client: AsyncClient, symbol: str = "BTCUSDT") -> Dict[int, HTFTrend]:
+    async def _compute_htf_cache(
+        self, df_5m: pd.DataFrame, client: AsyncClient, symbol: str = "BTCUSDT"
+    ) -> Dict[int, Dict]:
         """
-        计算 HTF (1h) 趋势，用于过滤 H2/L2 信号
+        计算 HTF (1h) 趋势、EMA、斜率，用于 H2/L2 背景过滤（强趋势 + 价格近 EMA20）
         
-        返回每个 5m K 线索引对应的 1h 趋势
+        返回每个 5m K 线索引对应的 {"trend", "ema", "slope"}
         """
-        htf_trends: Dict[int, HTFTrend] = {}
+        htf_cache: Dict[int, Dict] = {}
+        strong_slope = HTFFilter.STRONG_SLOPE_THRESHOLD_PCT
+        slope_lookback = HTFFilter.SLOPE_LOOKBACK_BARS
         
         try:
-            # 获取 1h K 线数据
             start_str = df_5m.index[0].strftime("%Y-%m-%d")
             end_str = (df_5m.index[-1] + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
             
@@ -286,11 +300,10 @@ class BacktestStrategy:
                 end_str=end_str
             )
             
-            if not klines_1h or len(klines_1h) < 20:
+            if not klines_1h or len(klines_1h) < 20 + slope_lookback:
                 logging.warning("⚠️ HTF 数据不足，跳过 HTF 过滤")
-                return htf_trends
+                return htf_cache
             
-            # 转换为 DataFrame
             df_1h = pd.DataFrame(klines_1h, columns=[
                 "open_time", "open", "high", "low", "close", "volume",
                 "close_time", "quote_volume", "trades", "taker_buy_base",
@@ -299,40 +312,34 @@ class BacktestStrategy:
             df_1h["open_time"] = pd.to_datetime(df_1h["open_time"], unit="ms")
             df_1h["close"] = df_1h["close"].astype(float)
             df_1h = df_1h.set_index("open_time")
-            
-            # 计算 1h EMA20
             df_1h["ema"] = compute_ema(df_1h["close"], 20)
             
-            # 计算 EMA 斜率（最近 3 根）
-            slope_lookback = 3
             for i in range(20 + slope_lookback, len(df_1h)):
                 ema_values = df_1h["ema"].iloc[i - slope_lookback:i + 1].values
-                if len(ema_values) >= 2:
-                    ema_start = ema_values[0]
-                    ema_end = ema_values[-1]
-                    ema_slope = (ema_end - ema_start) / ema_start if ema_start > 0 else 0
-                    
-                    # 判断趋势
-                    if ema_slope > 0.001:  # 0.1%
-                        trend = HTFTrend.BULLISH
-                    elif ema_slope < -0.001:
-                        trend = HTFTrend.BEARISH
-                    else:
-                        trend = HTFTrend.NEUTRAL
-                    
-                    # 找到这个 1h K 线对应的所有 5m K 线
-                    htf_time = df_1h.index[i]
-                    for j, kline_time in enumerate(df_5m.index):
-                        # 如果 5m K 线在这个 1h K 线的时间范围内
-                        if htf_time <= kline_time < htf_time + pd.Timedelta(hours=1):
-                            htf_trends[j] = trend
+                if len(ema_values) < 2:
+                    continue
+                ema_start = ema_values[0]
+                ema_end = ema_values[-1]
+                ema_slope = (ema_end - ema_start) / ema_start if ema_start > 0 else 0
+                ema_val = float(df_1h["ema"].iloc[i])
+                
+                if ema_slope > HTFFilter.SLOPE_THRESHOLD_PCT:
+                    trend = HTFTrend.BULLISH
+                elif ema_slope < -HTFFilter.SLOPE_THRESHOLD_PCT:
+                    trend = HTFTrend.BEARISH
+                else:
+                    trend = HTFTrend.NEUTRAL
+                
+                htf_time = df_1h.index[i]
+                for j, kline_time in enumerate(df_5m.index):
+                    if htf_time <= kline_time < htf_time + pd.Timedelta(hours=1):
+                        htf_cache[j] = {"trend": trend, "ema": ema_val, "slope": ema_slope}
             
-            logging.info(f"✅ HTF 趋势计算完成: {len(htf_trends)} 个 5m K 线有 HTF 趋势数据")
-            
+            logging.info(f"✅ HTF 缓存计算完成: {len(htf_cache)} 个 5m K 线（含 trend/ema/slope）")
         except Exception as e:
-            logging.warning(f"⚠️ HTF 趋势计算失败: {e}，跳过 HTF 过滤")
+            logging.warning(f"⚠️ HTF 缓存计算失败: {e}，跳过 HTF 过滤")
         
-        return htf_trends
+        return htf_cache
     
     def _calculate_tp1_tp2(
         self, entry_price: float, stop_loss: float, side: str, 
@@ -356,6 +363,24 @@ class BacktestStrategy:
         
         return (tp1, tp2)
     
+    def _satisfies_trader_equation(
+        self, entry_price: float, stop_loss: float, tp1: float, tp2: float,
+        tp1_close_ratio: float, side: str,
+    ) -> bool:
+        """交易者方程：WinRate × Reward > Risk 时才允许记录信号（与实盘一致）"""
+        if not self.trader_equation_enabled:
+            return True
+        risk = abs(entry_price - stop_loss)
+        if risk <= 0:
+            return True
+        if side == "buy":
+            reward = tp1_close_ratio * (tp1 - entry_price) + (1.0 - tp1_close_ratio) * (tp2 - entry_price)
+        else:
+            reward = tp1_close_ratio * (entry_price - tp1) + (1.0 - tp1_close_ratio) * (entry_price - tp2)
+        if reward <= 0:
+            return False
+        return (self.trader_equation_win_rate * reward) > risk
+    
     async def generate_signals(self, df: pd.DataFrame, show_progress: bool = True, htf_client: Optional[AsyncClient] = None, symbol: str = "BTCUSDT") -> pd.DataFrame:
         """
         生成交易信号（同步版本，但 HTF 计算需要异步）
@@ -378,31 +403,24 @@ class BacktestStrategy:
         else:
             data["atr"] = data["high"] - data["low"]  # 用波幅代替
         
-        # 计算 HTF 趋势（用于过滤 H2/L2 信号）
+        # 计算 HTF 缓存（1h 趋势 + EMA + 斜率，用于 H2/L2 强趋势+价格近 EMA 过滤）
         if htf_client is not None:
-            self._htf_trend_cache = await self._compute_htf_trend(data, htf_client, symbol)
+            self._htf_cache = await self._compute_htf_cache(data, htf_client, symbol)
         else:
-            self._htf_trend_cache = {}
+            self._htf_cache = {}
         
-        # 预计算基础向量化列（pattern_detector 需要）
+        # ========== 可向量化预计算（循环外一次性计算，避免循环内重复）==========
+        # 以下列供 pattern_detector / market_analyzer 使用，循环内仅做查表与形态逻辑
         data["body_size"] = (data["close"] - data["open"]).abs()
         data["kline_range"] = data["high"] - data["low"]
         data["is_bullish"] = data["close"] > data["open"]
         data["is_bearish"] = data["close"] < data["open"]
-        
-        # 避免除零
-        data["body_ratio"] = data["body_size"] / data["kline_range"].replace(0, float('nan'))
+        data["body_ratio"] = data["body_size"] / data["kline_range"].replace(0, float("nan"))
         data["body_ratio"] = data["body_ratio"].fillna(0)
-        
-        # 价格与 EMA 关系
         data["above_ema"] = data["close"] > data["ema"]
         data["ema_distance"] = (data["close"] - data["ema"]).abs()
         data["ema_distance_pct"] = data["ema_distance"] / data["ema"]
-        
-        # EMA 穿越检测（向量化）
         data["ema_cross"] = data["above_ema"].astype(int).diff().abs()
-        
-        # 滚动计算（用于 Spike/Climax 检测）
         data["body_size_ma10"] = data["body_size"].rolling(window=10, min_periods=1).mean()
         data["kline_range_ma10"] = data["kline_range"].rolling(window=10, min_periods=1).mean()
         
@@ -441,8 +459,9 @@ class BacktestStrategy:
             ema = row["ema"]
             atr = row["atr"] if "atr" in data.columns else None
             
-            # 检测市场状态
+            # 检测市场状态与市场周期（Spike / Channel / Trading Range）
             market_state = self.market_analyzer.detect_market_state(data, i, ema)
+            market_cycle = self.market_analyzer.get_market_cycle(data, i, ema, market_state)
             market_states[i] = market_state.value
             
             # 获取趋势方向和强度
@@ -478,23 +497,35 @@ class BacktestStrategy:
                     signal_type, side, stop_loss, limit_price, base_height, spike_idx, _ = pending_spike
                     
                     if side == "buy" and low <= limit_price:
+                        if self.pattern_detector.is_likely_wick_bar(data, i - 1, atr):
+                            pending_spike = None
+                            continue
+                        tp1, tp2 = self._calculate_tp1_tp2(limit_price, stop_loss, side, base_height, atr)
+                        if not self._satisfies_trader_equation(limit_price, stop_loss, tp1, tp2, 0.5, side):
+                            pending_spike = None
+                            continue
                         signals[i] = signal_type
                         sides[i] = side
                         stops[i] = stop_loss
                         base_heights[i] = base_height
                         risk_reward_ratios[i] = 2.0
-                        tp1, tp2 = self._calculate_tp1_tp2(limit_price, stop_loss, side, base_height, atr)
                         tp1_prices[i], tp2_prices[i] = tp1, tp2
                         pending_spike = None
                         h2_machine.set_strong_trend()
                         continue
                     elif side == "sell" and high >= limit_price:
+                        if self.pattern_detector.is_likely_wick_bar(data, i - 1, atr):
+                            pending_spike = None
+                            continue
+                        tp1, tp2 = self._calculate_tp1_tp2(limit_price, stop_loss, side, base_height, atr)
+                        if not self._satisfies_trader_equation(limit_price, stop_loss, tp1, tp2, 0.5, side):
+                            pending_spike = None
+                            continue
                         signals[i] = signal_type
                         sides[i] = side
                         stops[i] = stop_loss
                         base_heights[i] = base_height
                         risk_reward_ratios[i] = 2.0
-                        tp1, tp2 = self._calculate_tp1_tp2(limit_price, stop_loss, side, base_height, atr)
                         tp1_prices[i], tp2_prices[i] = tp1, tp2
                         pending_spike = None
                         l2_machine.set_strong_trend()
@@ -504,21 +535,32 @@ class BacktestStrategy:
                     elif i - spike_idx > 5:
                         pending_spike = None
                 
-                # 优先级1: Failed Breakout
-                if market_state == MarketState.TRADING_RANGE and not is_strong_trend_mode:
-                    result = self.pattern_detector.detect_failed_breakout(data, i, ema, atr, market_state)
+                # 优先级1: Wedge+失败突破 或 普通 Failed Breakout（尖峰阶段不触发反转）
+                if market_cycle != MarketCycle.SPIKE and market_state == MarketState.TRADING_RANGE and not is_strong_trend_mode:
+                    relaxed_signal_bar = market_cycle == MarketCycle.TRADING_RANGE
+                    result = self.pattern_detector.detect_wedge_failed_breakout(
+                        data, i, ema, atr, market_state
+                    )
+                    if not result:
+                        result = self.pattern_detector.detect_failed_breakout(
+                            data, i, ema, atr, market_state,
+                            relaxed_signal_bar=relaxed_signal_bar,
+                        )
                     if result:
                         signal_type, side, stop_loss, base_height = result
                         
                         if allowed_side is not None and side != allowed_side:
                             continue
-                        
+                        if self.pattern_detector.is_likely_wick_bar(data, i - 1, atr):
+                            continue
+                        tp1, tp2 = self._calculate_tp1_tp2(close, stop_loss, side, base_height, atr)
+                        if not self._satisfies_trader_equation(close, stop_loss, tp1, tp2, 0.5, side):
+                            continue
                         signals[i] = signal_type
                         sides[i] = side
                         stops[i] = stop_loss
                         base_heights[i] = base_height
                         risk_reward_ratios[i] = 1.0
-                        tp1, tp2 = self._calculate_tp1_tp2(close, stop_loss, side, base_height, atr)
                         tp1_prices[i], tp2_prices[i] = tp1, tp2
                         continue
                 
@@ -533,12 +575,16 @@ class BacktestStrategy:
                     if limit_price is not None:
                         pending_spike = (signal_type, side, stop_loss, limit_price, base_height, i, is_high_risk)
                     else:
+                        if self.pattern_detector.is_likely_wick_bar(data, i - 1, atr):
+                            continue
+                        tp1, tp2 = self._calculate_tp1_tp2(close, stop_loss, side, base_height, atr)
+                        if not self._satisfies_trader_equation(close, stop_loss, tp1, tp2, 0.5, side):
+                            continue
                         signals[i] = signal_type
                         sides[i] = side
                         stops[i] = stop_loss
                         base_heights[i] = base_height
                         risk_reward_ratios[i] = 2.0
-                        tp1, tp2 = self._calculate_tp1_tp2(close, stop_loss, side, base_height, atr)
                         tp1_prices[i], tp2_prices[i] = tp1, tp2
                         if side == "buy":
                             h2_machine.set_strong_trend()
@@ -554,36 +600,44 @@ class BacktestStrategy:
                         
                         if allowed_side is not None and side != allowed_side:
                             continue
-                        
+                        if self.pattern_detector.is_likely_wick_bar(data, i - 1, atr):
+                            continue
+                        tp1, tp2 = self._calculate_tp1_tp2(close, stop_loss, side, base_height, atr)
+                        if not self._satisfies_trader_equation(close, stop_loss, tp1, tp2, 0.5, side):
+                            continue
                         signals[i] = signal_type
                         sides[i] = side
                         stops[i] = stop_loss
                         base_heights[i] = base_height
                         risk_reward_ratios[i] = 2.0
-                        tp1, tp2 = self._calculate_tp1_tp2(close, stop_loss, side, base_height, atr)
                         tp1_prices[i], tp2_prices[i] = tp1, tp2
                         continue
                 
-                # 优先级4: Wedge 反转（SL=极值±0.5*ATR，TP1=EMA20，TP2=楔形起点）
-                if not is_strong_trend_mode:
+                # 优先级4: Wedge 反转（尖峰阶段不触发；交易区间降低信号棒门槛）
+                if market_cycle != MarketCycle.SPIKE and not is_strong_trend_mode:
+                    relaxed_signal_bar = market_cycle == MarketCycle.TRADING_RANGE
                     wedge_result = self.pattern_detector.detect_wedge_reversal(
-                        data, i, ema, atr, market_state
+                        data, i, ema, atr, market_state,
+                        relaxed_signal_bar=relaxed_signal_bar,
                     )
                     if wedge_result:
                         signal_type, side, stop_loss, base_height, wedge_tp1, wedge_tp2, _ = wedge_result
                         
                         if allowed_side is not None and side != allowed_side:
                             continue
-                        
+                        if self.pattern_detector.is_likely_wick_bar(data, i - 1, atr):
+                            continue
+                        if wedge_tp1 is not None and wedge_tp2 is not None:
+                            tp1, tp2 = wedge_tp1, wedge_tp2
+                        else:
+                            tp1, tp2 = self._calculate_tp1_tp2(close, stop_loss, side, base_height, atr)
+                        if not self._satisfies_trader_equation(close, stop_loss, tp1, tp2, 0.5, side):
+                            continue
                         signals[i] = signal_type
                         sides[i] = side
                         stops[i] = stop_loss
                         base_heights[i] = base_height
                         risk_reward_ratios[i] = 2.0
-                        if wedge_tp1 is not None and wedge_tp2 is not None:
-                            tp1, tp2 = wedge_tp1, wedge_tp2
-                        else:
-                            tp1, tp2 = self._calculate_tp1_tp2(close, stop_loss, side, base_height, atr)
                         tp1_prices[i], tp2_prices[i] = tp1, tp2
                         continue
             
@@ -598,11 +652,16 @@ class BacktestStrategy:
                 )
                 if h2_signal:
                     self._h2l2_diag["h2_emitted"] += 1
-                    # HTF 过滤（no_filters 时关闭）
-                    if self.use_htf_filter_for_h2l2 and not self.no_filters:
-                        htf_trend = self._htf_trend_cache.get(i, HTFTrend.NEUTRAL)
-                        if htf_trend == HTFTrend.BEARISH:
-                            continue  # HTF 下降趋势，禁止买入
+                    # HTF 背景硬过滤：强多头 + 价格近 1h EMA20（no_filters 时关闭）
+                    if self.use_htf_filter_for_h2l2 and not self.no_filters and self._htf_cache:
+                        htf = self._htf_cache.get(i)
+                        if not htf:
+                            continue
+                        trend, ema_val, slope = htf["trend"], htf["ema"], htf["slope"]
+                        strong_bull = trend == HTFTrend.BULLISH and slope >= HTFFilter.STRONG_SLOPE_THRESHOLD_PCT
+                        near_ema = ema_val > 0 and abs(close - ema_val) / ema_val <= HTFFilter.PRICE_NEAR_EMA_PCT
+                        if not (strong_bull and near_ema):
+                            continue  # 非强多头或价格未回调至 EMA 附近，禁止 H2 买入
                     
                     # 信号棒质量验证（no_filters / skip 时关闭，完全 Al Brooks）
                     if not (self.skip_h2l2_validation or self.no_filters):
@@ -615,12 +674,16 @@ class BacktestStrategy:
                             self._h2l2_diag["h2_rejected"] += 1
                             continue  # 信号棒质量不合格
                     
+                    if self.pattern_detector.is_likely_wick_bar(data, i - 1, atr):
+                        continue
+                    tp1, tp2 = self._calculate_tp1_tp2(close, h2_signal.stop_loss, h2_signal.side, h2_signal.base_height, atr)
+                    if not self._satisfies_trader_equation(close, h2_signal.stop_loss, tp1, tp2, 0.5, h2_signal.side):
+                        continue
                     signals[i] = h2_signal.signal_type
                     sides[i] = h2_signal.side
                     stops[i] = h2_signal.stop_loss
                     base_heights[i] = h2_signal.base_height
                     risk_reward_ratios[i] = 2.0
-                    tp1, tp2 = self._calculate_tp1_tp2(close, h2_signal.stop_loss, h2_signal.side, h2_signal.base_height, atr)
                     tp1_prices[i], tp2_prices[i] = tp1, tp2
                     continue  # 已出 H2 信号，同 bar 不再尝试 L2
             
@@ -632,11 +695,16 @@ class BacktestStrategy:
                 )
                 if l2_signal:
                     self._h2l2_diag["l2_emitted"] += 1
-                    # HTF 过滤（no_filters 时关闭）
-                    if self.use_htf_filter_for_h2l2 and not self.no_filters:
-                        htf_trend = self._htf_trend_cache.get(i, HTFTrend.NEUTRAL)
-                        if htf_trend == HTFTrend.BULLISH:
-                            continue  # HTF 上升趋势，禁止卖出
+                    # HTF 背景硬过滤：强空头 + 价格近 1h EMA20（no_filters 时关闭）
+                    if self.use_htf_filter_for_h2l2 and not self.no_filters and self._htf_cache:
+                        htf = self._htf_cache.get(i)
+                        if not htf:
+                            continue
+                        trend, ema_val, slope = htf["trend"], htf["ema"], htf["slope"]
+                        strong_bear = trend == HTFTrend.BEARISH and slope <= -HTFFilter.STRONG_SLOPE_THRESHOLD_PCT
+                        near_ema = ema_val > 0 and abs(close - ema_val) / ema_val <= HTFFilter.PRICE_NEAR_EMA_PCT
+                        if not (strong_bear and near_ema):
+                            continue  # 非强空头或价格未反弹至 EMA 附近，禁止 L2 卖出
                     
                     # 信号棒质量验证（no_filters / skip 时关闭，完全 Al Brooks）
                     if not (self.skip_h2l2_validation or self.no_filters):
@@ -649,12 +717,16 @@ class BacktestStrategy:
                             self._h2l2_diag["l2_rejected"] += 1
                             continue  # 信号棒质量不合格
                     
+                    if self.pattern_detector.is_likely_wick_bar(data, i - 1, atr):
+                        continue
+                    tp1, tp2 = self._calculate_tp1_tp2(close, l2_signal.stop_loss, l2_signal.side, l2_signal.base_height, atr)
+                    if not self._satisfies_trader_equation(close, l2_signal.stop_loss, tp1, tp2, 0.5, l2_signal.side):
+                        continue
                     signals[i] = l2_signal.signal_type
                     sides[i] = l2_signal.side
                     stops[i] = l2_signal.stop_loss
                     base_heights[i] = l2_signal.base_height
                     risk_reward_ratios[i] = 2.0
-                    tp1, tp2 = self._calculate_tp1_tp2(close, l2_signal.stop_loss, l2_signal.side, l2_signal.base_height, atr)
                     tp1_prices[i], tp2_prices[i] = tp1, tp2
         
         # 写入结果
@@ -685,10 +757,15 @@ class BacktestEngine:
             lookback_period=config.lookback_period,
             stop_loss_atr_multiplier=config.stop_loss_atr_multiplier,
             kline_interval=config.interval,
+            use_adaptive_ema=config.use_adaptive_ema,
             use_htf_filter_for_h2l2=config.use_htf_filter_for_h2l2,
             skip_h2l2_validation=config.skip_h2l2_validation,
             h2l2_only=config.h2l2_only,
             no_filters=config.no_filters,
+            tick_size=config.tick_size,
+            use_signal_bar_only_stop=config.use_signal_bar_only_stop,
+            trader_equation_enabled=config.trader_equation_enabled,
+            trader_equation_win_rate=config.trader_equation_win_rate,
         )
         
         # 交易状态
@@ -1313,7 +1390,9 @@ async def main():
     parser.add_argument("--end", type=str, default="2024-12-31", help="结束日期")
     parser.add_argument("--capital", type=float, default=1000.0, help="初始资金")
     parser.add_argument("--leverage", type=int, default=20, help="杠杆倍数")
-    parser.add_argument("--sl-atr", type=float, default=2.0, help="止损ATR乘数（默认2.0）")
+    parser.add_argument("--sl-atr", type=float, default=2.0, help="止损ATR乘数（两棒+ATR模式时使用）")
+    parser.add_argument("--tick-size", type=float, default=0.01, help="合约最小价格步长（信号棒极值±TickSize）")
+    parser.add_argument("--no-signal-bar-stop", action="store_true", help="使用两棒+ATR止损而非信号棒极值±TickSize")
     parser.add_argument("--export", action="store_true", help="导出交易记录到CSV")
     parser.add_argument("--plot", action="store_true", help="生成权益曲线图")
     parser.add_argument("--verbose", action="store_true", help="详细日志")
@@ -1336,7 +1415,11 @@ async def main():
         end_date=args.end,
         initial_capital=args.capital,
         leverage=args.leverage,
-        stop_loss_atr_multiplier=args.sl_atr
+        stop_loss_atr_multiplier=args.sl_atr,
+        tick_size=getattr(args, "tick_size", 0.01),
+        use_signal_bar_only_stop=not getattr(args, "no_signal_bar_stop", False),
+        trader_equation_enabled=True,
+        trader_equation_win_rate=0.4,
     )
     
     # 创建回测引擎

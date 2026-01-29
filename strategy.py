@@ -35,8 +35,8 @@ from dataclasses import dataclass, field
 
 import redis.asyncio as aioredis
 
-# ⭐ 提前导入 MarketState，供 dataclass 使用
-from logic.market_analyzer import MarketState
+# ⭐ 提前导入 MarketState、MarketCycle，供 dataclass 使用
+from logic.market_analyzer import MarketState, MarketCycle
 
 
 # ============================================================================
@@ -60,6 +60,7 @@ class BarContext:
     
     # 市场状态
     market_state: MarketState        # 市场状态枚举
+    market_cycle: MarketCycle        # 市场周期状态机：Spike / Channel / TradingRange
     trend_direction: Optional[str]   # 趋势方向 ("up"/"down"/None)
     trend_strength: float            # 趋势强度 (0-1)
     tight_channel_score: float       # 紧凑通道评分
@@ -69,6 +70,10 @@ class BarContext:
     is_strong_trend_mode: bool       # 是否是强趋势模式
     allowed_side: Optional[str]      # 允许的交易方向 ("buy"/"sell"/None)
     is_latest_bar: bool              # 是否是最新K线
+    
+    # 力量维度（Volume/OI，用于有效突破确认）
+    volume: Optional[float] = None    # 当根 K 线成交量
+    avg_volume: Optional[float] = None  # 近期均量（用于放量确认）
 
 
 @dataclass
@@ -157,7 +162,7 @@ from logic.talib_patterns import (
     TALibPatternDetector,
     TALIB_AVAILABLE,
 )
-from logic.talib_indicators import compute_ema, compute_atr
+from logic.talib_indicators import compute_ema, compute_atr, compute_ema_adaptive
 
 # 导入动态订单流模块
 from delta_flow import (
@@ -188,27 +193,40 @@ class AlBrooksStrategy:
     """
 
     def __init__(
-        self, 
-        ema_period: int = 20, 
-        lookback_period: int = 20, 
+        self,
+        ema_period: int = 20,
+        lookback_period: int = 20,
         redis_url: Optional[str] = None,
-        kline_interval: str = "5m"
+        kline_interval: str = "5m",
+        use_adaptive_ema: bool = True,
+        use_signal_bar_only_stop: Optional[bool] = None,
+        tick_size: Optional[float] = None,
     ):
         self.ema_period = ema_period
         self.lookback_period = lookback_period
         self.kline_interval = kline_interval
+        self.use_adaptive_ema = use_adaptive_ema
+        try:
+            from config import USE_SIGNAL_BAR_ONLY_STOP, TICK_SIZE
+            self._use_signal_bar_only_stop = use_signal_bar_only_stop if use_signal_bar_only_stop is not None else USE_SIGNAL_BAR_ONLY_STOP
+            self._tick_size = tick_size if tick_size is not None else TICK_SIZE
+        except ImportError:
+            self._use_signal_bar_only_stop = use_signal_bar_only_stop if use_signal_bar_only_stop is not None else True
+            self._tick_size = tick_size if tick_size is not None else 0.01
         
         # 加载周期自适应参数
         self._params: IntervalParams = get_interval_params(kline_interval)
         
-        # 初始化模块化组件（传入周期参数）
+        # 初始化模块化组件（传入周期参数与止损模式）
         self.market_analyzer = MarketAnalyzer(
-            ema_period=ema_period, 
+            ema_period=ema_period,
             kline_interval=kline_interval
         )
         self.pattern_detector = PatternDetector(
             lookback_period=lookback_period,
-            kline_interval=kline_interval
+            kline_interval=kline_interval,
+            use_signal_bar_only_stop=self._use_signal_bar_only_stop,
+            tick_size=self._tick_size,
         )
         
         # 信号冷却期管理（周期自适应）
@@ -237,8 +255,8 @@ class AlBrooksStrategy:
             logging.warning("⚠️ TA-Lib 不可用，形态增强功能已禁用")
         
         logging.info(
-            f"策略已初始化: EMA周期={ema_period}, K线周期={kline_interval}, "
-            f"Delta窗口={self.delta_analyzer.WINDOW_SECONDS}秒, "
+            f"策略已初始化: EMA周期={ema_period}{'(自适应σ)' if use_adaptive_ema else ''}, "
+            f"K线周期={kline_interval}, Delta窗口={self.delta_analyzer.WINDOW_SECONDS}秒, "
             f"信号冷却={self.SIGNAL_COOLDOWN_BARS}根K线, "
             f"HTF过滤=1h EMA20, TA-Lib={'启用' if TALIB_AVAILABLE else '禁用'}"
         )
@@ -268,11 +286,11 @@ class AlBrooksStrategy:
         """
         # 定义各方向的信号类型
         buy_signals = [
-            "Spike_Buy", "FailedBreakout_Buy", "Climax_Buy", 
+            "Spike_Buy", "FailedBreakout_Buy", "Wedge_FailedBreakout_Buy", "Climax_Buy",
             "Wedge_Buy", "H1_Buy", "H2_Buy"
         ]
         sell_signals = [
-            "Spike_Sell", "FailedBreakout_Sell", "Climax_Sell", 
+            "Spike_Sell", "FailedBreakout_Sell", "Wedge_FailedBreakout_Sell", "Climax_Sell",
             "Wedge_Sell", "L1_Sell", "L2_Sell"
         ]
         
@@ -353,7 +371,16 @@ class AlBrooksStrategy:
             self._redis_connected = False
 
     def _compute_ema(self, df: pd.DataFrame) -> pd.Series:
-        """计算 EMA (使用 TA-Lib)"""
+        """计算 EMA：自适应波动率时用 σ 调节周期，否则固定周期"""
+        if self.use_adaptive_ema:
+            return compute_ema_adaptive(
+                df["close"], df["high"], df["low"],
+                base_period=self.ema_period,
+                atr_period=14,
+                atr_lookback=50,
+                min_period=10,
+                max_period=35,
+            )
         return compute_ema(df["close"], self.ema_period)
 
     def _compute_atr(self, df: pd.DataFrame, period: int = 14) -> pd.Series:
@@ -442,6 +469,9 @@ class AlBrooksStrategy:
         # FailedBreakout：高胜率（60-70%），可用较低盈亏比
         "FailedBreakout_Buy": {"tp1_r": 0.8, "tp2_r": 1.5},
         "FailedBreakout_Sell": {"tp1_r": 0.8, "tp2_r": 1.5},
+        # Wedge+失败突破：三推楔形后假突破极值反向切入，高胜率
+        "Wedge_FailedBreakout_Buy": {"tp1_r": 0.8, "tp2_r": 1.5},
+        "Wedge_FailedBreakout_Sell": {"tp1_r": 0.8, "tp2_r": 1.5},
         
         # Climax 反转：低胜率（35-45%），需要高盈亏比
         "Climax_Buy": {"tp1_r": 1.2, "tp2_r": 3.0},
@@ -504,6 +534,11 @@ class AlBrooksStrategy:
     ) -> Tuple[float, float, float, bool]:
         """
         Al Brooks 风格分批止盈目标位（动态分时出场版）
+        
+        Measured Move (MM) 理论：
+        - 区间突破后的首选目标 = 区间高度 1:1 投影，即 measured_move = entry ± base_height。
+        - base_height 为区间宽度或前段波动长度，TP2 取 measured_move 与 R 倍数目标中较有利者。
+        - 不同信号类型可通过 SIGNAL_RR_RATIO 区分 MM 比例（如 Failed Breakout 使用 0.8:1）。
         
         根据市场状态动态调整 TP2：
         - TightChannel: TP2 延长至 RR 3:1（让利润奔跑）
@@ -671,6 +706,8 @@ class AlBrooksStrategy:
         
         # 检测市场状态
         market_state = self.market_analyzer.detect_market_state(data, i, ema)
+        # 市场周期状态机（Spike / Channel / Trading Range）
+        market_cycle = self.market_analyzer.get_market_cycle(data, i, ema, market_state)
         
         # 获取趋势方向和强度
         trend_direction = self.market_analyzer.get_trend_direction()
@@ -699,6 +736,19 @@ class AlBrooksStrategy:
             elif tight_channel_direction == "down" or trend_direction == "down":
                 allowed_side = "sell"
         
+        # 力量维度：成交量（用于有效突破确认，可选）
+        volume: Optional[float] = None
+        avg_volume: Optional[float] = None
+        if "volume" in data.columns and i < len(data):
+            try:
+                volume = float(data.iloc[i]["volume"])
+                lookback = 20
+                start = max(0, i - lookback)
+                if start < i:
+                    avg_volume = float(data["volume"].iloc[start:i].mean())
+            except (TypeError, ValueError, KeyError):
+                pass
+        
         return BarContext(
             i=i,
             close=close,
@@ -707,6 +757,7 @@ class AlBrooksStrategy:
             ema=ema,
             atr=atr,
             market_state=market_state,
+            market_cycle=market_cycle,
             trend_direction=trend_direction,
             trend_strength=trend_strength,
             tight_channel_score=tight_channel_score,
@@ -714,20 +765,73 @@ class AlBrooksStrategy:
             is_strong_trend_mode=is_strong_trend_mode,
             allowed_side=allowed_side,
             is_latest_bar=(i == total_bars - 1),
+            volume=volume,
+            avg_volume=avg_volume,
         )
     
+    def _volume_confirms_breakout(self, ctx: BarContext) -> bool:
+        """
+        成交量确认突破：当次或近期成交量 > 近期均量×系数时，视为有效突破。
+        可选过滤，默认关闭；开启后仅对突破类信号（如 Spike）要求放量。
+        """
+        try:
+            from config import VOLUME_BREAKOUT_CONFIRM_ENABLED, VOLUME_BREAKOUT_MULTIPLIER
+            if not VOLUME_BREAKOUT_CONFIRM_ENABLED:
+                return True
+            mult = VOLUME_BREAKOUT_MULTIPLIER
+        except ImportError:
+            return True
+        if ctx.volume is None or ctx.avg_volume is None or ctx.avg_volume <= 0:
+            return True  # 无成交量数据时不拦截
+        return ctx.volume >= ctx.avg_volume * mult
+    
+    def _satisfies_trader_equation(
+        self,
+        entry_price: float,
+        stop_loss: float,
+        tp1: float,
+        tp2: float,
+        tp1_close_ratio: float,
+        side: str,
+        win_rate: Optional[float] = None,
+    ) -> bool:
+        """
+        交易者方程：WinRate × Reward > Risk 时才允许交易。
+        若信号棒过大导致止损过远、盈亏比不足，则跳过该笔交易。
+        """
+        try:
+            from config import TRADER_EQUATION_ENABLED, TRADER_EQUATION_WIN_RATE
+            if not TRADER_EQUATION_ENABLED:
+                return True
+            wr = win_rate if win_rate is not None else TRADER_EQUATION_WIN_RATE
+        except ImportError:
+            return True
+        risk = abs(entry_price - stop_loss)
+        if risk <= 0:
+            return True
+        if side == "buy":
+            reward = tp1_close_ratio * (tp1 - entry_price) + (1.0 - tp1_close_ratio) * (tp2 - entry_price)
+        else:
+            reward = tp1_close_ratio * (entry_price - tp1) + (1.0 - tp1_close_ratio) * (entry_price - tp2)
+        if reward <= 0:
+            return False
+        return (wr * reward) > risk
+    
     def _record_signal(
-        self, 
-        arrays: SignalArrays, 
-        i: int, 
+        self,
+        arrays: SignalArrays,
+        i: int,
         result: SignalResult,
         market_state_value: str,
         tight_channel_score: float,
         tp1: float,
         tp2: float,
+        entry_price: float,
+        data: Optional[pd.DataFrame] = None,
+        atr: Optional[float] = None,
     ) -> None:
         """
-        记录信号到结果数组
+        记录信号到结果数组。入场前校验交易者方程与插针过滤，不满足则跳过。
         
         Args:
             arrays: 信号数组集合
@@ -736,7 +840,25 @@ class AlBrooksStrategy:
             market_state_value: 市场状态字符串
             tight_channel_score: 紧凑通道评分
             tp1, tp2: 止盈价格
+            entry_price: 入场价（用于交易者方程）
+            data: 用于插针检测的 DataFrame（可选）
+            atr: 当前 ATR（用于插针检测，可选）
         """
+        # 插针过滤：信号棒（前一根）为疑似插针则跳过
+        if data is not None and atr is not None and i >= 1:
+            if self.pattern_detector.is_likely_wick_bar(data, i - 1, atr):
+                logging.debug(
+                    f"⏭ 插针过滤跳过: {result.signal_type} {result.side} bar={i-1}（疑似插针）"
+                )
+                return
+        if not self._satisfies_trader_equation(
+            entry_price, result.stop_loss, tp1, tp2, result.tp1_close_ratio, result.side
+        ):
+            logging.debug(
+                f"⏭ 交易者方程不满足跳过: {result.signal_type} {result.side}, "
+                f"entry={entry_price:.2f}, SL={result.stop_loss:.2f}, Risk过大或Reward不足"
+            )
+            return
         arrays.signals[i] = result.signal_type
         arrays.sides[i] = result.side
         arrays.stops[i] = result.stop_loss
@@ -776,9 +898,16 @@ class AlBrooksStrategy:
         if ctx.market_state != MarketState.TRADING_RANGE or ctx.is_strong_trend_mode:
             return None
         
-        result = self.pattern_detector.detect_failed_breakout(
+        # 交易区间 BLSH：降低信号棒准入门槛
+        relaxed_signal_bar = ctx.market_cycle == MarketCycle.TRADING_RANGE
+        result = self.pattern_detector.detect_wedge_failed_breakout(
             data, ctx.i, ctx.ema, ctx.atr, ctx.market_state
         )
+        if not result:
+            result = self.pattern_detector.detect_failed_breakout(
+                data, ctx.i, ctx.ema, ctx.atr, ctx.market_state,
+                relaxed_signal_bar=relaxed_signal_bar,
+            )
         
         if not result:
             return None
@@ -856,6 +985,12 @@ class AlBrooksStrategy:
                     f"🚫 强趋势只顺势: {signal_type} {side} 被禁止 - "
                     f"趋势={ctx.trend_direction}，只允许{ctx.allowed_side}"
                 )
+            return None
+        
+        # 成交量确认突破（可选）：有效突破需放量
+        if not self._volume_confirms_breakout(ctx):
+            if ctx.is_latest_bar:
+                logging.debug(f"⏭ 成交量未确认突破跳过: {signal_type} {side}（未达均量倍数）")
             return None
         
         if ctx.is_latest_bar and is_high_risk:
@@ -949,8 +1084,10 @@ class AlBrooksStrategy:
         if ctx.is_strong_trend_mode:
             return None
         
+        relaxed_signal_bar = ctx.market_cycle == MarketCycle.TRADING_RANGE
         result = self.pattern_detector.detect_wedge_reversal(
-            data, ctx.i, ctx.ema, ctx.atr, ctx.market_state
+            data, ctx.i, ctx.ema, ctx.atr, ctx.market_state,
+            relaxed_signal_bar=relaxed_signal_bar,
         )
         
         if not result:
@@ -1018,10 +1155,22 @@ class AlBrooksStrategy:
         if self._check_signal_cooldown(h2_signal.signal_type, h2_signal.side, ctx.i, ctx.is_latest_bar):
             return None
         
-        # 信号棒质量验证
-        bar_valid, bar_reason = self.pattern_detector.validate_btc_signal_bar(
-            data.iloc[ctx.i], h2_signal.side
-        )
+        # HTF 背景硬过滤（Al Brooks：背景胜过一切，5m 做多需 1h 强多头且价格回调至 1h EMA20 附近）
+        allowed, reason = self.htf_filter.allows_h2_buy(ctx.close)
+        if not allowed:
+            if ctx.is_latest_bar:
+                logging.info(f"🚫 H2 背景过滤: {reason}")
+            return None
+        
+        # 信号棒质量验证（交易区间 BLSH 时降低门槛）
+        if ctx.market_cycle == MarketCycle.TRADING_RANGE:
+            bar_valid, bar_reason = self.pattern_detector.validate_btc_signal_bar(
+                data.iloc[ctx.i], h2_signal.side, min_body_ratio=0.40, close_position_pct=0.35
+            )
+        else:
+            bar_valid, bar_reason = self.pattern_detector.validate_btc_signal_bar(
+                data.iloc[ctx.i], h2_signal.side
+            )
         if not bar_valid:
             if ctx.is_latest_bar:
                 logging.info(f"🚫 H2信号棒质量不合格: {h2_signal.signal_type} - {bar_reason}")
@@ -1112,10 +1261,22 @@ class AlBrooksStrategy:
         if self._check_signal_cooldown(l2_signal.signal_type, l2_signal.side, ctx.i, ctx.is_latest_bar):
             return None
         
-        # 信号棒质量验证
-        bar_valid, bar_reason = self.pattern_detector.validate_btc_signal_bar(
-            data.iloc[ctx.i], l2_signal.side
-        )
+        # HTF 背景硬过滤（Al Brooks：背景胜过一切，5m 做空需 1h 强空头且价格反弹至 1h EMA20 附近）
+        allowed, reason = self.htf_filter.allows_l2_sell(ctx.close)
+        if not allowed:
+            if ctx.is_latest_bar:
+                logging.info(f"🚫 L2 背景过滤: {reason}")
+            return None
+        
+        # 信号棒质量验证（交易区间 BLSH 时降低门槛）
+        if ctx.market_cycle == MarketCycle.TRADING_RANGE:
+            bar_valid, bar_reason = self.pattern_detector.validate_btc_signal_bar(
+                data.iloc[ctx.i], l2_signal.side, min_body_ratio=0.40, close_position_pct=0.35
+            )
+        else:
+            bar_valid, bar_reason = self.pattern_detector.validate_btc_signal_bar(
+                data.iloc[ctx.i], l2_signal.side
+            )
         if not bar_valid:
             if ctx.is_latest_bar:
                 logging.info(f"🚫 L2信号棒质量不合格: {l2_signal.signal_type} - {bar_reason}")
@@ -1304,7 +1465,7 @@ class AlBrooksStrategy:
                         base_height=base_height, tp1_close_ratio=tp1_ratio, is_climax=is_climax,
                         entry_mode="Limit_Entry", is_high_risk=is_high_risk
                     )
-                    self._record_signal(arrays, i, result, ctx.market_state.value, ctx.tight_channel_score, tp1, tp2)
+                    self._record_signal(arrays, i, result, ctx.market_state.value, ctx.tight_channel_score, tp1, tp2, limit_price, data, ctx.atr)
                     self._update_signal_cooldown(signal_type, i)
                     pending_spike = None
                     if side == "buy":
@@ -1320,8 +1481,12 @@ class AlBrooksStrategy:
                 elif i - spike_idx > 5:
                     pending_spike = None
             
-            # ---------- 优先级1: Failed Breakout ----------
-            fb_result = self._check_failed_breakout(data, ctx)
+            # ---------- 市场周期：尖峰阶段 Always In，忽略小回调，不触发反转（FB/Wedge）----------
+            # ---------- 优先级1: Failed Breakout（仅在非 Spike 周期）----------
+            if ctx.market_cycle != MarketCycle.SPIKE:
+                fb_result = self._check_failed_breakout(data, ctx)
+            else:
+                fb_result = None
             if fb_result:
                 # 应用 HTF 权重调节（v2.0 软过滤）
                 htf_modifier = cached_htf_buy_modifier if fb_result.side == "buy" else cached_htf_sell_modifier
@@ -1337,7 +1502,7 @@ class AlBrooksStrategy:
                 )
                 fb_result.tp1_close_ratio = tp1_ratio
                 fb_result.is_climax = is_climax
-                self._record_signal(arrays, i, fb_result, ctx.market_state.value, ctx.tight_channel_score, tp1, tp2)
+                self._record_signal(arrays, i, fb_result, ctx.market_state.value, ctx.tight_channel_score, tp1, tp2, ctx.close, data, ctx.atr)
                 self._update_signal_cooldown(fb_result.signal_type, i)
                 continue
             
@@ -1394,7 +1559,7 @@ class AlBrooksStrategy:
                         )
                         spike_result.tp1_close_ratio = tp1_ratio
                         spike_result.is_climax = is_climax
-                        self._record_signal(arrays, i, spike_result, ctx.market_state.value, ctx.tight_channel_score, tp1, tp2)
+                        self._record_signal(arrays, i, spike_result, ctx.market_state.value, ctx.tight_channel_score, tp1, tp2, ctx.close, data, ctx.atr)
                         self._update_signal_cooldown(spike_result.signal_type, i)
                         if spike_result.side == "buy":
                             h2_machine.set_strong_trend()
@@ -1419,12 +1584,15 @@ class AlBrooksStrategy:
                 )
                 climax_result.tp1_close_ratio = tp1_ratio
                 climax_result.is_climax = is_climax
-                self._record_signal(arrays, i, climax_result, ctx.market_state.value, ctx.tight_channel_score, tp1, tp2)
+                self._record_signal(arrays, i, climax_result, ctx.market_state.value, ctx.tight_channel_score, tp1, tp2, ctx.close, data, ctx.atr)
                 self._update_signal_cooldown(climax_result.signal_type, i)
                 continue
             
-            # ---------- 优先级4: Wedge 反转 ----------
-            wedge_result = self._check_wedge(data, ctx)
+            # ---------- 优先级4: Wedge 反转（仅在非 Spike 周期；TR 周期降低信号棒门槛）----------
+            if ctx.market_cycle != MarketCycle.SPIKE:
+                wedge_result = self._check_wedge(data, ctx)
+            else:
+                wedge_result = None
             if wedge_result:
                 # Wedge_Buy 专用：Delta 背离（价格新低但卖压减弱）则强度 +0.3
                 if wedge_result.signal_type == "Wedge_Buy" and ctx.is_latest_bar:
@@ -1471,7 +1639,7 @@ class AlBrooksStrategy:
                     )
                 wedge_result.tp1_close_ratio = tp1_ratio
                 wedge_result.is_climax = is_climax
-                self._record_signal(arrays, i, wedge_result, ctx.market_state.value, ctx.tight_channel_score, tp1, tp2)
+                self._record_signal(arrays, i, wedge_result, ctx.market_state.value, ctx.tight_channel_score, tp1, tp2, ctx.close, data, ctx.atr)
                 self._update_signal_cooldown(wedge_result.signal_type, i)
                 continue
             
@@ -1506,7 +1674,7 @@ class AlBrooksStrategy:
                     )
                     h2_result.tp1_close_ratio = tp1_ratio
                     h2_result.is_climax = is_climax
-                    self._record_signal(arrays, i, h2_result, ctx.market_state.value, ctx.tight_channel_score, tp1, tp2)
+                    self._record_signal(arrays, i, h2_result, ctx.market_state.value, ctx.tight_channel_score, tp1, tp2, ctx.close, data, ctx.atr)
                     self._update_signal_cooldown(h2_result.signal_type, i)
             
             # L2 信号处理（允许所有方向，通过权重调节）
@@ -1529,7 +1697,7 @@ class AlBrooksStrategy:
                     )
                     l2_result.tp1_close_ratio = tp1_ratio
                     l2_result.is_climax = is_climax
-                    self._record_signal(arrays, i, l2_result, ctx.market_state.value, ctx.tight_channel_score, tp1, tp2)
+                    self._record_signal(arrays, i, l2_result, ctx.market_state.value, ctx.tight_channel_score, tp1, tp2, ctx.close, data, ctx.atr)
                     self._update_signal_cooldown(l2_result.signal_type, i)
         
         # ========== Step 5: 应用 TA-Lib 形态加成 ==========

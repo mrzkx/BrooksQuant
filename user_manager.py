@@ -625,6 +625,77 @@ class TradingUser:
             logging.error(f"[{self.name}] 取消挂单失败: {e}", exc_info=True)
             return False
 
+    async def get_order_book_best_prices(self, symbol: str, limit: int = 5) -> tuple[float, float]:
+        """
+        获取订单簿最优买卖价（用于限价开仓）
+        
+        Args:
+            symbol: 交易对（如 "BTCUSDT"）
+            limit: 深度档位（5/10/20/50/100，默认 5 档即可取最优价）
+        
+        Returns:
+            (best_bid, best_ask): 最优买一价、最优卖一价
+        
+        Raises:
+            RuntimeError: 客户端未连接或订单簿为空
+        """
+        if self.client is None:
+            raise RuntimeError(f"用户 {self.name} 尚未连接客户端")
+        
+        try:
+            depth = await self.client.futures_order_book(symbol=symbol, limit=limit)
+            bids = depth.get("bids", [])
+            asks = depth.get("asks", [])
+            if not bids or not asks:
+                raise RuntimeError(f"[{self.name}] 订单簿为空: {symbol}")
+            best_bid = float(bids[0][0])
+            best_ask = float(asks[0][0])
+            logging.debug(f"[{self.name}] 订单簿最优价 {symbol}: bid={best_bid}, ask={best_ask}")
+            return (best_bid, best_ask)
+        except Exception as e:
+            logging.error(f"[{self.name}] 获取订单簿失败: {e}", exc_info=True)
+            raise
+
+    async def get_limit_price_from_order_book(
+        self,
+        symbol: str,
+        side: str,
+        offset_pct: float = 0.0,
+        offset_ticks: int = 0,
+    ) -> float:
+        """
+        根据订单簿最优价得到开仓限价（并符合 tickSize）。
+        支持追价限价单（Marketable Limit）：买 Ask+偏移、卖 Bid-偏移，提高成交优先级并限制滑点。
+        
+        - 买入：best_ask + offset（偏移为正时更易成交）
+        - 卖出：best_bid - offset
+        
+        Args:
+            symbol: 交易对
+            side: "BUY" 或 "SELL"
+            offset_pct: 偏移百分比（如 0.05 表示 0.05%），与 offset_ticks 二选一
+            offset_ticks: 偏移 tick 数（与 offset_pct 二选一）
+        
+        Returns:
+            符合 tickSize 的限价
+        """
+        best_bid, best_ask = await self.get_order_book_best_prices(symbol)
+        filters = self._symbol_filters.get(symbol, {"tickSize": 0.01})
+        tick_size = float(filters.get("tickSize", 0.01))
+        if side.upper() == "BUY":
+            price = best_ask
+            if offset_ticks > 0:
+                price = price + tick_size * offset_ticks
+            elif offset_pct > 0:
+                price = price * (1.0 + offset_pct / 100.0)
+        else:
+            price = best_bid
+            if offset_ticks > 0:
+                price = price - tick_size * offset_ticks
+            elif offset_pct > 0:
+                price = price * (1.0 - offset_pct / 100.0)
+        return self.round_tick_size(price, tick_size)
+
     async def create_market_order(
         self,
         symbol: str,

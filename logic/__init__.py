@@ -7,12 +7,13 @@ Al Brooks 价格行为策略模块
 - state_machines: H2/L2 状态机管理
 """
 
-from .market_analyzer import MarketState, MarketAnalyzer
+from .market_analyzer import MarketState, MarketCycle, MarketAnalyzer
 from .patterns import PatternDetector
 from .state_machines import HState, LState, H2StateMachine, L2StateMachine
 
 __all__ = [
     "MarketState",
+    "MarketCycle",
     "MarketAnalyzer", 
     "PatternDetector",
     "HState",

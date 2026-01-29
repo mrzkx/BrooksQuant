@@ -15,7 +15,7 @@ import logging
 from decimal import Decimal, ROUND_DOWN
 from typing import Dict
 
-from config import SYMBOL as CONFIG_SYMBOL
+from config import SYMBOL as CONFIG_SYMBOL, ORDER_PRICE_OFFSET_PCT, ORDER_PRICE_OFFSET_TICKS
 from trade_logger import TradeLogger
 from user_manager import TradingUser
 
@@ -42,6 +42,40 @@ def _extract_signal_params(signal: Dict) -> Dict:
         "is_climax_bar": signal.get("is_climax_bar", False),
         "move_stop_to_breakeven_at_tp1": signal.get("move_stop_to_breakeven_at_tp1", False),
     }
+
+
+def _satisfies_trader_equation(signal: Dict) -> bool:
+    """
+    交易者方程：WinRate × Reward > Risk 时才允许执行。
+    入场前校验，若信号棒过大导致止损过远、盈亏比不足则跳过。
+    """
+    try:
+        from config import TRADER_EQUATION_ENABLED, TRADER_EQUATION_WIN_RATE
+        if not TRADER_EQUATION_ENABLED:
+            return True
+        win_rate = TRADER_EQUATION_WIN_RATE
+    except ImportError:
+        return True
+    entry = float(signal.get("price", 0))
+    stop_loss = float(signal.get("stop_loss", 0))
+    params = _extract_signal_params(signal)
+    tp1 = params.get("tp1_price")
+    tp2 = params.get("tp2_price")
+    tp1_close_ratio = float(params.get("tp1_close_ratio", 0.5))
+    side = (signal.get("side") or "").lower()
+    if not tp1 or not tp2 or entry <= 0:
+        return True
+    tp1, tp2 = float(tp1), float(tp2)
+    risk = abs(entry - stop_loss)
+    if risk <= 0:
+        return True
+    if side == "buy":
+        reward = tp1_close_ratio * (tp1 - entry) + (1.0 - tp1_close_ratio) * (tp2 - entry)
+    else:
+        reward = tp1_close_ratio * (entry - tp1) + (1.0 - tp1_close_ratio) * (entry - tp2)
+    if reward <= 0:
+        return False
+    return (win_rate * reward) > risk
 
 
 def round_quantity_to_step_size(quantity: float, step_size: float = 0.001) -> float:
@@ -89,6 +123,14 @@ async def execute_observe_order(
         trade_logger: 交易日志器
         calculate_order_quantity_func: 计算下单数量的函数
     """
+    # 交易者方程：WinRate×Reward>Risk 不满足则跳过
+    if not _satisfies_trader_equation(signal):
+        logging.info(
+            f"[{user.name}] ⏭ 交易者方程不满足跳过: {signal.get('signal')} {signal.get('side')}, "
+            "Risk过大或Reward不足"
+        )
+        return
+    
     # 提取信号参数（使用公共函数避免重复）
     params = _extract_signal_params(signal)
     
@@ -155,104 +197,74 @@ async def execute_live_order(
     Returns:
         bool: 是否成功
     """
+    # 交易者方程：WinRate×Reward>Risk 不满足则跳过
+    if not _satisfies_trader_equation(signal):
+        logging.info(
+            f"[{user.name}] ⏭ 交易者方程不满足跳过: {signal.get('signal')} {signal.get('side')}, "
+            "Risk过大或Reward不足"
+        )
+        return False
+    
     # 提取信号参数（使用公共函数避免重复）
     params = _extract_signal_params(signal)
     
-    # 判断信号类型
     signal_type = signal["signal"]
     
-    # 突破型信号：需要快速入场，使用市价单
-    BREAKOUT_SIGNALS = [
-        "Spike_Buy", "Spike_Sell", 
-        "Failed_Breakout_Buy", "Failed_Breakout_Sell",
-        "Climax_Buy", "Climax_Sell"
-    ]
-    
-    is_breakout_signal = signal_type in BREAKOUT_SIGNALS
-    
     try:
-        if is_breakout_signal:
-            # ===== 突破型信号：市价入场 =====
-            logging.info(
-                f"[{user.name}] 🚀 执行市价入场（突破型）: "
-                f"{signal_type} {signal['side'].upper()} @ 市价, 数量={order_qty:.4f} BTC, "
-                f"持仓价值≈{position_value:.2f} USDT"
-            )
-            
-            entry_response = await user.create_market_order(
-                symbol=SYMBOL,
-                side=signal["side"].upper(),
-                quantity=order_qty,
-                reduce_only=False,
-            )
-            
-            order_id = entry_response.get("orderId")
-            order_status = entry_response.get("status", "FILLED")
-            
-            logging.info(f"[{user.name}] 市价开仓单已成交: ID={order_id}, 状态={order_status}")
-            
-            # 获取实际成交价
-            avg_price = entry_response.get("avgPrice", "0")
-            actual_price = float(avg_price) if avg_price and float(avg_price) > 0 else float(signal["price"])
+        # ===== 所有信号统一：追价限价单（订单簿最优价 + 可选偏移）=====
+        limit_price = await user.get_limit_price_from_order_book(
+            SYMBOL,
+            signal["side"].upper(),
+            offset_pct=ORDER_PRICE_OFFSET_PCT,
+            offset_ticks=ORDER_PRICE_OFFSET_TICKS,
+        )
+        
+        logging.info(
+            f"[{user.name}] 🎯 执行限价开仓（追价限价单 offset_pct={ORDER_PRICE_OFFSET_PCT} ticks={ORDER_PRICE_OFFSET_TICKS}）: "
+            f"{signal_type} {signal['side'].upper()} @ {limit_price:.2f}, 数量={order_qty:.4f} BTC, "
+            f"持仓价值≈{position_value:.2f} USDT"
+        )
+        
+        entry_response = await user.create_limit_order(
+            symbol=SYMBOL,
+            side=signal["side"].upper(),
+            quantity=order_qty,
+            price=limit_price,
+            time_in_force="GTC",
+        )
+        
+        order_id = entry_response.get("orderId")
+        order_status = entry_response.get("status", "NEW")
+        
+        logging.info(f"[{user.name}] 限价开仓单已提交: ID={order_id}, 状态={order_status}")
+        
+        # 等待限价单成交（超时60秒）
+        if order_status == "NEW":
+            try:
+                entry_response = await user.wait_for_order_fill(
+                    symbol=SYMBOL,
+                    order_id=order_id,
+                    timeout_seconds=60.0,
+                    poll_interval=2.0,
+                )
+                order_status = entry_response.get("status", "FILLED")
+                logging.info(f"[{user.name}] 限价单成交确认: 状态={order_status}")
+            except TimeoutError:
+                logging.warning(f"[{user.name}] 限价单超时未成交，跳过此信号")
+                return False
+            except Exception as wait_err:
+                logging.error(f"[{user.name}] 等待限价单成交出错: {wait_err}")
+                return False
+        
+        # 实际成交价
+        price = entry_response.get("price", "0")
+        avg_price = entry_response.get("avgPrice", "0")
+        if avg_price and float(avg_price) > 0:
+            actual_price = float(avg_price)
+        elif price and float(price) > 0:
+            actual_price = float(price)
         else:
-            # ===== 回撤型信号：限价入场 =====
-            signal_atr = signal.get("atr")
-            
-            limit_price = user.calculate_limit_price(
-                current_price=signal["price"],
-                side=signal["side"],
-                slippage_pct=0.05,
-                symbol=SYMBOL,
-                atr=signal_atr,
-            )
-            
-            logging.info(
-                f"[{user.name}] 🎯 执行限价入场（回撤型）: "
-                f"{signal_type} {signal['side'].upper()} @ {limit_price:.2f}, 数量={order_qty:.4f} BTC, "
-                f"持仓价值≈{position_value:.2f} USDT"
-            )
-            
-            entry_response = await user.create_limit_order(
-                symbol=SYMBOL,
-                side=signal["side"].upper(),
-                quantity=order_qty,
-                price=limit_price,
-                time_in_force="GTC",
-            )
-            
-            order_id = entry_response.get("orderId")
-            order_status = entry_response.get("status", "NEW")
-            
-            logging.info(f"[{user.name}] 限价开仓单已提交: ID={order_id}, 状态={order_status}")
-            
-            # 等待限价单成交（超时60秒）
-            if order_status == "NEW":
-                try:
-                    entry_response = await user.wait_for_order_fill(
-                        symbol=SYMBOL,
-                        order_id=order_id,
-                        timeout_seconds=60.0,
-                        poll_interval=2.0,
-                    )
-                    order_status = entry_response.get("status", "FILLED")
-                    logging.info(f"[{user.name}] 限价单成交确认: 状态={order_status}")
-                except TimeoutError:
-                    logging.warning(f"[{user.name}] 限价单超时未成交，跳过此信号")
-                    return False
-                except Exception as wait_err:
-                    logging.error(f"[{user.name}] 等待限价单成交出错: {wait_err}")
-                    return False
-            
-            # 获取实际成交价（限价单可能还未成交）
-            price = entry_response.get("price", "0")
-            avg_price = entry_response.get("avgPrice", "0")
-            # 优先使用成交均价，其次使用限价，最后使用信号价格
-            if avg_price and float(avg_price) > 0:
-                actual_price = float(avg_price)
-            elif price and float(price) > 0:
-                actual_price = float(price)
-            else:
-                actual_price = limit_price
+            actual_price = limit_price
         
         actual_qty = float(entry_response.get("origQty", order_qty))
         
@@ -311,23 +323,22 @@ async def execute_live_order(
         
         # 日志输出
         status_emoji = "✅" if order_status == "FILLED" else "📝"
-        order_type_text = "市价单" if is_breakout_signal else "限价单"
         status_text = "已成交" if order_status == "FILLED" else f"挂单中({order_status})"
         
         if params["tp1_price"] and params["tp2_price"]:
             logging.info(
-                f"[{user.name}] {status_emoji} 实盘{order_type_text}{status_text}: {signal['signal']} {signal['side']} @ {actual_price:.2f}, "
+                f"[{user.name}] {status_emoji} 实盘限价单{status_text}: {signal['signal']} {signal['side']} @ {actual_price:.2f}, "
                 f"数量={actual_qty:.4f} BTC, 止损={signal['stop_loss']:.2f}, "
                 f"TP1={params['tp1_price']:.2f}(50%), TP2={params['tp2_price']:.2f}(50%) [K线动态退出]"
             )
         else:
             logging.info(
-                f"[{user.name}] {status_emoji} 实盘{order_type_text}{status_text}: {signal['signal']} {signal['side']} @ {actual_price:.2f}, "
+                f"[{user.name}] {status_emoji} 实盘限价单{status_text}: {signal['signal']} {signal['side']} @ {actual_price:.2f}, "
                 f"数量={actual_qty:.4f} BTC, 止损={signal['stop_loss']:.2f}, 止盈={signal['take_profit']:.2f} [K线动态退出]"
             )
         
         print(
-            f"[{user.name}] {status_emoji} 实盘{order_type_text}{status_text}: {signal['signal']} {signal['side']} @ {actual_price:.2f}"
+            f"[{user.name}] {status_emoji} 实盘限价单{status_text}: {signal['signal']} {signal['side']} @ {actual_price:.2f}"
         )
         
         return True

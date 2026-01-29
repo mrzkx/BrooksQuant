@@ -1,7 +1,7 @@
 """
 市场状态分析器
 
-负责 MarketState（含 TightChannel）的识别逻辑
+负责 MarketState（含 TightChannel）与市场周期状态机（Market Cycle）的识别逻辑
 
 Al Brooks 核心市场状态：
 - STRONG_TREND: 强劲趋势（连续同向K线，禁止逆势交易）
@@ -9,6 +9,11 @@ Al Brooks 核心市场状态：
 - CHANNEL: 通道模式，EMA附近有序运行
 - TRADING_RANGE: 交易区间，价格频繁穿越EMA
 - TIGHT_CHANNEL: 紧凑通道，强劲单边趋势（禁止反转）
+
+市场周期状态机（严格三阶段）：
+- SPIKE（尖峰）：强突破阶段，逻辑“Always In”，忽略小回调
+- CHANNEL（通道）：趋势延续，EMA 附近有序运行
+- TRADING_RANGE（交易区间）：高空低多 BLSH，自动降低信号棒准入门槛
 """
 
 import logging
@@ -26,6 +31,20 @@ class MarketState(Enum):
     CHANNEL = "Channel"
     TRADING_RANGE = "TradingRange"
     TIGHT_CHANNEL = "TightChannel"
+
+
+class MarketCycle(Enum):
+    """
+    市场周期状态机（Al Brooks 严格三阶段）
+    
+    将市场严格划分为三种周期，对应不同交易逻辑：
+    - SPIKE：尖峰阶段，Always In，忽略小回调
+    - CHANNEL：通道阶段，趋势延续
+    - TRADING_RANGE：交易区间，高空低多 BLSH，降低信号棒门槛
+    """
+    SPIKE = "Spike"           # 尖峰：强突破，Always In，忽略小回调
+    CHANNEL = "Channel"       # 通道：趋势延续
+    TRADING_RANGE = "TradingRange"  # 交易区间：BLSH，放宽信号棒
 
 
 class MarketAnalyzer:
@@ -50,6 +69,10 @@ class MarketAnalyzer:
         # 趋势方向缓存（用于禁止逆势交易）
         self._trend_direction: Optional[str] = None  # "up" / "down" / None
         self._trend_strength: float = 0.0  # 0-1
+        
+        # 市场周期状态机：滞后保持，避免尖峰/区间频繁切换
+        self._last_cycle: Optional[MarketCycle] = None
+        self._cycle_hold_bars: int = 0  # 剩余保持周期数（>0 时沿用上一周期）
         
         logging.info(
             f"📊 MarketAnalyzer 初始化: 周期={kline_interval}, "
@@ -152,6 +175,37 @@ class MarketAnalyzer:
                             return MarketState.BREAKOUT
         
         return MarketState.CHANNEL
+    
+    def get_market_cycle(
+        self, df: pd.DataFrame, i: int, ema: float, market_state: MarketState
+    ) -> MarketCycle:
+        """
+        市场周期状态机：将市场严格划分为 Spike / Channel / Trading Range。
+        
+        - Spike（尖峰）：BREAKOUT → Always In，忽略小回调
+        - Channel（通道）：STRONG_TREND / TIGHT_CHANNEL / CHANNEL
+        - Trading Range（交易区间）：TRADING_RANGE → BLSH，降低信号棒门槛
+        
+        带简单滞后：一旦进入 Spike 保持 2 根 K 线，避免尖峰与通道来回切换。
+        """
+        # 滞后：若仍在保持期内，沿用上一周期
+        if self._cycle_hold_bars > 0 and self._last_cycle is not None:
+            self._cycle_hold_bars -= 1
+            return self._last_cycle
+        
+        if market_state == MarketState.BREAKOUT:
+            cycle = MarketCycle.SPIKE
+            self._cycle_hold_bars = 2  # 尖峰后保持 2 根
+        elif market_state == MarketState.TRADING_RANGE:
+            cycle = MarketCycle.TRADING_RANGE
+            self._cycle_hold_bars = 0
+        else:
+            # STRONG_TREND, TIGHT_CHANNEL, CHANNEL
+            cycle = MarketCycle.CHANNEL
+            self._cycle_hold_bars = 0
+        
+        self._last_cycle = cycle
+        return cycle
     
     def _detect_strong_trend(self, df: pd.DataFrame, i: int, ema: float) -> Optional[MarketState]:
         """

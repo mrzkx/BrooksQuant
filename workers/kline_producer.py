@@ -349,6 +349,9 @@ def _build_signal(last, k, df) -> Dict:
         else:
             take_profit = entry_price - actual_tp_distance
 
+    # 市场周期状态机：Spike / Channel / TradingRange（由 market_state 映射）
+    market_cycle = "Spike" if market_state == "Breakout" else ("TradingRange" if market_state == "TradingRange" else "Channel")
+    
     return {
         "signal": last["signal"],
         "side": last["side"],
@@ -357,6 +360,7 @@ def _build_signal(last, k, df) -> Dict:
         "take_profit": take_profit,
         "risk_reward_ratio": risk_reward_ratio,
         "market_state": market_state,
+        "market_cycle": market_cycle,
         "signal_strength": signal_strength,
         "tp1_price": tp1_price,
         "tp2_price": tp2_price,

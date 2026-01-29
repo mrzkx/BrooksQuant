@@ -204,6 +204,15 @@ def get_trading_config() -> dict:
     - LEVERAGE: 杠杆倍数，默认 20
     - SYMBOL: 交易对，默认 BTCUSDT
     - INTERVAL: K线周期，默认 5m
+    - TICK_SIZE: 合约最小价格步长（用于动态止损 SignalBar±TickSize），默认 0.01
+    - USE_SIGNAL_BAR_ONLY_STOP: 是否使用纯信号棒止损（true=SignalBar极值±TickSize），默认 true
+    - TRADER_EQUATION_ENABLED: 是否启用交易者方程过滤（WinRate×Reward>Risk），默认 true
+    - TRADER_EQUATION_WIN_RATE: 交易者方程默认胜率（0~1），默认 0.4
+    - VOLUME_BREAKOUT_CONFIRM_ENABLED: 是否启用成交量确认突破（有效突破类信号需放量），默认 false
+    - VOLUME_BREAKOUT_MULTIPLIER: 成交量确认倍数（当根或近期量 > 均量×此值），默认 1.2
+    - OPEN_INTEREST_ENABLED: 是否启用持仓量确认（需数据源支持，当前为预留），默认 false
+    - ORDER_PRICE_OFFSET_PCT: 追价限价单偏移百分比（买 Ask+偏移/卖 Bid-偏移），默认 0.05
+    - ORDER_PRICE_OFFSET_TICKS: 追价限价单偏移 tick 数（与 ORDER_PRICE_OFFSET_PCT 二选一），默认 0
     
     动态仓位配置（资金管理）：
     - LARGE_BALANCE_THRESHOLD: 大资金阈值（USDT），默认 1000
@@ -219,6 +228,15 @@ def get_trading_config() -> dict:
     leverage_str = os.getenv("LEVERAGE", "20")
     symbol_str = os.getenv("SYMBOL", "BTCUSDT")
     interval_str = os.getenv("INTERVAL", "5m")
+    tick_size_str = os.getenv("TICK_SIZE", "0.01")
+    use_signal_bar_only_stop_str = os.getenv("USE_SIGNAL_BAR_ONLY_STOP", "true")
+    trader_equation_enabled_str = os.getenv("TRADER_EQUATION_ENABLED", "true")
+    trader_equation_win_rate_str = os.getenv("TRADER_EQUATION_WIN_RATE", "0.4")
+    volume_breakout_confirm_str = os.getenv("VOLUME_BREAKOUT_CONFIRM_ENABLED", "false")
+    volume_breakout_multiplier_str = os.getenv("VOLUME_BREAKOUT_MULTIPLIER", "1.2")
+    open_interest_enabled_str = os.getenv("OPEN_INTEREST_ENABLED", "false")
+    order_price_offset_pct_str = os.getenv("ORDER_PRICE_OFFSET_PCT", "0.05")
+    order_price_offset_ticks_str = os.getenv("ORDER_PRICE_OFFSET_TICKS", "0")
     
     # 动态仓位配置
     large_balance_threshold_str = os.getenv("LARGE_BALANCE_THRESHOLD", "1000")
@@ -230,6 +248,15 @@ def get_trading_config() -> dict:
         leverage = int(leverage_str) if leverage_str else 20
         large_balance_threshold = float(large_balance_threshold_str) if large_balance_threshold_str else 1000.0
         large_balance_position_pct = float(large_balance_position_pct_str) if large_balance_position_pct_str else 50.0
+        tick_size = float(tick_size_str) if tick_size_str else 0.01
+        use_signal_bar_only_stop = use_signal_bar_only_stop_str.lower() in ("true", "1", "yes")
+        trader_equation_enabled = trader_equation_enabled_str.lower() in ("true", "1", "yes")
+        trader_equation_win_rate = float(trader_equation_win_rate_str) if trader_equation_win_rate_str else 0.4
+        volume_breakout_confirm = volume_breakout_confirm_str.lower() in ("true", "1", "yes")
+        volume_breakout_multiplier = float(volume_breakout_multiplier_str) if volume_breakout_multiplier_str else 1.2
+        open_interest_enabled = open_interest_enabled_str.lower() in ("true", "1", "yes")
+        order_price_offset_pct = float(order_price_offset_pct_str) if order_price_offset_pct_str else 0.0
+        order_price_offset_ticks = int(order_price_offset_ticks_str) if order_price_offset_ticks_str else 0
     except ValueError as e:
         logging.error(f"交易参数配置格式错误: {e}")
         raise RuntimeError(f"交易参数配置格式错误: {e}")
@@ -245,6 +272,10 @@ def get_trading_config() -> dict:
         raise RuntimeError(f"LARGE_BALANCE_THRESHOLD 必须 >= 0，当前值: {large_balance_threshold}")
     if not (0 < large_balance_position_pct <= 100):
         raise RuntimeError(f"LARGE_BALANCE_POSITION_PCT 必须在 (0, 100] 范围内，当前值: {large_balance_position_pct}")
+    if tick_size <= 0:
+        raise RuntimeError(f"TICK_SIZE 必须大于 0，当前值: {tick_size}")
+    if not (0 <= trader_equation_win_rate <= 1):
+        raise RuntimeError(f"TRADER_EQUATION_WIN_RATE 必须在 [0, 1]，当前值: {trader_equation_win_rate}")
     
     config = {
         "observe_balance": observe_balance,
@@ -252,6 +283,15 @@ def get_trading_config() -> dict:
         "leverage": leverage,
         "symbol": symbol_str or "BTCUSDT",
         "interval": interval_str or "5m",
+        "tick_size": tick_size,
+        "use_signal_bar_only_stop": use_signal_bar_only_stop,
+        "trader_equation_enabled": trader_equation_enabled,
+        "trader_equation_win_rate": trader_equation_win_rate,
+        "volume_breakout_confirm_enabled": volume_breakout_confirm,
+        "volume_breakout_multiplier": volume_breakout_multiplier,
+        "open_interest_enabled": open_interest_enabled,
+        "order_price_offset_pct": order_price_offset_pct,
+        "order_price_offset_ticks": order_price_offset_ticks,
         "large_balance_threshold": large_balance_threshold,
         "large_balance_position_pct": large_balance_position_pct,
     }
@@ -262,7 +302,8 @@ def get_trading_config() -> dict:
         f"大资金阈值={config['large_balance_threshold']} USDT, "
         f"大资金仓位={config['large_balance_position_pct']}%, "
         f"杠杆={config['leverage']}x, "
-        f"交易对={config['symbol']}, K线周期={config['interval']}"
+        f"交易对={config['symbol']}, K线周期={config['interval']}, "
+        f"止损模式={'信号棒极值+TickSize' if config['use_signal_bar_only_stop'] else '两棒+ATR'}, tick_size={config['tick_size']}"
     )
     
     return config
@@ -277,6 +318,15 @@ POSITION_SIZE_PERCENT = TRADING_CONFIG["position_size_percent"]
 LEVERAGE = TRADING_CONFIG["leverage"]
 SYMBOL = TRADING_CONFIG["symbol"]
 KLINE_INTERVAL = TRADING_CONFIG["interval"]
+TICK_SIZE = TRADING_CONFIG["tick_size"]
+USE_SIGNAL_BAR_ONLY_STOP = TRADING_CONFIG["use_signal_bar_only_stop"]
+TRADER_EQUATION_ENABLED = TRADING_CONFIG["trader_equation_enabled"]
+TRADER_EQUATION_WIN_RATE = TRADING_CONFIG["trader_equation_win_rate"]
+VOLUME_BREAKOUT_CONFIRM_ENABLED = TRADING_CONFIG["volume_breakout_confirm_enabled"]
+VOLUME_BREAKOUT_MULTIPLIER = TRADING_CONFIG["volume_breakout_multiplier"]
+OPEN_INTEREST_ENABLED = TRADING_CONFIG["open_interest_enabled"]
+ORDER_PRICE_OFFSET_PCT = TRADING_CONFIG["order_price_offset_pct"]
+ORDER_PRICE_OFFSET_TICKS = TRADING_CONFIG["order_price_offset_ticks"]
 LARGE_BALANCE_THRESHOLD = TRADING_CONFIG["large_balance_threshold"]
 LARGE_BALANCE_POSITION_PCT = TRADING_CONFIG["large_balance_position_pct"]
 

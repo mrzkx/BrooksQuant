@@ -129,6 +129,8 @@ class TALibPatternDetector:
         "WedgeReversal_Sell": [PatternCategory.BEARISH_REVERSAL],
         "FailedBreakout_Buy": [PatternCategory.BULLISH_REVERSAL],
         "FailedBreakout_Sell": [PatternCategory.BEARISH_REVERSAL],
+        "Wedge_FailedBreakout_Buy": [PatternCategory.BULLISH_REVERSAL],
+        "Wedge_FailedBreakout_Sell": [PatternCategory.BEARISH_REVERSAL],
         
         # H2/L2 回调信号需要延续形态
         "H2_Buy": [PatternCategory.BULLISH_REVERSAL, PatternCategory.BULLISH_CONTINUATION],

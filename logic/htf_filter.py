@@ -2,6 +2,7 @@
 高时间框架过滤器 (Higher Time Frame Filter)
 
 Al Brooks 核心原则：
+"背景（Context）胜过一切"
 "大周期的趋势是日内交易最好的保护伞"
 "没有 100% 的确定性，只有概率和盈亏比"
 
@@ -11,9 +12,12 @@ Al Brooks 核心原则：
 3. 下降趋势：增强卖出信号（×1.2），削弱买入信号（×0.5）
 4. 中性趋势：双向交易（×1.0）
 
+H2/L2 硬过滤（Context 优先）：
+- 5m 做多（H1/H2）：仅在 1h 强多头且价格回调至 1h EMA20 附近时允许
+- 5m 做空（L1/L2）：仅在 1h 强空头且价格反弹至 1h EMA20 附近时允许
+
 软过滤策略（v2.0 优化）：
-- 不完全禁止逆势交易，而是降低信号权重
-- 强烈的反转信号（Climax、Failed Breakout）仍可逆势入场
+- 其他信号（Spike/Wedge/Climax/FB）仍用权重调节，不硬禁止
 - 通过信号强度 × 权重来自动筛选
 """
 
@@ -89,6 +93,11 @@ class HTFFilter:
     # 斜率阈值（%）
     # BTC 1h 周期，0.3% 的 EMA 变化是更稳定的趋势信号
     SLOPE_THRESHOLD_PCT = 0.003  # 0.3%（从 0.1% 提高）
+    # 强趋势阈值：H2/L2 硬过滤要求 1h 处于强趋势（Al Brooks 背景优先）
+    STRONG_SLOPE_THRESHOLD_PCT = 0.005  # 0.5% 视为强多头/强空头
+    
+    # 价格“靠近 HTF EMA20”的容差（%）：用于 H2/L2 仅允许在回调至 EMA 附近触发
+    PRICE_NEAR_EMA_PCT = 0.008  # 0.8% 内视为靠近 1h EMA20
     
     # 斜率计算使用的 K 线数（6 小时，更能反映趋势）
     SLOPE_LOOKBACK_BARS = 6  # 从 3 根提高到 6 根
@@ -313,6 +322,92 @@ class HTFFilter:
                 return self.COUNTER_TREND_FACTOR    # 0.5 逆势削弱（不是 0）
             else:
                 return self.NEUTRAL_FACTOR          # 1.0 中性
+
+    def is_price_near_htf_ema(
+        self, current_price: float, tolerance_pct: Optional[float] = None
+    ) -> bool:
+        """
+        当前价格是否在 HTF EMA20 附近（用于 H2/L2 背景过滤）
+        
+        Al Brooks：只有在价格回调至大周期 EMA 附近时，才做 H2/L2 顺势单。
+        
+        Args:
+            current_price: 当前 K 线价格（如 5m 收盘价）
+            tolerance_pct: 容差百分比，默认使用 PRICE_NEAR_EMA_PCT
+        
+        Returns:
+            True 表示在 EMA 附近（|price - ema| / ema <= tolerance）
+        """
+        if self._snapshot is None or current_price <= 0:
+            return False
+        tol = tolerance_pct if tolerance_pct is not None else self.PRICE_NEAR_EMA_PCT
+        ema = self._snapshot.ema_value
+        if ema <= 0:
+            return False
+        pct = abs(current_price - ema) / ema
+        return pct <= tol
+
+    def allows_h2_buy(self, current_price: float) -> tuple[bool, str]:
+        """
+        是否允许 5m 级别的 H1/H2 买入（Al Brooks 背景优先）
+        
+        条件：1h 处于强多头趋势 且 当前价格回调至 1h EMA20 附近。
+        
+        Args:
+            current_price: 当前 K 线价格（如 5m 收盘价）
+        
+        Returns:
+            (allowed, reason)
+        """
+        if self._snapshot is None:
+            return (False, "HTF 数据未就绪，禁止 H2 买入")
+        s = self._snapshot
+        strong_bull = (
+            s.trend == HTFTrend.BULLISH
+            and s.ema_slope >= self.STRONG_SLOPE_THRESHOLD_PCT
+        )
+        if not strong_bull:
+            return (
+                False,
+                f"HTF({self.htf_interval}) 非强多头(斜率={s.ema_slope:.3%}<{self.STRONG_SLOPE_THRESHOLD_PCT:.2%})，禁止 H2 买入",
+            )
+        if not self.is_price_near_htf_ema(current_price):
+            return (
+                False,
+                f"价格{current_price:.2f} 未回调至 1h EMA20({s.ema_value:.2f}) 附近(>{self.PRICE_NEAR_EMA_PCT:.2%})，禁止 H2 买入",
+            )
+        return (True, f"HTF 强多头且价格近 EMA，允许 H2 买入")
+
+    def allows_l2_sell(self, current_price: float) -> tuple[bool, str]:
+        """
+        是否允许 5m 级别的 L1/L2 卖出（Al Brooks 背景优先）
+        
+        条件：1h 处于强空头趋势 且 当前价格反弹至 1h EMA20 附近。
+        
+        Args:
+            current_price: 当前 K 线价格（如 5m 收盘价）
+        
+        Returns:
+            (allowed, reason)
+        """
+        if self._snapshot is None:
+            return (False, "HTF 数据未就绪，禁止 L2 卖出")
+        s = self._snapshot
+        strong_bear = (
+            s.trend == HTFTrend.BEARISH
+            and s.ema_slope <= -self.STRONG_SLOPE_THRESHOLD_PCT
+        )
+        if not strong_bear:
+            return (
+                False,
+                f"HTF({self.htf_interval}) 非强空头(斜率={s.ema_slope:.3%}>-{self.STRONG_SLOPE_THRESHOLD_PCT:.2%})，禁止 L2 卖出",
+            )
+        if not self.is_price_near_htf_ema(current_price):
+            return (
+                False,
+                f"价格{current_price:.2f} 未反弹至 1h EMA20({s.ema_value:.2f}) 附近(>{self.PRICE_NEAR_EMA_PCT:.2%})，禁止 L2 卖出",
+            )
+        return (True, "HTF 强空头且价格近 EMA，允许 L2 卖出")
 
 
 # ============================================================================
