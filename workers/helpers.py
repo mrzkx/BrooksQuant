@@ -4,7 +4,6 @@
 包含K线数据加载、补全等辅助功能
 """
 
-import asyncio
 import logging
 from typing import Dict, List, Optional
 

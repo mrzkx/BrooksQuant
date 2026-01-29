@@ -4,13 +4,11 @@
 
 import asyncio
 import logging
-import os
 from typing import List
 
+from config import OBSERVE_MODE
 from trade_logger import TradeLogger
 from user_manager import TradingUser
-
-OBSERVE_MODE = os.getenv("OBSERVE_MODE", "true").lower() == "true"
 
 
 async def print_stats_periodically(

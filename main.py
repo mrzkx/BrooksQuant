@@ -19,16 +19,16 @@ BrooksQuant 交易系统 - 主入口
 
 import asyncio
 import logging
-import os
 
 from config import (
-    load_user_credentials, 
+    load_user_credentials,
     REDIS_URL,
     OBSERVE_BALANCE,
     POSITION_SIZE_PERCENT,
     LEVERAGE,
     SYMBOL as CONFIG_SYMBOL,
     KLINE_INTERVAL,
+    OBSERVE_MODE,
 )
 from strategy import AlBrooksStrategy
 from trade_logger import TradeLogger
@@ -43,9 +43,6 @@ from workers import kline_producer, user_worker, print_stats_periodically
 
 # 交易参数
 SYMBOL = CONFIG_SYMBOL
-
-# 观察模式：设置为 True 时只模拟交易，不实际下单
-OBSERVE_MODE = os.getenv("OBSERVE_MODE", "true").lower() == "true"
 
 
 def setup_logging():
@@ -94,9 +91,8 @@ async def main() -> None:
     delta_window = strategy.delta_analyzer.WINDOW_SECONDS if strategy.delta_analyzer else 300
     logging.info(f"策略已初始化: EMA周期=20, K线周期={KLINE_INTERVAL}, Delta窗口={delta_window}秒")
 
-    # 初始化交易日志器
-    trade_logger = TradeLogger()
-    trade_logger.sync_from_db()
+    # 初始化交易日志器（内存 + Redis 当前状态持久化；启动时先查币安再查 Redis）
+    trade_logger = TradeLogger(redis_url=REDIS_URL)
     logging.info("交易日志器已初始化")
 
     # 创建队列
@@ -147,25 +143,17 @@ async def main() -> None:
 
 
 def _log_mode_info():
-    """记录运行模式信息"""
+    """记录运行模式信息（同时写日志与控制台）"""
+    sep = "=" * 60
     if OBSERVE_MODE:
-        logging.info("=" * 60)
-        logging.info("观察模式已启用 - 将进行模拟交易，不会实际下单")
-        logging.info(f"模拟资金: {OBSERVE_BALANCE} USDT, 仓位: {POSITION_SIZE_PERCENT}%, 杠杆: {LEVERAGE}x")
-        logging.info("=" * 60)
-        print("=" * 60)
-        print("观察模式已启用 - 将进行模拟交易，不会实际下单")
-        print(f"模拟资金: {OBSERVE_BALANCE} USDT, 仓位: {POSITION_SIZE_PERCENT}%, 杠杆: {LEVERAGE}x")
-        print("=" * 60)
+        line1 = "观察模式已启用 - 将进行模拟交易，不会实际下单"
+        line2 = f"模拟资金: {OBSERVE_BALANCE} USDT, 仓位: {POSITION_SIZE_PERCENT}%, 杠杆: {LEVERAGE}x"
     else:
-        logging.info("=" * 60)
-        logging.info("实际交易模式 - 将进行真实下单")
-        logging.info(f"仓位: {POSITION_SIZE_PERCENT}%, 杠杆: {LEVERAGE}x")
-        logging.info("=" * 60)
-        print("=" * 60)
-        print("实际交易模式 - 将进行真实下单")
-        print(f"仓位: {POSITION_SIZE_PERCENT}%, 杠杆: {LEVERAGE}x")
-        print("=" * 60)
+        line1 = "实际交易模式 - 将进行真实下单"
+        line2 = f"仓位: {POSITION_SIZE_PERCENT}%, 杠杆: {LEVERAGE}x"
+    for line in (sep, line1, line2, sep):
+        logging.info(line)
+        print(line)
 
 
 if __name__ == "__main__":

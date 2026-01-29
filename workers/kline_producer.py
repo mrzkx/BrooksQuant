@@ -6,7 +6,6 @@ K线生产者模块
 
 import asyncio
 import logging
-import os
 from typing import Dict, List, Optional
 
 import pandas as pd
@@ -14,7 +13,7 @@ import pandas as pd
 from binance import BinanceSocketManager, AsyncClient
 from binance.exceptions import ReadLoopClosed
 
-from config import SYMBOL as CONFIG_SYMBOL
+from config import SYMBOL as CONFIG_SYMBOL, OBSERVE_MODE
 from strategy import AlBrooksStrategy
 from trade_logger import TradeLogger
 from workers.helpers import load_historical_klines, fill_missing_klines
@@ -30,7 +29,6 @@ except ImportError:
 
 SYMBOL = CONFIG_SYMBOL
 INTERVAL = AsyncClient.KLINE_INTERVAL_5MINUTE
-OBSERVE_MODE = os.getenv("OBSERVE_MODE", "true").lower() == "true"
 
 
 async def kline_producer(
@@ -327,7 +325,7 @@ def _build_signal(last, k, df) -> Dict:
     # 信号强度 = 基础强度 × (1 + TA-Lib 加成)
     signal_strength = base_strength * (1 + talib_boost)
     
-    # 计算止盈
+    # 计算止盈（与 strategy._calculate_tp1_tp2 口径一致：无 tp1/tp2 时用 stop_distance + risk_reward_ratio + base_height）
     if tp1_price and tp2_price:
         take_profit = tp2_price
     else:

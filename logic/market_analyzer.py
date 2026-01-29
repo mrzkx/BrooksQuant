@@ -88,28 +88,6 @@ class MarketAnalyzer:
         """获取当前趋势强度 (0-1)"""
         return self._trend_strength
     
-    def is_counter_trend(self, side: str) -> bool:
-        """
-        判断是否是逆势交易
-        
-        Args:
-            side: "buy" 或 "sell"
-        
-        Returns:
-            True 如果是逆势交易（在上涨趋势中做空，或在下跌趋势中做多）
-        """
-        # 使用周期自适应的趋势强度阈值
-        trend_threshold = self._params.strong_trend_threshold + 0.1
-        if self._trend_direction is None or self._trend_strength < trend_threshold:
-            return False
-        
-        if self._trend_direction == "up" and side == "sell":
-            return True
-        if self._trend_direction == "down" and side == "buy":
-            return True
-        
-        return False
-    
     def detect_market_state(self, df: pd.DataFrame, i: int, ema: float) -> MarketState:
         """
         检测当前市场状态

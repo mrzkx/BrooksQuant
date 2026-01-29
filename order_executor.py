@@ -12,12 +12,13 @@
 
 import asyncio
 import logging
-from decimal import Decimal, ROUND_DOWN
 from typing import Dict
 
 from config import SYMBOL as CONFIG_SYMBOL, ORDER_PRICE_OFFSET_PCT, ORDER_PRICE_OFFSET_TICKS
+from logic.trader_equation import satisfies_trader_equation
 from trade_logger import TradeLogger
 from user_manager import TradingUser
+from utils import round_quantity_to_step_size
 
 SYMBOL = CONFIG_SYMBOL
 
@@ -45,63 +46,73 @@ def _extract_signal_params(signal: Dict) -> Dict:
 
 
 def _satisfies_trader_equation(signal: Dict) -> bool:
-    """
-    交易者方程：WinRate × Reward > Risk 时才允许执行。
-    入场前校验，若信号棒过大导致止损过远、盈亏比不足则跳过。
-    """
-    try:
-        from config import TRADER_EQUATION_ENABLED, TRADER_EQUATION_WIN_RATE
-        if not TRADER_EQUATION_ENABLED:
-            return True
-        win_rate = TRADER_EQUATION_WIN_RATE
-    except ImportError:
-        return True
+    """交易者方程：WinRate × Reward > Risk 时才允许执行（委托公共函数）。"""
+    params = _extract_signal_params(signal)
     entry = float(signal.get("price", 0))
     stop_loss = float(signal.get("stop_loss", 0))
-    params = _extract_signal_params(signal)
     tp1 = params.get("tp1_price")
     tp2 = params.get("tp2_price")
-    tp1_close_ratio = float(params.get("tp1_close_ratio", 0.5))
-    side = (signal.get("side") or "").lower()
     if not tp1 or not tp2 or entry <= 0:
         return True
     tp1, tp2 = float(tp1), float(tp2)
-    risk = abs(entry - stop_loss)
-    if risk <= 0:
-        return True
-    if side == "buy":
-        reward = tp1_close_ratio * (tp1 - entry) + (1.0 - tp1_close_ratio) * (tp2 - entry)
+    tp1_close_ratio = float(params.get("tp1_close_ratio", 0.5))
+    side = (signal.get("side") or "").lower()
+    return satisfies_trader_equation(
+        entry, stop_loss, tp1, tp2, tp1_close_ratio, side, win_rate=None, enabled=True
+    )
+
+
+def _log_order_execution(
+    user: TradingUser,
+    signal: Dict,
+    params: Dict,
+    order_qty: float,
+    position_value: float,
+    is_observe: bool,
+    entry_price: float = None,
+    quantity: float = None,
+    status_emoji: str = None,
+    status_text: str = None,
+) -> None:
+    """统一订单执行后的日志与 print（有 TP1/TP2 与无两种分支）。"""
+    entry = entry_price if entry_price is not None else signal["price"]
+    qty = quantity if quantity is not None else order_qty
+    has_tp = params.get("tp1_price") and params.get("tp2_price")
+    if is_observe:
+        if has_tp:
+            logging.info(
+                f"[{user.name}] 📝 观察模式记录: {signal['signal']} {signal['side']} @ {entry:.2f}, "
+                f"数量={qty:.4f} BTC (≈{position_value:.2f} USDT), 止损={signal['stop_loss']:.2f}, "
+                f"TP1={params['tp1_price']:.2f}(50%), TP2={params['tp2_price']:.2f}(50%)"
+            )
+            print(
+                f"[{user.name}] 📝 观察模式: {signal['signal']} {signal['side']} @ {entry:.2f}, "
+                f"止损={signal['stop_loss']:.2f}, TP1={params['tp1_price']:.2f}(50%), TP2={params['tp2_price']:.2f}(50%)"
+            )
+        else:
+            logging.info(
+                f"[{user.name}] 📝 观察模式记录: {signal['signal']} {signal['side']} @ {entry:.2f}, "
+                f"数量={qty:.4f} BTC (≈{position_value:.2f} USDT), 止损={signal['stop_loss']:.2f}, 止盈={signal['take_profit']:.2f}"
+            )
+            print(
+                f"[{user.name}] 📝 观察模式: {signal['signal']} {signal['side']} @ {entry:.2f}, "
+                f"止损={signal['stop_loss']:.2f}, 止盈={signal['take_profit']:.2f}"
+            )
     else:
-        reward = tp1_close_ratio * (entry - tp1) + (1.0 - tp1_close_ratio) * (entry - tp2)
-    if reward <= 0:
-        return False
-    return (win_rate * reward) > risk
-
-
-def round_quantity_to_step_size(quantity: float, step_size: float = 0.001) -> float:
-    """
-    将数量按 stepSize 截断（向下取整）
-    
-    BTCUSDT 的 stepSize = 0.001，所以数量必须是 0.001 的整数倍
-    
-    Args:
-        quantity: 原始数量
-        step_size: 步长（默认 0.001）
-    
-    Returns:
-        按步长截断后的数量
-    """
-    if step_size <= 0:
-        step_size = 0.001
-    
-    # 使用 Decimal 确保精度
-    qty_decimal = Decimal(str(quantity))
-    step_decimal = Decimal(str(step_size))
-    
-    # 向下取整到最近的 step_size
-    rounded = (qty_decimal / step_decimal).quantize(Decimal('1'), rounding=ROUND_DOWN) * step_decimal
-    
-    return max(float(rounded), step_size)  # 确保至少是最小数量
+        emoji = status_emoji or "✅"
+        text = status_text or "已成交"
+        if has_tp:
+            logging.info(
+                f"[{user.name}] {emoji} 实盘限价单{text}: {signal['signal']} {signal['side']} @ {entry:.2f}, "
+                f"数量={qty:.4f} BTC, 止损={signal['stop_loss']:.2f}, "
+                f"TP1={params['tp1_price']:.2f}(50%), TP2={params['tp2_price']:.2f}(50%) [K线动态退出]"
+            )
+        else:
+            logging.info(
+                f"[{user.name}] {emoji} 实盘限价单{text}: {signal['signal']} {signal['side']} @ {entry:.2f}, "
+                f"数量={qty:.4f} BTC, 止损={signal['stop_loss']:.2f}, 止盈={signal['take_profit']:.2f} [K线动态退出]"
+            )
+        print(f"[{user.name}] {emoji} 实盘限价单{text}: {signal['signal']} {signal['side']} @ {entry:.2f}")
 
 
 async def execute_observe_order(
@@ -130,12 +141,9 @@ async def execute_observe_order(
             "Risk过大或Reward不足"
         )
         return
-    
-    # 提取信号参数（使用公共函数避免重复）
+
     params = _extract_signal_params(signal)
-    
-    # 记录观察模式交易
-    trade = trade_logger.open_position(
+    trade_logger.open_position(
         user=user.name,
         signal=signal["signal"],
         side=signal["side"],
@@ -152,27 +160,7 @@ async def execute_observe_order(
         tp1_close_ratio=params["tp1_close_ratio"],
         is_climax_bar=params["is_climax_bar"],
     )
-    
-    # 日志输出
-    if params["tp1_price"] and params["tp2_price"]:
-        logging.info(
-            f"[{user.name}] 📝 观察模式记录: {signal['signal']} {signal['side']} @ {signal['price']:.2f}, "
-            f"数量={order_qty:.4f} BTC (≈{position_value:.2f} USDT), 止损={signal['stop_loss']:.2f}, "
-            f"TP1={params['tp1_price']:.2f}(50%), TP2={params['tp2_price']:.2f}(50%)"
-        )
-        print(
-            f"[{user.name}] 📝 观察模式: {signal['signal']} {signal['side']} @ {signal['price']:.2f}, "
-            f"止损={signal['stop_loss']:.2f}, TP1={params['tp1_price']:.2f}(50%), TP2={params['tp2_price']:.2f}(50%)"
-        )
-    else:
-        logging.info(
-            f"[{user.name}] 📝 观察模式记录: {signal['signal']} {signal['side']} @ {signal['price']:.2f}, "
-            f"数量={order_qty:.4f} BTC (≈{position_value:.2f} USDT), 止损={signal['stop_loss']:.2f}, 止盈={signal['take_profit']:.2f}"
-        )
-        print(
-            f"[{user.name}] 📝 观察模式: {signal['signal']} {signal['side']} @ {signal['price']:.2f}, "
-            f"止损={signal['stop_loss']:.2f}, 止盈={signal['take_profit']:.2f}"
-        )
+    _log_order_execution(user, signal, params, order_qty, position_value, is_observe=True)
 
 
 async def execute_live_order(
@@ -321,26 +309,13 @@ async def execute_live_order(
             except Exception as tp1_err:
                 logging.error(f"[{user.name}] ⚠️ TP1 止盈单挂单失败: {tp1_err}")
         
-        # 日志输出
         status_emoji = "✅" if order_status == "FILLED" else "📝"
         status_text = "已成交" if order_status == "FILLED" else f"挂单中({order_status})"
-        
-        if params["tp1_price"] and params["tp2_price"]:
-            logging.info(
-                f"[{user.name}] {status_emoji} 实盘限价单{status_text}: {signal['signal']} {signal['side']} @ {actual_price:.2f}, "
-                f"数量={actual_qty:.4f} BTC, 止损={signal['stop_loss']:.2f}, "
-                f"TP1={params['tp1_price']:.2f}(50%), TP2={params['tp2_price']:.2f}(50%) [K线动态退出]"
-            )
-        else:
-            logging.info(
-                f"[{user.name}] {status_emoji} 实盘限价单{status_text}: {signal['signal']} {signal['side']} @ {actual_price:.2f}, "
-                f"数量={actual_qty:.4f} BTC, 止损={signal['stop_loss']:.2f}, 止盈={signal['take_profit']:.2f} [K线动态退出]"
-            )
-        
-        print(
-            f"[{user.name}] {status_emoji} 实盘限价单{status_text}: {signal['signal']} {signal['side']} @ {actual_price:.2f}"
+        _log_order_execution(
+            user, signal, params, order_qty, position_value, is_observe=False,
+            entry_price=actual_price, quantity=actual_qty,
+            status_emoji=status_emoji, status_text=status_text,
         )
-        
         return True
         
     except Exception as exc:

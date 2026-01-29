@@ -9,14 +9,14 @@ BrooksQuant 配置管理模块
 3. 无默认值（强制配置）
 
 必需的环境变量（生产环境强制）：
-- DATABASE_URL 或 (DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD)
 - REDIS_URL 或 (REDIS_HOST, REDIS_PORT)
 - USER1_API_KEY, USER1_API_SECRET (Binance 凭证，观察模式可选)
+
+说明：交易记录不再持久化到 PostgreSQL，持仓状态根据币安真实持仓恢复与更新。
 """
 
 import logging
 import os
-import sys
 from datetime import datetime
 from dataclasses import dataclass
 from typing import List, Optional
@@ -37,35 +37,10 @@ load_dotenv()
 # 观察模式：设置为 True 时只模拟交易，不实际下单
 OBSERVE_MODE = os.getenv("OBSERVE_MODE", "true").lower() == "true"
 
-# 是否保存交易记录到数据库（设置为 False 时禁用数据库保存）
-SAVE_TRADES_TO_DB = os.getenv("SAVE_TRADES_TO_DB", "false").lower() == "true"
-
 
 # ============================================================================
 # 环境变量验证
 # ============================================================================
-
-def _get_required_env(key: str, fallback_keys: Optional[List[str]] = None) -> str:
-    """
-    获取必需的环境变量
-    
-    如果未设置，记录警告但不终止程序（允许观察模式下运行）
-    """
-    value = os.getenv(key)
-    
-    if not value and fallback_keys:
-        for fallback in fallback_keys:
-            value = os.getenv(fallback)
-            if value:
-                break
-    
-    return value or ""
-
-
-def _get_env(key: str, default: str = "") -> str:
-    """获取环境变量，带默认值"""
-    return os.getenv(key, default)
-
 
 def _mask_url_password(url: str) -> str:
     """
@@ -86,52 +61,6 @@ def _mask_url_password(url: str) -> str:
     except Exception:
         # 解析失败时，使用简单的 @ 分割
         return url.split("@")[-1] if "@" in url else url
-
-
-# ============================================================================
-# 数据库配置（生产环境强制）
-# ============================================================================
-
-def get_database_url() -> str:
-    """
-    获取数据库连接 URL
-    
-    优先级：
-    1. DATABASE_URL 环境变量（完整连接字符串）
-    2. DB_URL 环境变量
-    3. 从独立环境变量组装：DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD
-    
-    生产环境强制配置：未配置时抛出异常，不允许降级到 SQLite 内存
-    """
-    db_url = os.getenv("DATABASE_URL") or os.getenv("DB_URL")
-    
-    if db_url:
-        # 安全地脱敏密码用于日志
-        safe_url = _mask_url_password(db_url)
-        logging.info(f"数据库配置: {safe_url}")
-        return db_url
-    
-    # 从独立环境变量组装
-    db_host = os.getenv("DB_HOST")
-    db_port = os.getenv("DB_PORT", "5432")
-    db_name = os.getenv("DB_NAME")
-    db_user = os.getenv("DB_USER")
-    db_password = os.getenv("DB_PASSWORD", "")
-    
-    if db_host and db_name and db_user:
-        db_url = f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
-        logging.info(f"数据库配置: {db_host}:{db_port}/{db_name}")
-        return db_url
-    
-    # 生产环境强制配置：未配置数据库时抛出异常
-    error_msg = (
-        "❌ 数据库未配置！生产环境强制要求配置 PostgreSQL 数据库。\n"
-        "请设置以下环境变量之一：\n"
-        "  方式1: DATABASE_URL=postgresql://user:password@host:5432/dbname\n"
-        "  方式2: DB_HOST, DB_NAME, DB_USER, DB_PASSWORD"
-    )
-    logging.critical(error_msg)
-    raise RuntimeError(error_msg)
 
 
 # ============================================================================
@@ -186,7 +115,6 @@ def get_redis_url() -> str:
 # 导出配置常量
 # ============================================================================
 
-DATABASE_URL = get_database_url()
 REDIS_URL = get_redis_url()
 
 
@@ -457,7 +385,6 @@ def validate_config():
     验证关键配置是否已设置
     
     生产环境强制要求：
-    - PostgreSQL 数据库（已在 get_database_url 中强制）
     - Redis（已在 get_redis_url 中强制）
     - Binance API 凭证（非观察模式下强制）
     """

@@ -1,18 +1,23 @@
 import asyncio
 import logging
-import math
-from decimal import Decimal, ROUND_DOWN
 from typing import Any, Dict, Optional
 
 from binance import AsyncClient
 
 from config import (
-    UserCredentials, 
+    UserCredentials,
     create_async_client_for_user,
     LARGE_BALANCE_THRESHOLD,
     LARGE_BALANCE_POSITION_PCT,
     POSITION_SIZE_PERCENT,
     LEVERAGE,
+)
+from utils import round_quantity_to_step_size as _round_quantity_to_step_size, round_tick_size as _round_tick_size
+from user_filters import parse_symbol_filters_from_exchange_info, DEFAULT_FILTERS
+from user_position_sizing import (
+    get_position_size_percent as _get_position_size_percent,
+    compute_order_quantity as _compute_order_quantity,
+    compute_limit_price as _compute_limit_price,
 )
 
 
@@ -159,132 +164,35 @@ class TradingUser:
 
     async def get_symbol_filters(self, symbol: str, force_refresh: bool = False) -> Dict[str, Any]:
         """
-        获取交易对的过滤器规则（stepSize, minQty, tickSize）
-        
-        Args:
-            symbol: 交易对（如 "BTCUSDT"）
-            force_refresh: 是否强制刷新
-        
-        Returns:
-            Dict: {
-                "stepSize": 数量精度步长,
-                "minQty": 最小数量,
-                "maxQty": 最大数量,
-                "tickSize": 价格精度步长,
-                "minNotional": 最小名义价值
-            }
+        获取交易对的过滤器规则（stepSize, minQty, tickSize）。
+        委托 user_filters.parse_symbol_filters_from_exchange_info。
         """
         if self.client is None:
             raise RuntimeError(f"用户 {self.name} 尚未连接客户端")
-        
-        # 使用缓存
         if not force_refresh and symbol in self._symbol_filters:
             return self._symbol_filters[symbol]
-        
         try:
             exchange_info = await self.client.futures_exchange_info()
-            
-            for sym_info in exchange_info.get("symbols", []):
-                if sym_info.get("symbol") == symbol:
-                    filters = {}
-                    
-                    for f in sym_info.get("filters", []):
-                        filter_type = f.get("filterType")
-                        
-                        if filter_type == "LOT_SIZE":
-                            filters["stepSize"] = float(f.get("stepSize", "0.001"))
-                            filters["minQty"] = float(f.get("minQty", "0.001"))
-                            filters["maxQty"] = float(f.get("maxQty", "10000"))
-                        
-                        elif filter_type == "PRICE_FILTER":
-                            filters["tickSize"] = float(f.get("tickSize", "0.01"))
-                        
-                        elif filter_type == "MIN_NOTIONAL":
-                            filters["minNotional"] = float(f.get("notional", "5"))
-                    
-                    # 设置默认值
-                    filters.setdefault("stepSize", 0.001)
-                    filters.setdefault("minQty", 0.001)
-                    filters.setdefault("maxQty", 10000)
-                    filters.setdefault("tickSize", 0.01)
-                    filters.setdefault("minNotional", 5)
-                    
-                    self._symbol_filters[symbol] = filters
-                    logging.info(
-                        f"[{self.name}] 获取 {symbol} 过滤器: "
-                        f"stepSize={filters['stepSize']}, minQty={filters['minQty']}, "
-                        f"tickSize={filters['tickSize']}"
-                    )
-                    return filters
-            
-            # 未找到交易对，使用默认值
-            logging.warning(f"[{self.name}] 未找到 {symbol} 的过滤器，使用默认值")
-            default_filters = {
-                "stepSize": 0.001,
-                "minQty": 0.001,
-                "maxQty": 10000,
-                "tickSize": 0.01,
-                "minNotional": 5,
-            }
-            self._symbol_filters[symbol] = default_filters
-            return default_filters
-            
+            filters = parse_symbol_filters_from_exchange_info(
+                exchange_info, symbol, log_prefix=f"[{self.name}]"
+            )
+            self._symbol_filters[symbol] = filters
+            return filters
         except Exception as e:
             logging.error(f"[{self.name}] 获取交易规则失败: {e}", exc_info=True)
-            # 返回 BTCUSDT 的默认值
-            return {
-                "stepSize": 0.001,
-                "minQty": 0.001,
-                "maxQty": 10000,
-                "tickSize": 0.01,
-                "minNotional": 5,
-            }
+            return dict(DEFAULT_FILTERS)
 
     def round_step_size(self, quantity: float, step_size: float) -> float:
-        """
-        按照 stepSize 向下取整数量
-        
-        Args:
-            quantity: 原始数量
-            step_size: 步长（如 0.001）
-        
-        Returns:
-            float: 取整后的数量
-        """
+        """按照 stepSize 向下取整数量（委托 utils）。"""
         if step_size <= 0:
             return quantity
-        
-        # 使用 Decimal 避免浮点数精度问题
-        qty_decimal = Decimal(str(quantity))
-        step_decimal = Decimal(str(step_size))
-        
-        # 向下取整到 stepSize 的倍数
-        rounded = (qty_decimal // step_decimal) * step_decimal
-        
-        return float(rounded)
+        return _round_quantity_to_step_size(quantity, step_size)
 
     def round_tick_size(self, price: float, tick_size: float) -> float:
-        """
-        按照 tickSize 取整价格
-        
-        Args:
-            price: 原始价格
-            tick_size: 步长（如 0.01）
-        
-        Returns:
-            float: 取整后的价格
-        """
+        """按照 tickSize 取整价格（委托 utils）。"""
         if tick_size <= 0:
             return price
-        
-        # 使用 Decimal 避免浮点数精度问题
-        price_decimal = Decimal(str(price))
-        tick_decimal = Decimal(str(tick_size))
-        
-        # 四舍五入到 tickSize 的倍数
-        rounded = round(price_decimal / tick_decimal) * tick_decimal
-        
-        return float(rounded)
+        return _round_tick_size(price, tick_size)
 
     async def set_leverage(self, symbol: str, leverage: int = DEFAULT_LEVERAGE) -> bool:
         """
@@ -326,135 +234,41 @@ class TradingUser:
             return False
 
     def calculate_position_size_percent(self, balance: float) -> float:
-        """
-        根据账户余额计算仓位百分比
-        
-        规则：
-        - 余额 <= 1000 USDT: 100% 仓位（全仓）
-        - 余额 > 1000 USDT: 20% 仓位
-        
-        Args:
-            balance: 账户 USDT 余额
-        
-        Returns:
-            float: 仓位百分比（0-100）
-        """
-        if balance <= self.SMALL_ACCOUNT_THRESHOLD:
-            return self.SMALL_ACCOUNT_POSITION_PCT
-        else:
-            return self.LARGE_ACCOUNT_POSITION_PCT
+        """根据账户余额计算仓位百分比（委托 user_position_sizing）。"""
+        return _get_position_size_percent(
+            balance,
+            self.SMALL_ACCOUNT_THRESHOLD,
+            self.SMALL_ACCOUNT_POSITION_PCT,
+            self.LARGE_ACCOUNT_POSITION_PCT,
+        )
 
     def calculate_order_quantity(
-        self, 
-        balance: float, 
-        current_price: float, 
+        self,
+        balance: float,
+        current_price: float,
         leverage: int = DEFAULT_LEVERAGE,
-        symbol: str = "BTCUSDT"
+        symbol: str = "BTCUSDT",
     ) -> float:
         """
-        计算下单数量（实盘版本，符合交易所 stepSize 规则）
-        
-        公式: 下单数量 = (余额 × 仓位百分比 × 杠杆) / 当前价格
-        
-        保证金检查：
-        - 需要的保证金 = quantity * price / leverage
-        - 手续费预留 = quantity * price * 0.001 (0.1% 总手续费)
-        - 总需求 = 保证金 + 手续费预留
-        - 确保总需求 <= 可用余额
-        
-        Args:
-            balance: 账户 USDT 余额
-            current_price: 当前价格
-            leverage: 杠杆倍数（默认 20）
-            symbol: 交易对（用于获取 stepSize）
-        
-        Returns:
-            float: 符合 stepSize 规则的数量
+        计算下单数量（实盘版本，符合交易所 stepSize 规则）。
+        委托 user_position_sizing.compute_order_quantity。
         """
-        if current_price <= 0 or balance <= 0:
-            logging.warning(f"[{self.name}] 无效参数: 余额={balance}, 价格={current_price}")
-            return 0.001  # 最小值
-        
-        # 获取交易规则（使用缓存）
-        filters = self._symbol_filters.get(symbol, {
-            "stepSize": 0.001,
-            "minQty": 0.001,
-            "minNotional": 5,
-        })
+        filters = self._symbol_filters.get(symbol, dict(DEFAULT_FILTERS))
         step_size = filters.get("stepSize", 0.001)
         min_qty = filters.get("minQty", 0.001)
-        min_notional = filters.get("minNotional", 5)
-        
-        # 计算仓位百分比
+        min_notional = filters.get("minNotional", 5.0)
         position_pct = self.calculate_position_size_percent(balance)
-        
-        # 开仓金额 = 余额 × 仓位百分比
-        position_value = balance * (position_pct / 100)
-        
-        # 实际购买力 = 开仓金额 × 杠杆
-        buying_power = position_value * leverage
-        
-        # 下单数量 = 购买力 / 当前价格
-        quantity = buying_power / current_price
-        
-        # 按 stepSize 向下取整
-        quantity = self.round_step_size(quantity, step_size)
-        
-        # 确保不低于最小交易量
-        quantity = max(quantity, min_qty)
-        
-        # 检查最小名义价值（防止订单被拒绝）
-        notional_value = quantity * current_price
-        if notional_value < min_notional:
-            # 调整数量以满足最小名义价值
-            quantity = min_notional / current_price
-            quantity = self.round_step_size(quantity, step_size)
-            # 向上取整确保满足最小值
-            if quantity * current_price < min_notional:
-                quantity += step_size
-            logging.warning(
-                f"[{self.name}] 调整数量以满足最小名义价值: "
-                f"{notional_value:.2f} < {min_notional}, 新数量={quantity:.6f}"
-            )
-        
-        # ========== 保证金检查（只检查保证金，不考虑手续费）==========
-        # 需要的保证金 = 名义价值 / 杠杆
-        required_margin = notional_value / leverage
-        
-        # 如果保证金超过可用余额，减少数量
-        if required_margin > balance:
-            # 反向计算：从可用余额反推最大数量
-            # balance = quantity * price / leverage
-            # quantity = balance * leverage / price
-            max_quantity = balance * leverage / current_price
-            max_quantity = self.round_step_size(max_quantity, step_size)
-            
-            # 确保不低于最小交易量
-            if max_quantity >= min_qty:
-                quantity = max_quantity
-                notional_value = quantity * current_price
-                required_margin = notional_value / leverage
-                
-                logging.warning(
-                    f"[{self.name}] ⚠️ 保证金不足，调整数量: "
-                    f"需要保证金={required_margin:.2f} > 余额={balance:.2f}, "
-                    f"调整为 {quantity:.6f} BTC"
-                )
-            else:
-                logging.error(
-                    f"[{self.name}] ❌ 余额不足，无法满足最小交易量: "
-                    f"余额={balance:.2f}, 最小数量需要保证金={min_qty * current_price / leverage:.2f}"
-                )
-                return 0.0  # 返回 0 表示无法下单
-        
-        logging.info(
-            f"[{self.name}] 仓位计算: 余额={balance:.2f} USDT, "
-            f"仓位比例={position_pct:.0f}%, 杠杆={leverage}x, "
-            f"下单数量={quantity:.6f} BTC (≈{notional_value:.2f} USDT), "
-            f"保证金={required_margin:.2f}, stepSize={step_size}"
+        return _compute_order_quantity(
+            balance,
+            current_price,
+            leverage,
+            position_pct,
+            step_size,
+            min_qty,
+            min_notional,
+            self.round_step_size,
+            log_prefix=f"[{self.name}]",
         )
-        
-        return quantity
     
     async def calculate_order_quantity_async(
         self, 
@@ -871,6 +685,64 @@ class TradingUser:
             logging.error(f"[{self.name}] 获取持仓信息失败: {e}")
             return None
 
+    async def sync_real_position(self, symbol: str) -> Dict[str, Any]:
+        """
+        同步币安真实持仓，返回标准化字典供策略引擎对比。
+
+        调用 Binance futures_position_information，提取数量、开仓均价与浮盈。
+
+        Args:
+            symbol: 交易对，如 BTCUSDT
+
+        Returns:
+            标准化字典，始终返回（无持仓时数量为 0）:
+            {
+                "symbol": str,
+                "position_amt": float,      # 有符号：正=多，负=空
+                "quantity": float,           # 数量绝对值
+                "side": str,                 # "buy" | "sell"
+                "entry_price": float,       # 开仓均价
+                "unrealized_profit": float, # 未实现盈亏（USDT）
+                "has_position": bool,
+            }
+        """
+        if self.client is None:
+            raise RuntimeError(f"用户 {self.name} 尚未连接客户端")
+
+        empty: Dict[str, Any] = {
+            "symbol": symbol,
+            "position_amt": 0.0,
+            "quantity": 0.0,
+            "side": "buy",
+            "entry_price": 0.0,
+            "unrealized_profit": 0.0,
+            "has_position": False,
+        }
+
+        try:
+            positions = await self.client.futures_position_information(symbol=symbol)
+            for pos in positions:
+                amt = float(pos.get("positionAmt", 0))
+                if amt == 0:
+                    continue
+                entry_price = float(pos.get("entryPrice", 0))
+                un_realized = float(pos.get("unRealizedProfit", 0))
+                quantity = abs(amt)
+                side = "buy" if amt > 0 else "sell"
+                return {
+                    "symbol": symbol,
+                    "position_amt": amt,
+                    "quantity": quantity,
+                    "side": side,
+                    "entry_price": entry_price,
+                    "unrealized_profit": un_realized,
+                    "has_position": True,
+                }
+            return empty
+        except Exception as e:
+            logging.error(f"[{self.name}] sync_real_position({symbol}) 失败: {e}")
+            return empty
+
     async def get_recent_trades(self, symbol: str, limit: int = 10) -> list:
         """
         获取最近的成交记录（用于计算实际盈亏）
@@ -886,8 +758,8 @@ class TradingUser:
             raise RuntimeError(f"用户 {self.name} 尚未连接客户端")
         
         try:
-            trades = await self.client.futures_account_trades(symbol=symbol, limit=limit)
-            return trades
+            raw = await self.client.futures_account_trades(symbol=symbol, limit=limit)
+            return list(raw) if isinstance(raw, list) else []
         except Exception as e:
             logging.error(f"[{self.name}] 获取成交记录失败: {e}")
             return []
@@ -914,11 +786,10 @@ class TradingUser:
         
         try:
             # 获取最近 20 条成交记录
-            trades = await self.client.futures_account_trades(symbol=symbol, limit=20)
-            
+            raw = await self.client.futures_account_trades(symbol=symbol, limit=20)
+            trades = list(raw) if isinstance(raw, list) else []
             if not trades:
                 return {"avg_price": 0, "commission": 0, "commission_asset": "USDT"}
-            
             # 按时间倒序（最新的在前）
             trades.sort(key=lambda x: x.get("time", 0), reverse=True)
             
@@ -973,50 +844,24 @@ class TradingUser:
             return {"avg_price": 0, "commission": 0, "commission_asset": "USDT"}
 
     def calculate_limit_price(
-        self, 
-        current_price: float, 
-        side: str, 
+        self,
+        current_price: float,
+        side: str,
         slippage_pct: float = 0.05,
         symbol: str = "BTCUSDT",
         atr: Optional[float] = None,
     ) -> float:
-        """
-        计算限价单价格（带滑点容忍度，符合 tickSize 规则）
-        
-        Args:
-            current_price: 当前价格
-            side: 方向（"buy" 或 "sell"）
-            slippage_pct: 滑点百分比（默认 0.05%）
-            symbol: 交易对（用于获取 tickSize）
-            atr: ATR值（可选，用于动态调整滑点）
-        
-        Returns:
-            float: 符合 tickSize 规则的限价
-        """
-        # 获取 tickSize（使用缓存）
-        filters = self._symbol_filters.get(symbol, {"tickSize": 0.01})
+        """计算限价单价格（带滑点，符合 tickSize）。委托 user_position_sizing.compute_limit_price。"""
+        filters = self._symbol_filters.get(symbol, dict(DEFAULT_FILTERS))
         tick_size = filters.get("tickSize", 0.01)
-        
-        # 动态滑点计算（问题6修复）
-        # 如果提供了ATR，根据市场波动调整滑点
-        if atr is not None and atr > 0:
-            # ATR 相对于价格的百分比
-            atr_pct = (atr / current_price) * 100
-            # 滑点至少为 ATR 的 10%，但不超过 0.3%
-            dynamic_slippage = max(slippage_pct, min(atr_pct * 0.1, 0.3))
-            slippage_pct = dynamic_slippage
-        
-        slippage = current_price * (slippage_pct / 100)
-        
-        if side.lower() == "buy":
-            # 买入：略高于当前价
-            limit_price = current_price + slippage
-        else:
-            # 卖出：略低于当前价
-            limit_price = current_price - slippage
-        
-        # 按 tickSize 取整
-        return self.round_tick_size(limit_price, tick_size)
+        return _compute_limit_price(
+            current_price,
+            side,
+            slippage_pct,
+            tick_size,
+            self.round_tick_size,
+            atr=atr,
+        )
     
     async def get_order_status(self, symbol: str, order_id: int) -> Dict[str, Any]:
         """

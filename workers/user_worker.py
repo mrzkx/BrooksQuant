@@ -6,17 +6,15 @@
 
 import asyncio
 import logging
-import os
-from typing import Dict, List
+from typing import Dict, Optional
 
-from config import LEVERAGE, SYMBOL as CONFIG_SYMBOL
+from config import LEVERAGE, SYMBOL as CONFIG_SYMBOL, OBSERVE_MODE
 from trade_logger import TradeLogger
 from user_manager import TradingUser
 from order_executor import execute_observe_order, execute_live_order, handle_close_request
 from workers.helpers import calculate_order_quantity
 
 SYMBOL = CONFIG_SYMBOL
-OBSERVE_MODE = os.getenv("OBSERVE_MODE", "true").lower() == "true"
 
 
 async def user_worker(
@@ -32,79 +30,92 @@ async def user_worker(
     """
     logging.info(f"用户工作线程 [{user.name}] 已启动")
 
+    sync_task: Optional[asyncio.Task] = None
     if not OBSERVE_MODE:
         await _setup_live_trading(user)
-        # 恢复币安真实持仓
+        # 恢复币安真实持仓（Recovery on Startup）
         await _recover_binance_position(user, trade_logger)
+        # 定期校准（每 60 秒对比币安与本地持仓）
+        sync_task = asyncio.create_task(_position_sync_loop(user, trade_logger))
+        logging.info(f"[{user.name}] 持仓校准任务已启动，间隔 {POSITION_SYNC_INTERVAL}s")
 
     signal_count = 0
-    while True:
-        try:
-            # 等待信号或平仓请求（TP1 是否触发在 K 线周期结束时由 kline_producer 投递 sync_tp1 检测）
-            signal_task = asyncio.create_task(signal_queue.get())
-            close_task = asyncio.create_task(close_queue.get())
-            done, pending = await asyncio.wait(
-                [signal_task, close_task],
-                return_when=asyncio.FIRST_COMPLETED
-            )
-            for task in pending:
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-            completed_task = close_task if close_task in done else signal_task
-            result = completed_task.result()
-
-            # 周期结束时 TP1 触发检测（由 kline_producer 在 K 线收盘时投递）
-            if isinstance(result, dict) and result.get("action") == "sync_tp1":
-                if not OBSERVE_MODE:
-                    await _sync_tp1_if_filled(user, trade_logger)
-                continue
-
-            # 处理平仓请求（优先级高）
-            if completed_task == close_task or (isinstance(result, dict) and result.get("action") in ["close", "tp1"]):
-                if not OBSERVE_MODE:
-                    await handle_close_request(user, result, trade_logger)
-                continue
-            
-            # 处理信号
-            signal: Dict = result
-            signal_count += 1
-            logging.info(
-                f"[{user.name}] 收到信号 #{signal_count}: {signal['signal']} {signal['side']} @ {signal['price']:.2f}"
-            )
-
-            # 检查冷却期和反手条件
-            if not _should_process_signal(user, signal, trade_logger):
-                signal_queue.task_done()
-                continue
-
-            # 计算下单数量
-            order_qty, position_value = await _calculate_position(user, signal)
-
-            if OBSERVE_MODE:
-                await execute_observe_order(
-                    user, signal, order_qty, position_value, 
-                    trade_logger, calculate_order_quantity
+    try:
+        while True:
+            try:
+                # 等待信号或平仓请求（TP1 是否触发在 K 线周期结束时由 kline_producer 投递 sync_tp1 检测）
+                signal_task = asyncio.create_task(signal_queue.get())
+                close_task = asyncio.create_task(close_queue.get())
+                done, pending = await asyncio.wait(
+                    [signal_task, close_task],
+                    return_when=asyncio.FIRST_COMPLETED
                 )
-            else:
-                success = await execute_live_order(
-                    user, signal, order_qty, position_value, 
-                    trade_logger, signal_queue
+                for task in pending:
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+                completed_task = close_task if close_task in done else signal_task
+                result = completed_task.result()
+
+                # 周期结束时 TP1 触发检测（由 kline_producer 在 K 线收盘时投递）
+                if isinstance(result, dict) and result.get("action") == "sync_tp1":
+                    if not OBSERVE_MODE:
+                        await _sync_tp1_if_filled(user, trade_logger)
+                    continue
+
+                # 处理平仓请求（优先级高）
+                if completed_task == close_task or (isinstance(result, dict) and result.get("action") in ["close", "tp1"]):
+                    if not OBSERVE_MODE:
+                        await handle_close_request(user, result, trade_logger)
+                    continue
+
+                # 处理信号
+                signal: Dict = result
+                signal_count += 1
+                logging.info(
+                    f"[{user.name}] 收到信号 #{signal_count}: {signal['signal']} {signal['side']} @ {signal['price']:.2f}"
                 )
-                if not success:
+
+                # 检查冷却期和反手条件
+                if not _should_process_signal(user, signal, trade_logger):
                     signal_queue.task_done()
                     continue
 
-            signal_queue.task_done()
-            
-        except asyncio.CancelledError:
-            logging.info(f"用户工作线程 [{user.name}] 已取消")
-            break
-        except Exception as e:
-            logging.error(f"用户工作线程 [{user.name}] 出错: {e}", exc_info=True)
-            signal_queue.task_done()
+                # 计算下单数量
+                order_qty, position_value = await _calculate_position(user, signal)
+
+                if OBSERVE_MODE:
+                    await execute_observe_order(
+                        user, signal, order_qty, position_value,
+                        trade_logger, calculate_order_quantity
+                    )
+                else:
+                    success = await execute_live_order(
+                        user, signal, order_qty, position_value,
+                        trade_logger, signal_queue
+                    )
+                    if not success:
+                        signal_queue.task_done()
+                        continue
+
+                signal_queue.task_done()
+
+            except asyncio.CancelledError:
+                logging.info(f"用户工作线程 [{user.name}] 已取消")
+                break
+            except Exception as e:
+                logging.error(f"用户工作线程 [{user.name}] 出错: {e}", exc_info=True)
+                signal_queue.task_done()
+    finally:
+        if sync_task is not None:
+            sync_task.cancel()
+            try:
+                await sync_task
+            except asyncio.CancelledError:
+                pass
+            logging.info(f"[{user.name}] 持仓校准任务已停止")
 
 
 async def _setup_live_trading(user: TradingUser) -> None:
@@ -209,9 +220,72 @@ async def _recover_binance_position(user: TradingUser, trade_logger: TradeLogger
         logging.error(f"[{user.name}] 恢复币安持仓失败: {e}", exc_info=True)
 
 
-async def _handle_tp2_order(_user: TradingUser, _trade_logger: TradeLogger) -> None:
-    """TP2 由程序监控执行平仓，不再挂单（保留函数签名兼容）"""
-    return
+# 持仓校准间隔（秒）
+POSITION_SYNC_INTERVAL = 60
+
+
+async def _position_sync_alignment(user: TradingUser, trade_logger: TradeLogger) -> None:
+    """
+    实盘对齐：对比币安真实持仓与本地 trade_logger，纠正脱节。
+    - 币安无仓、本地有 -> 强制标记为外部平仓（externally_closed）
+    - 币安有仓、本地无 -> 孤儿持仓，从币安恢复并挂 2% ATR 紧急止损
+    """
+    try:
+        real = await user.sync_real_position(SYMBOL)
+        local_pos = trade_logger.positions.get(user.name)
+
+        # 币安无仓位，本地有记录 -> 外部平仓（手动/强平等）
+        if not real["has_position"] and local_pos is not None:
+            try:
+                ticker = await user.client.futures_symbol_ticker(symbol=SYMBOL)
+                exit_price = float(ticker.get("price", 0))
+            except Exception:
+                exit_price = float(local_pos.entry_price)
+            closed = trade_logger.force_close_position(
+                user.name, exit_price, reason="externally_closed"
+            )
+            if closed:
+                logging.warning(
+                    f"[{user.name}] 实盘对齐: 币安已无仓位，本地持仓已标记为外部平仓 "
+                    f"(exit_price={exit_price:.2f})"
+                )
+            return
+
+        # 币安有仓位，本地无记录 -> 孤儿持仓，从币安恢复并挂 2% ATR 紧急止损
+        if real["has_position"] and local_pos is None:
+            position_info = await user.get_position_info(SYMBOL)
+            if not position_info:
+                return
+            try:
+                ticker = await user.client.futures_symbol_ticker(symbol=SYMBOL)
+                current_price = float(ticker.get("price", 0))
+            except Exception:
+                current_price = position_info.get("markPrice", position_info.get("entryPrice", 0))
+            if current_price <= 0:
+                return
+            atr = current_price * 0.02  # 2% 紧急止损距离
+            trade = trade_logger.recover_from_binance_position(
+                user=user.name,
+                position_info=position_info,
+                current_price=current_price,
+                atr=atr,
+            )
+            if trade:
+                logging.info(
+                    f"[{user.name}] 实盘对齐: 发现孤儿持仓，已从币安恢复并挂载 2% ATR 紧急止损 "
+                    f"({trade.side.upper()} {trade.quantity:.6f} @ {trade.entry_price:.2f})"
+                )
+    except Exception as e:
+        logging.warning(f"[{user.name}] 持仓校准失败: {e}")
+
+
+async def _position_sync_loop(
+    user: TradingUser, trade_logger: TradeLogger
+) -> None:
+    """每 POSITION_SYNC_INTERVAL 秒执行一次持仓校准（仅实盘）"""
+    while True:
+        await asyncio.sleep(POSITION_SYNC_INTERVAL)
+        await _position_sync_alignment(user, trade_logger)
 
 
 async def _sync_tp1_if_filled(user: TradingUser, trade_logger: TradeLogger) -> None:
