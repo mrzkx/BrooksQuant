@@ -5,7 +5,7 @@
 """
 
 import logging
-from typing import Optional, Callable
+from typing import Optional, Callable, Dict, Any
 
 import pandas as pd
 
@@ -35,10 +35,12 @@ class SignalChecker:
         pattern_detector: PatternDetector,
         check_signal_cooldown: Optional[Callable[[str, str, int, bool], bool]] = None,
         volume_confirms_breakout: Optional[Callable[[BarContext], bool]] = None,
+        mtr_overrides: Optional[Dict[str, Any]] = None,
     ):
         self.pattern_detector = pattern_detector
         self._check_cooldown = check_signal_cooldown or _noop_cooldown
         self._volume_confirms = volume_confirms_breakout or _noop_volume
+        self.mtr_overrides = mtr_overrides  # 仅回测使用，如 retest_tolerance=0.001
 
     def check_failed_breakout(
         self, data: pd.DataFrame, ctx: BarContext
@@ -126,6 +128,9 @@ class SignalChecker:
         self, data: pd.DataFrame, ctx: BarContext
     ) -> Optional[SignalResult]:
         """检测 Climax 反转信号。"""
+        # Al Brooks: Spike 周期内禁止反转信号，这是 "Always In" 阶段
+        if ctx.market_cycle == MarketCycle.SPIKE:
+            return None
         if ctx.is_strong_trend_mode:
             return None
         result = self.pattern_detector.detect_climax_reversal(
@@ -155,6 +160,9 @@ class SignalChecker:
         self, data: pd.DataFrame, ctx: BarContext
     ) -> Optional[SignalResult]:
         """检测 Wedge 反转信号。"""
+        # Al Brooks: Spike 周期内禁止反转信号，这是 "Always In" 阶段
+        if ctx.market_cycle == MarketCycle.SPIKE:
+            return None
         if ctx.is_strong_trend_mode:
             return None
         relaxed_signal_bar = ctx.market_cycle == MarketCycle.TRADING_RANGE
@@ -191,10 +199,14 @@ class SignalChecker:
         self, data: pd.DataFrame, ctx: BarContext
     ) -> Optional[SignalResult]:
         """检测 MTR（Major Trend Reversal）主要趋势反转，利用 BarContext 市场状态。"""
+        # Al Brooks: Spike 周期内禁止反转信号，这是 "Always In" 阶段
+        if ctx.market_cycle == MarketCycle.SPIKE:
+            return None
         if ctx.is_strong_trend_mode:
             return None
+        kwargs = self.mtr_overrides or {}
         result = self.pattern_detector.detect_mtr_reversal(
-            data, ctx.i, ctx.ema, ctx.atr, ctx.market_state
+            data, ctx.i, ctx.ema, ctx.atr, ctx.market_state, **kwargs
         )
         if not result:
             return None

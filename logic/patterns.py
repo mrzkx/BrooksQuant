@@ -125,24 +125,35 @@ class PatternDetector:
         row: pd.Series, 
         side: str,
         min_body_ratio: Optional[float] = None,
-        close_position_pct: Optional[float] = None
+        close_position_pct: Optional[float] = None,
+        df: Optional[pd.DataFrame] = None,
+        i: Optional[int] = None,
+        signal_type: Optional[str] = None,
     ) -> tuple[bool, str]:
         """
-        BTC 专用信号棒质量验证（针对高波动长影线特性）
+        BTC 专用信号棒质量验证（针对高波动长影线特性 + 背景比较）
         
         Al Brooks: "信号棒的质量决定了交易的成功率"
         
-        BTC 特殊要求：
+        基础要求：
         1. 实体必须占全长的 60% 以上（过滤长影线噪音）
         2. 买入信号：收盘价必须在最高 20% 区域（强势收盘）
         3. 卖出信号：收盘价必须在最低 20% 区域（弱势收盘）
         4. 信号棒方向必须与交易方向一致（买=阳线，卖=阴线）
+        
+        背景比较（需提供 df 和 i）：
+        5. 相对大小：信号棒实体必须大于前三根 K 线实体的平均值
+        6. 低重叠度：信号棒实体与前一根棒的实体重叠部分不应超过 50%
+        7. 影线要求：反转棒（Wedge/MTR）的反向影线必须极小（<15%）
         
         Args:
             row: K线数据
             side: 交易方向 ("buy" 或 "sell")
             min_body_ratio: 最小实体占比（默认 0.60）
             close_position_pct: 收盘位置要求（默认 0.20，即顶部/底部 20%）
+            df: K线 DataFrame（用于背景比较，可选）
+            i: 当前 K 线索引（用于背景比较，可选）
+            signal_type: 信号类型（用于判断影线要求，可选）
         
         Returns:
             (is_valid, reason): 是否有效及原因
@@ -164,8 +175,34 @@ class PatternDetector:
         body_size = abs(close - open_price)
         body_ratio = body_size / kline_range
         
+        # 实体的上下边界
+        body_top = max(close, open_price)
+        body_bottom = min(close, open_price)
+        
+        # ========== Al Brooks 修正：Pin Bar 提前检测 ==========
+        # "Pin Bar（长影线）是强烈的反转信号" - Al Brooks
+        # Pin Bar 的特征是影线 > 实体×2.5，且影线 > K线范围×30%
+        # 关键是影线的方向和长度，而非实体占比
+        is_pin_bar = False
+        if side == "buy":
+            # 买入 Pin Bar：下影线（拒绝更低价格）
+            lower_wick = body_bottom - low
+            if body_size > 0 and lower_wick > body_size * 2.5 and lower_wick > kline_range * 0.30:
+                is_pin_bar = True
+                logging.debug(f"✅ Pin Bar 信号棒(买入): 下影线{lower_wick:.2f} > 实体{body_size:.2f}×2.5, 占比{lower_wick/kline_range:.1%}")
+        else:
+            # 卖出 Pin Bar：上影线（拒绝更高价格）
+            upper_wick = high - body_top
+            if body_size > 0 and upper_wick > body_size * 2.5 and upper_wick > kline_range * 0.30:
+                is_pin_bar = True
+                logging.debug(f"✅ Pin Bar 信号棒(卖出): 上影线{upper_wick:.2f} > 实体{body_size:.2f}×2.5, 占比{upper_wick/kline_range:.1%}")
+        
         # ========== 条件1: 实体占比检查 ==========
-        if body_ratio < min_body_ratio:
+        # Al Brooks 修正：Pin Bar 例外 - 直接跳过实体占比检查
+        if is_pin_bar:
+            # Pin Bar 仍需验证收盘位置和方向
+            logging.debug(f"Pin Bar 例外: 跳过实体占比检查")
+        elif body_ratio < min_body_ratio:
             return (False, f"实体占比不足({body_ratio:.1%}<{min_body_ratio:.0%})")
         
         # ========== 条件2: 信号棒方向检查 ==========
@@ -189,71 +226,156 @@ class PatternDetector:
             if close_from_low > close_position_pct:
                 return (False, f"收盘价未在底部{close_position_pct:.0%}区域(距底{close_from_low:.1%})")
         
+        # ========== 背景比较（需要 df 和 i）==========
+        if df is not None and i is not None and i >= 3:
+            # Pin Bar 已在前面检测过（is_pin_bar 变量）
+            # Al Brooks: Pin Bar 例外跳过部分背景比较检查
+            
+            # ---------- 条件4: 相对大小 ----------
+            # 信号棒实体必须大于前三根 K 线实体的平均值
+            # Pin Bar 例外：跳过此检查
+            if not is_pin_bar:
+                prev_bodies = []
+                for j in range(i - 3, i):
+                    if j >= 0 and j < len(df):
+                        prev_bar = df.iloc[j]
+                        prev_body = abs(float(prev_bar["close"]) - float(prev_bar["open"]))
+                        prev_bodies.append(prev_body)
+                
+                if prev_bodies:
+                    avg_prev_body = sum(prev_bodies) / len(prev_bodies)
+                    if body_size <= avg_prev_body:
+                        return (False, f"实体不够大(当前{body_size:.2f}≤前3根均值{avg_prev_body:.2f})")
+            
+            # ---------- 条件5: 低重叠度 ----------
+            # 信号棒实体与前一根棒的实体重叠部分不应超过 50%
+            if i >= 1:
+                prev_bar = df.iloc[i - 1]
+                prev_close = float(prev_bar["close"])
+                prev_open = float(prev_bar["open"])
+                prev_body_top = max(prev_close, prev_open)
+                prev_body_bottom = min(prev_close, prev_open)
+                prev_body_size = abs(prev_close - prev_open)
+                
+                # 计算重叠区域
+                overlap_top = min(body_top, prev_body_top)
+                overlap_bottom = max(body_bottom, prev_body_bottom)
+                overlap_size = max(0, overlap_top - overlap_bottom)
+                
+                # 重叠比例（相对于信号棒实体）
+                if body_size > 0:
+                    overlap_ratio = overlap_size / body_size
+                    if overlap_ratio > 0.50:
+                        return (False, f"实体重叠过多({overlap_ratio:.1%}>50%，市场震荡)")
+            
+            # ---------- 条件6: 影线要求（反转棒）----------
+            # 判断是否为反转信号（Wedge/MTR/Climax/FailedBreakout）
+            is_reversal_signal = (
+                signal_type is not None and (
+                    signal_type.startswith("Wedge_") or
+                    signal_type.startswith("MTR_") or
+                    signal_type.startswith("Climax_") or
+                    signal_type.startswith("FailedBreakout_") or
+                    signal_type.startswith("FinalFlag_")
+                )
+            )
+            
+            # Al Brooks: Climax 后的反转信号可以容忍更长的反向影线
+            # 因为 Climax 本身已经证明了极端情绪
+            is_climax_signal = signal_type is not None and signal_type.startswith("Climax_")
+            
+            if is_reversal_signal and not is_pin_bar:
+                # 反转棒的"反向影线"（推力方向的影线）必须极小
+                # 买入反转：上影线必须极小（看空的推力被拒绝）
+                # 卖出反转：下影线必须极小（看多的推力被拒绝）
+                # Climax 信号放宽到 25%，其他反转信号 15%
+                max_opposing_wick_ratio = 0.25 if is_climax_signal else 0.15
+                
+                if side == "buy":
+                    # 买入反转：检查上影线（空头推力）
+                    upper_wick = high - body_top
+                    upper_wick_ratio = upper_wick / kline_range if kline_range > 0 else 0
+                    if upper_wick_ratio > max_opposing_wick_ratio:
+                        return (False, f"反转棒上影线过大({upper_wick_ratio:.1%}>{max_opposing_wick_ratio:.0%})")
+                else:
+                    # 卖出反转：检查下影线（多头推力）
+                    lower_wick = body_bottom - low
+                    lower_wick_ratio = lower_wick / kline_range if kline_range > 0 else 0
+                    if lower_wick_ratio > max_opposing_wick_ratio:
+                        return (False, f"反转棒下影线过大({lower_wick_ratio:.1%}>{max_opposing_wick_ratio:.0%})")
+        
         return (True, "信号棒质量合格")
     
     def calculate_unified_stop_loss(
         self, df: pd.DataFrame, i: int, side: str, entry_price: float, atr: Optional[float] = None
-    ) -> float:
+    ) -> Optional[float]:
         """
-        Al Brooks 风格止损计算（周期自适应版）
+        Al Brooks 风格止损计算（简化版 + 动态缓冲）
         
-        核心原则：止损放在 Signal Bar（前一根K线）的极值外
+        核心原则：止损放在 Signal Bar 和 Entry Bar 的极值外
         
         Al Brooks: "如果市场回到 Signal Bar 之外，说明你的判断错了"
         
-        两种模式（由 use_signal_bar_only_stop 控制）：
-        1. 纯信号棒：stop = SignalBar.Low - TickSize（买）/ SignalBar.High + TickSize（卖）
-        2. 两棒+ATR：前两根 K 线极值 + buffer，并用 ATR 上下限约束
+        止损逻辑：
+        - 买入止损：min(SignalBar.Low, EntryBar.Low) - buffer
+        - 卖出止损：max(SignalBar.High, EntryBar.High) + buffer
+        
+        Al Brooks 修正：动态止损缓冲
+        - buffer = max(0.3 * ATR, 0.5% * entry_price)
+        - 原因：BTC 高波动时固定比例太小，低波动时 ATR 太窄
+        - 取两者较大值确保足够的缓冲空间
+        
+        High Risk Filter（保护性约束）：
+        - 如果止损距离超过 3 × ATR，认为风险过大，返回 None 放弃信号
+        
+        Args:
+            df: K线数据
+            i: 当前 K 线索引（Entry Bar）
+            side: 交易方向 "buy" / "sell"
+            entry_price: 入场价格
+            atr: ATR 值
+        
+        Returns:
+            止损价格，或 None（表示风险过大，应放弃信号）
         """
         if i < 1:
             return entry_price * (0.98 if side == "buy" else 1.02)
         
         signal_bar = df.iloc[i - 1]  # Signal Bar = 前一根 K 线
+        entry_bar = df.iloc[i]       # Entry Bar = 当前 K 线
         
-        # 纯信号棒极值 + TickSize（动态止损）
-        if self._use_signal_bar_only_stop and self._tick_size > 0:
-            if side == "buy":
-                return float(signal_bar["low"]) - self._tick_size
-            else:
-                return float(signal_bar["high"]) + self._tick_size
+        signal_low = float(signal_bar["low"])
+        signal_high = float(signal_bar["high"])
+        entry_low = float(entry_bar["low"])
+        entry_high = float(entry_bar["high"])
         
-        # 两棒 + ATR 约束模式
-        if i < 2:
-            return entry_price * (0.98 if side == "buy" else 1.02)
-        prev_bar = df.iloc[i - 2]
-        
-        if atr and atr > 0:
-            buffer = atr * 0.15
-        else:
-            buffer = entry_price * 0.0015
-        
-        atr_stop_min = self._params.atr_stop_min_mult
-        atr_stop_max = self._params.atr_stop_max_mult
+        # Al Brooks 修正：动态止损缓冲 = max(0.3 * ATR, 0.5% * entry_price)
+        # - 高波动时使用 ATR 缓冲（0.3 * ATR）
+        # - 低波动或无 ATR 时使用固定比例（0.5% * entry_price）
+        atr_buffer = (atr * 0.3) if atr and atr > 0 else 0
+        pct_buffer = entry_price * 0.005  # 0.5%
+        buffer = max(atr_buffer, pct_buffer)
         
         if side == "buy":
-            two_bar_low = min(signal_bar["low"], prev_bar["low"])
-            signal_bar_stop = two_bar_low - buffer
-            if atr and atr > 0:
-                min_stop_distance = atr * atr_stop_min
-                min_stop = entry_price - min_stop_distance
-                if signal_bar_stop > min_stop:
-                    signal_bar_stop = min_stop
-                max_stop_distance = atr * atr_stop_max
-                floor_stop = entry_price - max_stop_distance
-                signal_bar_stop = max(signal_bar_stop, floor_stop)
-            return signal_bar_stop
+            # 买入止损：min(SignalBar.Low, EntryBar.Low) - buffer
+            stop_loss = min(signal_low, entry_low) - buffer
+            stop_distance = entry_price - stop_loss
         else:
-            two_bar_high = max(signal_bar["high"], prev_bar["high"])
-            signal_bar_stop = two_bar_high + buffer
-            if atr and atr > 0:
-                min_stop_distance = atr * atr_stop_min
-                max_stop = entry_price + min_stop_distance
-                if signal_bar_stop < max_stop:
-                    signal_bar_stop = max_stop
-                max_stop_distance = atr * atr_stop_max
-                ceiling_stop = entry_price + max_stop_distance
-                signal_bar_stop = min(signal_bar_stop, ceiling_stop)
-            return signal_bar_stop
+            # 卖出止损：max(SignalBar.High, EntryBar.High) + buffer
+            stop_loss = max(signal_high, entry_high) + buffer
+            stop_distance = stop_loss - entry_price
+        
+        # High Risk Filter: 止损距离超过 3 × ATR 则放弃信号
+        if atr and atr > 0:
+            max_stop_distance = atr * 3.0
+            if stop_distance > max_stop_distance:
+                logging.debug(
+                    f"⚠️ High Risk Filter: 止损距离 {stop_distance:.2f} > 3×ATR ({max_stop_distance:.2f})，"
+                    f"放弃信号 side={side}"
+                )
+                return None
+        
+        return stop_loss
     
     def calculate_measured_move(
         self, df: pd.DataFrame, i: int, side: str, 
@@ -348,10 +470,13 @@ class PatternDetector:
         market_state: Optional[MarketState] = None
     ) -> Optional[Tuple[str, str, float, Optional[float], float, str, bool]]:
         """
-        检测 Strong Spike（强突破入场）- Al Brooks Spike & Channel 对齐版
+        检测 Strong Spike（强突破入场）- Al Brooks Spike & Channel 对齐版（修正版）
+        
+        Al Brooks 修正：Spike 更注重连续性和跟随情况，单根 K 线的实体占比不是唯一标准
+        BTC 高波动性下，65% 实体占比的强趋势棒也应被识别
         
         增强突破定义：
-        1. Signal Bar（前一根 i-1）实体占比 > 70%，且必须突破过去 10 根 K 线的极值
+        1. Signal Bar（前一根 i-1）实体占比 > 65%（从 70% 降低），且必须突破过去 10 根 K 线的极值
         2. Entry Bar（当前 Bar i）续延性验证：同向强 K 线，实体 > 50%
         
         入场模式：
@@ -400,11 +525,11 @@ class PatternDetector:
         
         # ---------- 向上突破 ----------
         if s_close > s_open and e_close > e_open:
-            # Signal Bar: 实体占比 > 70%，且突破过去 10 根最高点
+            # Signal Bar: 实体占比 > 65%（Al Brooks 修正：从 70% 降低），且突破过去 10 根最高点
             if s_range <= 0:
                 return None
             signal_body_ratio = s_body / s_range
-            if signal_body_ratio <= 0.70:
+            if signal_body_ratio <= 0.65:  # Al Brooks 修正：从 0.70 降至 0.65
                 return None
             if s_high <= max_10_high:
                 return None
@@ -447,7 +572,7 @@ class PatternDetector:
             if s_range <= 0:
                 return None
             signal_body_ratio = s_body / s_range
-            if signal_body_ratio <= 0.70:
+            if signal_body_ratio <= 0.65:  # Al Brooks 修正：从 0.70 降至 0.65
                 return None
             if s_low >= min_10_low:
                 return None
@@ -487,17 +612,24 @@ class PatternDetector:
         self, df: pd.DataFrame, i: int, ema: float, atr: Optional[float] = None
     ) -> Optional[Tuple[str, str, float, float]]:
         """
-        检测 Climax 反转信号
+        检测 Climax 反转信号（Al Brooks 修正版）
         
         当检测到 Climax（Spike 长度超过 2.5 倍 ATR）后，寻找反转信号
         
-        优化增强：
-        1. 尾部影线检查 - Al Brooks 强调真正的 Climax 有明显的"拒绝影线"
-        2. 前期走势深度检查 - 确保是真正的超卖/超买
+        Al Brooks 修正：
+        1. 尾部影线检查 - 真正的 Climax 有明显的"拒绝影线"
+        2. 前期走势深度检查 - 扩展到 5-8 根 K 线（从 3 根扩展）
+        3. 趋势持续性检查 - 至少 5 根 K 线都在 EMA 同一侧
+        
+        "Climax 通常出现在趋势的极端位置" - Al Brooks
         
         返回: (signal_type, side, stop_loss, base_height) 或 None
         """
-        if i < 3 or atr is None or atr <= 0:  # 需要至少3根K线来检查前期走势
+        # Al Brooks 修正：需要至少 8 根 K 线来检查前期走势（从 3 根扩展）
+        CLIMAX_LOOKBACK = 8
+        MIN_LOOKBACK = 5  # 最少需要 5 根
+        
+        if i < CLIMAX_LOOKBACK or atr is None or atr <= 0:
             return None
         
         current_bar = df.iloc[i]
@@ -527,23 +659,34 @@ class PatternDetector:
                 if not self.validate_signal_close(current_bar, "sell"):
                     return None
                 
-                # ⭐ 新增：尾部影线检查（上影线 = 拒绝更高价格）
+                # ⭐ 尾部影线检查（上影线 = 拒绝更高价格）
                 upper_tail = high - max(open_price, close)
                 tail_ratio = upper_tail / current_range
                 if tail_ratio < 0.15:  # 上影线至少占 K 线的 15%
                     logging.debug(f"Climax_Sell 被跳过: 上影线不足 ({tail_ratio:.1%} < 15%)")
                     return None
                 
-                # ⭐ 新增：前期走势深度检查（确保是真正的超买）
-                # 检查前 3 根 K 线的整体涨幅
-                prior_bar = df.iloc[i - 3]
-                prior_move = prev_high - prior_bar["low"]  # 从前3根的低点到Climax高点
-                if prior_move < atr * 1.5:  # 之前涨幅不够深
-                    logging.debug(f"Climax_Sell 被跳过: 前期涨幅不足 ({prior_move:.2f} < {atr * 1.5:.2f})")
+                # ⭐ Al Brooks 修正：前期走势深度检查（扩展到 5-8 根 K 线）
+                # 检查前 5-8 根 K 线的整体涨幅
+                lookback_data = df.iloc[i - CLIMAX_LOOKBACK : i]
+                lookback_low = lookback_data["low"].min()
+                prior_move = prev_high - lookback_low  # 从回看期的低点到 Climax 高点
+                if prior_move < atr * 2.0:  # 提高阈值：从 1.5 ATR 提高到 2.0 ATR
+                    logging.debug(f"Climax_Sell 被跳过: 前期涨幅不足 ({prior_move:.2f} < {atr * 2.0:.2f})")
+                    return None
+                
+                # ⭐ Al Brooks 修正：趋势持续性检查
+                # 至少 5 根 K 线都在 EMA 上方（确保是真正的超买）
+                bars_above_ema = sum(1 for j in range(i - MIN_LOOKBACK, i) if df.iloc[j]["close"] > ema)
+                if bars_above_ema < MIN_LOOKBACK:
+                    logging.debug(f"Climax_Sell 被跳过: 趋势持续性不足 (仅 {bars_above_ema}/{MIN_LOOKBACK} 根在 EMA 上方)")
                     return None
                 
                 stop_loss = self.calculate_unified_stop_loss(df, i, "sell", close, atr)
-                logging.debug(f"✅ Climax_Sell 触发: 上影线={tail_ratio:.1%}, 前期涨幅={prior_move:.2f}")
+                if stop_loss is None:
+                    logging.debug(f"Climax_Sell 被跳过: High Risk Filter 止损距离过大")
+                    return None
+                logging.debug(f"✅ Climax_Sell 触发: 上影线={tail_ratio:.1%}, 前期涨幅={prior_move:.2f}, 趋势持续={bars_above_ema}根")
                 return ("Climax_Sell", "sell", stop_loss, prev_range)
         
         # 向下 Climax -> Climax_Buy（做多反转）
@@ -552,23 +695,34 @@ class PatternDetector:
                 if not self.validate_signal_close(current_bar, "buy"):
                     return None
                 
-                # ⭐ 新增：尾部影线检查（下影线 = 拒绝更低价格）
+                # ⭐ 尾部影线检查（下影线 = 拒绝更低价格）
                 lower_tail = min(open_price, close) - low
                 tail_ratio = lower_tail / current_range
                 if tail_ratio < 0.15:  # 下影线至少占 K 线的 15%
                     logging.debug(f"Climax_Buy 被跳过: 下影线不足 ({tail_ratio:.1%} < 15%)")
                     return None
                 
-                # ⭐ 新增：前期走势深度检查（确保是真正的超卖）
-                # 检查前 3 根 K 线的整体跌幅
-                prior_bar = df.iloc[i - 3]
-                prior_move = prior_bar["high"] - prev_low  # 从前3根的高点到Climax低点
-                if prior_move < atr * 1.5:  # 之前跌幅不够深
-                    logging.debug(f"Climax_Buy 被跳过: 前期跌幅不足 ({prior_move:.2f} < {atr * 1.5:.2f})")
+                # ⭐ Al Brooks 修正：前期走势深度检查（扩展到 5-8 根 K 线）
+                # 检查前 5-8 根 K 线的整体跌幅
+                lookback_data = df.iloc[i - CLIMAX_LOOKBACK : i]
+                lookback_high = lookback_data["high"].max()
+                prior_move = lookback_high - prev_low  # 从回看期的高点到 Climax 低点
+                if prior_move < atr * 2.0:  # 提高阈值：从 1.5 ATR 提高到 2.0 ATR
+                    logging.debug(f"Climax_Buy 被跳过: 前期跌幅不足 ({prior_move:.2f} < {atr * 2.0:.2f})")
+                    return None
+                
+                # ⭐ Al Brooks 修正：趋势持续性检查
+                # 至少 5 根 K 线都在 EMA 下方（确保是真正的超卖）
+                bars_below_ema = sum(1 for j in range(i - MIN_LOOKBACK, i) if df.iloc[j]["close"] < ema)
+                if bars_below_ema < MIN_LOOKBACK:
+                    logging.debug(f"Climax_Buy 被跳过: 趋势持续性不足 (仅 {bars_below_ema}/{MIN_LOOKBACK} 根在 EMA 下方)")
                     return None
                 
                 stop_loss = self.calculate_unified_stop_loss(df, i, "buy", close, atr)
-                logging.debug(f"✅ Climax_Buy 触发: 下影线={tail_ratio:.1%}, 前期跌幅={prior_move:.2f}")
+                if stop_loss is None:
+                    logging.debug(f"Climax_Buy 被跳过: High Risk Filter 止损距离过大")
+                    return None
+                logging.debug(f"✅ Climax_Buy 触发: 下影线={tail_ratio:.1%}, 前期跌幅={prior_move:.2f}, 趋势持续={bars_below_ema}根")
                 return ("Climax_Buy", "buy", stop_loss, prev_range)
         
         return None
@@ -601,19 +755,29 @@ class PatternDetector:
     def _find_three_lower_highs(
         peaks: List[Tuple[int, float]],
         min_span: int = 3,
-        require_convergence: bool = False,
+        require_convergence: bool = True,
+        require_momentum_decay: bool = True,
     ) -> Optional[Tuple[List[int], List[float]]]:
-        """调用入口 - 实际逻辑已提取到 wedge_reversal.py"""
-        return find_three_lower_highs(peaks, min_span, require_convergence)
+        """
+        调用入口 - 实际逻辑已提取到 wedge_reversal.py
+        
+        Al Brooks 修正：默认启用收敛检测和动能递减检测
+        """
+        return find_three_lower_highs(peaks, min_span, require_convergence, require_momentum_decay)
     
     @staticmethod
     def _find_three_higher_lows(
         troughs: List[Tuple[int, float]],
         min_span: int = 3,
-        require_convergence: bool = False,
+        require_convergence: bool = True,
+        require_momentum_decay: bool = True,
     ) -> Optional[Tuple[List[int], List[float]]]:
-        """调用入口 - 实际逻辑已提取到 wedge_reversal.py"""
-        return find_three_higher_lows(troughs, min_span, require_convergence)
+        """
+        调用入口 - 实际逻辑已提取到 wedge_reversal.py
+        
+        Al Brooks 修正：默认启用收敛检测和动能递减检测
+        """
+        return find_three_higher_lows(troughs, min_span, require_convergence, require_momentum_decay)
     
     def detect_failed_breakout(
         self, df: pd.DataFrame, i: int, ema: float, atr: Optional[float] = None,
@@ -685,6 +849,9 @@ class PatternDetector:
                 threshold = 0.5 if relaxed_signal_bar else 0.6
                 if close_position >= threshold:
                     stop_loss = self.calculate_unified_stop_loss(df, i, "sell", close, atr)
+                    if stop_loss is None:
+                        logging.debug(f"FailedBreakout_Sell 被跳过: High Risk Filter 止损距离过大")
+                        return None
                     logging.debug(f"✅ FailedBreakout_Sell 触发: 创新高{current_high:.2f}后反转，收盘位置={close_position:.1%}")
                     return ("FailedBreakout_Sell", "sell", stop_loss, range_width)
         
@@ -711,6 +878,9 @@ class PatternDetector:
                 threshold = 0.5 if relaxed_signal_bar else 0.6
                 if close_position >= threshold:
                     stop_loss = self.calculate_unified_stop_loss(df, i, "buy", close, atr)
+                    if stop_loss is None:
+                        logging.debug(f"FailedBreakout_Buy 被跳过: High Risk Filter 止损距离过大")
+                        return None
                     logging.debug(f"✅ FailedBreakout_Buy 触发: 创新低{current_low:.2f}后反转，收盘位置={close_position:.1%}")
                     return ("FailedBreakout_Buy", "buy", stop_loss, range_width)
         
@@ -751,8 +921,12 @@ class PatternDetector:
             return None
         
         # 三推高点递降：楔顶失败突破（突破楔顶后收盘拉回 → 卖）
+        # Al Brooks 修正：启用收敛检测和动能递减检测
         peaks_rec = self._find_swing_peaks(df, lookback_start, i + 1, min_left=2, min_right=2)
-        three_lower = self._find_three_lower_highs(peaks_rec, min_span=leg_span, require_convergence=False)
+        three_lower = self._find_three_lower_highs(
+            peaks_rec, min_span=leg_span, 
+            require_convergence=True, require_momentum_decay=True
+        )
         if three_lower is not None:
             peak_indices, peak_values = three_lower
             wedge_high = max(peak_values)
@@ -768,8 +942,12 @@ class PatternDetector:
                         return ("Wedge_FailedBreakout_Sell", "sell", stop_loss, range_width)
         
         # 三推低点递升：楔底失败突破（跌破楔底后收盘拉回 → 买）
+        # Al Brooks 修正：启用收敛检测和动能递减检测
         troughs_rec = self._find_swing_troughs(df, lookback_start, i + 1, min_left=2, min_right=2)
-        three_higher = self._find_three_higher_lows(troughs_rec, min_span=leg_span, require_convergence=False)
+        three_higher = self._find_three_higher_lows(
+            troughs_rec, min_span=leg_span,
+            require_convergence=True, require_momentum_decay=True
+        )
         if three_higher is not None:
             trough_indices, trough_values = three_higher
             wedge_low = min(trough_values)
@@ -817,6 +995,509 @@ class PatternDetector:
             validate_signal_close_func=self.validate_signal_close,
         )
     
+    # ========== MTR 辅助函数：纯价格行为趋势识别 ==========
+    
+    @staticmethod
+    def _identify_significant_trend(
+        df: pd.DataFrame,
+        end_idx: int,
+        lookback: int = 60,
+        min_swing_points: int = 3,
+    ) -> Optional[Tuple[str, List[Tuple[int, float]], List[Tuple[int, float]], float]]:
+        """
+        识别显著趋势（纯价格行为，不依赖 EMA）
+        
+        Al Brooks: 趋势由连续的 Higher High + Higher Low（上升）或 
+        Lower High + Lower Low（下降）定义。
+        
+        Args:
+            df: K线数据
+            end_idx: 当前 K 线索引
+            lookback: 回看周期（默认 60 根）
+            min_swing_points: 最少需要的 swing 点数量
+        
+        Returns:
+            (trend_direction, swing_highs, swing_lows, trend_strength) 或 None
+            - trend_direction: "up" / "down"
+            - swing_highs: [(idx, high), ...] 趋势中的主要高点
+            - swing_lows: [(idx, low), ...] 趋势中的主要低点
+            - trend_strength: 趋势强度（0-1，基于价格变动幅度）
+        """
+        start_idx = max(0, end_idx - lookback)
+        if end_idx - start_idx < 20:
+            return None
+        
+        # 识别 swing highs 和 swing lows
+        swing_highs: List[Tuple[int, float]] = []
+        swing_lows: List[Tuple[int, float]] = []
+        
+        for j in range(start_idx + 2, end_idx - 1):
+            h = float(df.iloc[j]["high"])
+            l = float(df.iloc[j]["low"])
+            
+            # Swing High: 左右两根的高点都更低
+            left_h1 = float(df.iloc[j - 1]["high"])
+            left_h2 = float(df.iloc[j - 2]["high"])
+            right_h1 = float(df.iloc[j + 1]["high"])
+            if h > left_h1 and h > left_h2 and h > right_h1:
+                swing_highs.append((j, h))
+            
+            # Swing Low: 左右两根的低点都更高
+            left_l1 = float(df.iloc[j - 1]["low"])
+            left_l2 = float(df.iloc[j - 2]["low"])
+            right_l1 = float(df.iloc[j + 1]["low"])
+            if l < left_l1 and l < left_l2 and l < right_l1:
+                swing_lows.append((j, l))
+        
+        if len(swing_highs) < min_swing_points or len(swing_lows) < min_swing_points:
+            return None
+        
+        # 分析趋势方向
+        # 上升趋势: 后续的 swing high 更高，swing low 也更高
+        # 下降趋势: 后续的 swing high 更低，swing low 也更低
+        
+        recent_highs = swing_highs[-min_swing_points:]
+        recent_lows = swing_lows[-min_swing_points:]
+        
+        # 检查上升趋势
+        hh_count = 0  # Higher High 计数
+        hl_count = 0  # Higher Low 计数
+        for k in range(1, len(recent_highs)):
+            if recent_highs[k][1] > recent_highs[k - 1][1]:
+                hh_count += 1
+        for k in range(1, len(recent_lows)):
+            if recent_lows[k][1] > recent_lows[k - 1][1]:
+                hl_count += 1
+        
+        # 检查下降趋势
+        lh_count = 0  # Lower High 计数
+        ll_count = 0  # Lower Low 计数
+        for k in range(1, len(recent_highs)):
+            if recent_highs[k][1] < recent_highs[k - 1][1]:
+                lh_count += 1
+        for k in range(1, len(recent_lows)):
+            if recent_lows[k][1] < recent_lows[k - 1][1]:
+                ll_count += 1
+        
+        # 计算趋势强度
+        total_range = float(df.iloc[start_idx:end_idx + 1]["high"].max() - 
+                           df.iloc[start_idx:end_idx + 1]["low"].min())
+        if total_range == 0:
+            return None
+        
+        # 判断趋势方向
+        up_score = hh_count + hl_count
+        down_score = lh_count + ll_count
+        required_score = min_swing_points - 1  # 至少需要这么多连续的同向 swing
+        
+        if up_score >= required_score and up_score > down_score:
+            # 上升趋势：从最早的 swing low 到最近的 swing high
+            trend_move = recent_highs[-1][1] - recent_lows[0][1]
+            trend_strength = min(1.0, abs(trend_move) / total_range)
+            return ("up", swing_highs, swing_lows, trend_strength)
+        
+        elif down_score >= required_score and down_score > up_score:
+            # 下降趋势：从最早的 swing high 到最近的 swing low
+            trend_move = recent_highs[0][1] - recent_lows[-1][1]
+            trend_strength = min(1.0, abs(trend_move) / total_range)
+            return ("down", swing_highs, swing_lows, trend_strength)
+        
+        return None
+    
+    @staticmethod
+    def _calculate_trendline(
+        swing_points: List[Tuple[int, float]],
+        direction: str,
+    ) -> Optional[Tuple[float, float, int, int]]:
+        """
+        计算趋势线（连接主要 swing 点）
+        
+        Args:
+            swing_points: [(idx, price), ...] swing 高点或低点
+            direction: "up" 连接低点（支撑线），"down" 连接高点（压力线）
+        
+        Returns:
+            (slope, intercept, start_idx, end_idx) 或 None
+            趋势线方程: price = slope * idx + intercept
+        """
+        if len(swing_points) < 2:
+            return None
+        
+        # 使用最近的两个主要 swing 点来画趋势线
+        # 上升趋势：连接 swing lows（支撑线）
+        # 下降趋势：连接 swing highs（压力线）
+        
+        # 取最近的 2-3 个点，选择形成最有效趋势线的两点
+        recent_points = swing_points[-3:] if len(swing_points) >= 3 else swing_points[-2:]
+        
+        best_line = None
+        best_touches = 0
+        
+        for i in range(len(recent_points)):
+            for j in range(i + 1, len(recent_points)):
+                p1_idx, p1_price = recent_points[i]
+                p2_idx, p2_price = recent_points[j]
+                
+                if p2_idx == p1_idx:
+                    continue
+                
+                slope = (p2_price - p1_price) / (p2_idx - p1_idx)
+                intercept = p1_price - slope * p1_idx
+                
+                # 验证斜率方向与趋势一致
+                if direction == "up" and slope <= 0:
+                    continue
+                if direction == "down" and slope >= 0:
+                    continue
+                
+                # 计算触碰次数（其他点接近趋势线）
+                touches = 2  # 两个定义点
+                for k, (pt_idx, pt_price) in enumerate(swing_points):
+                    if k == i or k == j:
+                        continue
+                    expected = slope * pt_idx + intercept
+                    tolerance = abs(expected) * 0.005  # 0.5% 容差
+                    if abs(pt_price - expected) <= tolerance:
+                        touches += 1
+                
+                if touches > best_touches:
+                    best_touches = touches
+                    best_line = (slope, intercept, p1_idx, p2_idx)
+        
+        return best_line
+    
+    @staticmethod
+    def _is_trendline_break(
+        df: pd.DataFrame,
+        bar_idx: int,
+        trendline: Tuple[float, float, int, int],
+        direction: str,
+        atr: Optional[float] = None,
+    ) -> Tuple[bool, float]:
+        """
+        检测趋势线突破（Al Brooks 修正版）
+        
+        Al Brooks: "趋势线突破需要有意义的跟随"
+        仅收盘价穿越趋势线不足以确认突破
+        
+        Al Brooks 修正：提高突破阈值
+        - 至少突破趋势线 0.8%（从 0.5% 提高）
+        - 或 1.0×ATR（从 0.8×ATR 提高）
+        - 增加突破棒收盘位置检查
+        
+        Args:
+            df: K线数据
+            bar_idx: 当前 K 线索引
+            trendline: (slope, intercept, start_idx, end_idx)
+            direction: 原趋势方向 "up" / "down"
+            atr: ATR 值（用于计算突破幅度）
+        
+        Returns:
+            (is_break, break_magnitude): 是否突破及突破幅度
+        """
+        slope, intercept, _, _ = trendline
+        bar = df.iloc[bar_idx]
+        bar_close = float(bar["close"])
+        bar_low = float(bar["low"])
+        bar_high = float(bar["high"])
+        bar_open = float(bar["open"])
+        
+        # 计算趋势线在当前位置的预期价格
+        trendline_price = slope * bar_idx + intercept
+        
+        # Al Brooks 修正：检查突破棒收盘位置
+        # 突破棒收盘应在极端位置（>75%）才是有效突破
+        kline_range = bar_high - bar_low
+        if kline_range > 0:
+            if direction == "up":
+                # 跌破支撑线：阴线，收盘在下方 75% 区域
+                close_position = (bar_high - bar_close) / kline_range
+                if close_position < 0.75 and bar_close >= bar_open:  # 非强势阴线
+                    return (False, 0.0)
+            else:
+                # 突破压力线：阳线，收盘在上方 75% 区域
+                close_position = (bar_close - bar_low) / kline_range
+                if close_position < 0.75 and bar_close <= bar_open:  # 非强势阳线
+                    return (False, 0.0)
+        
+        if direction == "up":
+            # 上升趋势，检测跌破支撑线
+            # 收盘价必须在趋势线下方
+            if bar_close >= trendline_price:
+                return (False, 0.0)
+            break_magnitude = (trendline_price - bar_close) / trendline_price
+            # Al Brooks 修正：趋势线突破需要更显著的幅度
+            # 至少突破趋势线 0.8%（从 0.5% 提高），或 1.0×ATR（从 0.8×ATR 提高）
+            min_break = 0.008  # 从 0.005 提高到 0.008
+            if atr and atr > 0:
+                min_break = max(min_break, 1.0 * atr / trendline_price)  # 从 0.8 提高到 1.0
+            if break_magnitude >= min_break:
+                return (True, break_magnitude)
+        
+        elif direction == "down":
+            # 下降趋势，检测突破压力线
+            if bar_close <= trendline_price:
+                return (False, 0.0)
+            break_magnitude = (bar_close - trendline_price) / trendline_price
+            # Al Brooks 修正：趋势线突破需要更显著的幅度
+            min_break = 0.008  # 从 0.005 提高到 0.008
+            if atr and atr > 0:
+                min_break = max(min_break, 1.0 * atr / trendline_price)  # 从 0.8 提高到 1.0
+            if break_magnitude >= min_break:
+                return (True, break_magnitude)
+        
+        return (False, 0.0)
+    
+    @staticmethod
+    def _is_strong_breakout_bar(
+        df: pd.DataFrame,
+        bar_idx: int,
+        direction: str,
+        min_body_ratio: float = 0.55,
+    ) -> Tuple[bool, str]:
+        """
+        验证突破棒是否为强趋势棒
+        
+        Al Brooks: 强突破棒的特征 - 实体大、影线小、收盘价在极端位置
+        
+        Args:
+            bar_idx: K 线索引
+            direction: 突破方向 "up" / "down"（与原趋势相反）
+            min_body_ratio: 最小实体占比
+        
+        Returns:
+            (is_strong, reason)
+        """
+        bar = df.iloc[bar_idx]
+        high = float(bar["high"])
+        low = float(bar["low"])
+        open_price = float(bar["open"])
+        close = float(bar["close"])
+        
+        kline_range = high - low
+        if kline_range == 0:
+            return (False, "K线范围为0")
+        
+        body = abs(close - open_price)
+        body_ratio = body / kline_range
+        
+        # 实体占比检查
+        if body_ratio < min_body_ratio:
+            return (False, f"实体占比不足({body_ratio:.1%}<{min_body_ratio:.0%})")
+        
+        # 方向检查
+        is_bullish = close > open_price
+        is_bearish = close < open_price
+        
+        if direction == "up" and not is_bullish:
+            return (False, "向上突破需要阳线")
+        if direction == "down" and not is_bearish:
+            return (False, "向下突破需要阴线")
+        
+        # 收盘位置检查（收盘价应在趋势方向的极端位置）
+        if direction == "up":
+            close_position = (close - low) / kline_range
+            if close_position < 0.70:
+                return (False, f"收盘位置不够高({close_position:.1%})")
+        else:
+            close_position = (high - close) / kline_range
+            if close_position < 0.70:
+                return (False, f"收盘位置不够低({close_position:.1%})")
+        
+        return (True, "强突破棒")
+    
+    @staticmethod
+    def _count_overlapping_bars(
+        df: pd.DataFrame,
+        start_idx: int,
+        end_idx: int,
+        overlap_threshold: float = 0.5,
+    ) -> int:
+        """
+        计算重叠棒数量（用于过滤弱突破）
+        
+        Al Brooks: 多根重叠棒表示市场犹豫，不是真正的突破
+        
+        Args:
+            start_idx, end_idx: 检测范围
+            overlap_threshold: 重叠比例阈值
+        
+        Returns:
+            重叠棒数量
+        """
+        if end_idx <= start_idx:
+            return 0
+        
+        overlap_count = 0
+        for j in range(start_idx + 1, end_idx + 1):
+            if j >= len(df):
+                break
+            curr = df.iloc[j]
+            prev = df.iloc[j - 1]
+            
+            curr_high = float(curr["high"])
+            curr_low = float(curr["low"])
+            prev_high = float(prev["high"])
+            prev_low = float(prev["low"])
+            
+            # 计算重叠区域
+            overlap_high = min(curr_high, prev_high)
+            overlap_low = max(curr_low, prev_low)
+            
+            if overlap_high > overlap_low:
+                overlap_range = overlap_high - overlap_low
+                curr_range = curr_high - curr_low
+                if curr_range > 0 and overlap_range / curr_range >= overlap_threshold:
+                    overlap_count += 1
+        
+        return overlap_count
+    
+    @staticmethod
+    def _detect_double_top_bottom(
+        df: pd.DataFrame,
+        i: int,
+        extreme_price: float,
+        trend_direction: str,
+        atr: Optional[float] = None,
+        lookback: int = 30,
+        min_bar_gap: int = 5,
+    ) -> Tuple[bool, int]:
+        """
+        检测双顶/双底结构 - Al Brooks MTR 增强验证
+        
+        Al Brooks: 双顶/双底是 MTR 的核心结构，两个接近的极值点
+        形成了"磁吸位"，增加了反转的可信度。
+        
+        检测逻辑：
+        1. 在回看期内找到所有接近 extreme_price 的极值点
+        2. 验证至少有 2 个极值点（间隔 >= min_bar_gap 根 K 线）
+        3. 返回是否形成双顶/双底 + 第一个极值点的索引
+        
+        Args:
+            df: K线数据
+            i: 当前 K 线索引
+            extreme_price: 极值价格
+            trend_direction: 趋势方向 ("up" = 双顶, "down" = 双底)
+            atr: ATR 值（用于计算容差）
+            lookback: 回看周期
+            min_bar_gap: 两个极值点之间的最小 K 线间隔
+        
+        Returns:
+            (is_double_pattern, first_extreme_idx)
+        """
+        # 动态容差：0.5 * ATR 或 0.5% 价格
+        if atr and atr > 0:
+            tolerance = atr * 0.5
+        else:
+            tolerance = extreme_price * 0.005
+        
+        extremes: List[Tuple[int, float]] = []
+        
+        for j in range(max(0, i - lookback), i + 1):
+            bar = df.iloc[j]
+            if trend_direction == "up":
+                # 双顶：找接近 extreme_price 的高点
+                bar_high = float(bar["high"])
+                if bar_high >= extreme_price - tolerance:
+                    extremes.append((j, bar_high))
+            else:
+                # 双底：找接近 extreme_price 的低点
+                bar_low = float(bar["low"])
+                if bar_low <= extreme_price + tolerance:
+                    extremes.append((j, bar_low))
+        
+        # 合并相邻的极值点（同一波动中的连续极值只算一个）
+        merged_extremes: List[Tuple[int, float]] = []
+        for idx, price in extremes:
+            if not merged_extremes or idx - merged_extremes[-1][0] >= 2:
+                merged_extremes.append((idx, price))
+            else:
+                # 更新为更极端的值
+                if trend_direction == "up" and price > merged_extremes[-1][1]:
+                    merged_extremes[-1] = (idx, price)
+                elif trend_direction == "down" and price < merged_extremes[-1][1]:
+                    merged_extremes[-1] = (idx, price)
+        
+        # 验证：至少需要 2 个极值点，且间隔 >= min_bar_gap
+        if len(merged_extremes) >= 2:
+            first_idx, first_price = merged_extremes[-2]
+            second_idx, second_price = merged_extremes[-1]
+            
+            if second_idx - first_idx >= min_bar_gap:
+                logging.debug(
+                    f"✅ 双{'顶' if trend_direction == 'up' else '底'}检测: "
+                    f"第一极值@{first_idx}={first_price:.2f}, "
+                    f"第二极值@{second_idx}={second_price:.2f}, "
+                    f"间隔={second_idx - first_idx}根"
+                )
+                return (True, first_idx)
+        
+        return (False, -1)
+    
+    @staticmethod
+    def _detect_retest_with_false_breakout(
+        df: pd.DataFrame,
+        current_idx: int,
+        extreme_price: float,
+        trend_direction: str,
+        atr: Optional[float] = None,
+        fallback_tolerance: float = 0.003,
+    ) -> Tuple[bool, bool, int]:
+        """
+        检测回测（允许假突破）- 动态 ATR 容差版
+        
+        Al Brooks: MTR 回测时常出现 Higher High（上升趋势）或 Lower Low（下降趋势）
+        的假突破，这反而增加了反转的可信度。
+        
+        Al Brooks 修正：
+        - BTC 等高波动资产使用固定百分比容差太窄（0.3% ≈ $300），容易被插针过滤
+        - 改用 0.5 * ATR 作为动态容差，更适应市场波动
+        
+        Args:
+            current_idx: 当前 K 线索引
+            extreme_price: 原趋势的极值价格
+            trend_direction: 原趋势方向
+            atr: ATR 值（用于计算动态容差）
+            fallback_tolerance: ATR 不可用时的回退容差比例
+        
+        Returns:
+            (is_at_retest, is_false_breakout, retest_bar_idx)
+        """
+        bar = df.iloc[current_idx]
+        bar_high = float(bar["high"])
+        bar_low = float(bar["low"])
+        
+        # 检查前一根 K 线
+        prev_bar = df.iloc[current_idx - 1] if current_idx > 0 else None
+        prev_high = float(prev_bar["high"]) if prev_bar is not None else 0
+        prev_low = float(prev_bar["low"]) if prev_bar is not None else float("inf")
+        
+        # 动态 ATR 容差：0.5 * ATR，回退到固定百分比
+        # Al Brooks: 对于 BTC 这种高波动资产，ATR 容差更合理
+        if atr and atr > 0:
+            atr_tolerance = atr * 0.5
+        else:
+            atr_tolerance = extreme_price * fallback_tolerance
+        
+        if trend_direction == "up":
+            # 上升趋势回测前高
+            retest_zone = extreme_price - atr_tolerance
+            at_retest = bar_high >= retest_zone or prev_high >= retest_zone
+            # 假突破：创出更高高点（超过极值 + 0.25 * ATR）
+            false_breakout_threshold = extreme_price + (atr_tolerance * 0.5)
+            false_breakout = bar_high > false_breakout_threshold
+            retest_bar = current_idx if bar_high >= retest_zone else (current_idx - 1 if prev_high >= retest_zone else -1)
+        else:
+            # 下降趋势回测前低
+            retest_zone = extreme_price + atr_tolerance
+            at_retest = bar_low <= retest_zone or prev_low <= retest_zone
+            # 假突破：创出更低低点（低于极值 - 0.25 * ATR）
+            false_breakout_threshold = extreme_price - (atr_tolerance * 0.5)
+            false_breakout = bar_low < false_breakout_threshold
+            retest_bar = current_idx if bar_low <= retest_zone else (current_idx - 1 if prev_low <= retest_zone else -1)
+        
+        return (at_retest, false_breakout, retest_bar)
+    
     def detect_mtr_reversal(
         self,
         df: pd.DataFrame,
@@ -824,26 +1505,49 @@ class PatternDetector:
         ema: float,
         atr: Optional[float] = None,
         market_state: Optional[MarketState] = None,
+        *,
+        mtr_lookback: int = 60,
+        min_trend_bars: int = 8,
+        retest_tolerance: float = 0.003,
+        max_overlapping_bars: int = 3,
     ) -> Optional[Tuple[str, str, float, float]]:
         """
-        检测 MTR（Major Trend Reversal）主要趋势反转 - Al Brooks 理论
+        检测 MTR（Major Trend Reversal）主要趋势反转 - 纯价格行为版
         
-        逻辑要求：
-        1. 识别上下文：必须先有强趋势（EMA 倾斜且价格在 EMA 一侧）
-        2. 突破趋势线：监测价格穿越 EMA20 并收盘在另一侧
-        3. 极值测试：记录突破前趋势的极值点（高点/低点），价格需再次回测该点
-        4. 信号入场：在回测极值点时，若出现强反转棒（Signal Bar）或二阶段信号（H2/L2），触发 MTR
+        Al Brooks MTR 核心逻辑（不依赖 EMA 交叉）：
+        1. 趋势定义：回看 60 根 K 线，识别显著的上升/下降趋势
+           - 上升趋势：连续的 Higher High + Higher Low
+           - 下降趋势：连续的 Lower High + Lower Low
         
-        返回: (signal_type, side, stop_loss, base_height) 或 None
+        2. 趋势线突破：连接趋势中的主要高/低点
+           - 上升趋势：连接 swing lows 形成支撑线，价格跌破
+           - 下降趋势：连接 swing highs 形成压力线，价格突破
+        
+        3. 强力突破棒：突破棒必须是强趋势棒
+           - 实体占比 >= 55%
+           - 收盘在极端位置（顶部/底部 30%）
+        
+        4. 回测（允许假突破）：价格回到前极值附近
+           - 允许 Higher High（上升趋势）或 Lower Low（下降趋势）
+           - 在假突破后寻找反转信号棒
+        
+        5. 弱突破过滤：如果突破区域有太多重叠棒，取消信号
+        
+        Args:
+            df: K线数据
+            i: 当前 K 线索引
+            ema: EMA20（仅用于止盈参考）
+            atr: ATR 值
+            market_state: 市场状态
+            mtr_lookback: 趋势识别回看周期（默认 60）
+            min_trend_bars: 最少趋势 K 线数量
+            retest_tolerance: 回测容差比例
+            max_overlapping_bars: 最大允许重叠棒数量
+        
+        Returns:
+            (signal_type, side, stop_loss, base_height) 或 None
         """
-        MTR_LOOKBACK = 30
-        MIN_TREND_BARS = 5
-        EMA_SLOPE_LOOKBACK = 5
-        RETEST_TOLERANCE = 0.002  # 极值回测容差 0.2%
-        
-        if i < MTR_LOOKBACK + 2:
-            return None
-        if "ema" not in df.columns:
+        if i < mtr_lookback + 5:
             return None
         
         current_bar = df.iloc[i]
@@ -851,155 +1555,192 @@ class PatternDetector:
         current_low = float(current_bar["low"])
         current_close = float(current_bar["close"])
         current_open = float(current_bar["open"])
-        prev_bar = df.iloc[i - 1]
-        prev_high = float(prev_bar["high"])
-        prev_low = float(prev_bar["low"])
-        prev_close = float(prev_bar["close"])
-        prev_ema = float(prev_bar["ema"]) if "ema" in prev_bar.index else ema
         
-        # ---------- MTR_Sell：先有上涨趋势 → 跌破 EMA → 回测前高 → 强反转棒做空 ----------
-        for break_idx in range(i - 1, max(0, i - MTR_LOOKBACK), -1):
-            break_row = df.iloc[break_idx]
-            break_close = float(break_row["close"])
-            break_ema = float(break_row["ema"])
-            if break_close >= break_ema:
-                continue
-            # 突破棒：当前收盘在 EMA 下方
-            prev_to_break = break_idx - 1
-            if prev_to_break < 0:
-                continue
-            prev_break_row = df.iloc[prev_to_break]
-            prev_break_close = float(prev_break_row["close"])
-            prev_break_ema = float(prev_break_row["ema"])
-            if prev_break_close <= prev_break_ema:
-                continue
-            # 突破前为上涨：前一根在 EMA 上方
-            # 强趋势：突破前至少 MIN_TREND_BARS 根在 EMA 上方，且 EMA 倾斜向上
-            trend_start = prev_to_break
-            while trend_start > 0 and float(df.iloc[trend_start]["close"]) > float(df.iloc[trend_start]["ema"]):
-                trend_start -= 1
-            trend_start += 1
-            trend_bars = prev_to_break - trend_start + 1
-            if trend_bars < MIN_TREND_BARS:
-                continue
-            ema_at_end = float(df.iloc[prev_to_break]["ema"])
-            ema_early_idx = max(0, prev_to_break - EMA_SLOPE_LOOKBACK)
-            ema_early = float(df.iloc[ema_early_idx]["ema"])
-            if ema_at_end <= ema_early:
-                continue
-            # EMA 倾斜且价格在 EMA 一侧（强趋势）✓
-            extreme_high = float(df.iloc[trend_start : prev_to_break + 1]["high"].max())
-            # 突破后是否回测前高
-            retest_occurred = False
-            for j in range(break_idx + 1, i + 1):
-                if float(df.iloc[j]["high"]) >= extreme_high * (1.0 - RETEST_TOLERANCE):
-                    retest_occurred = True
-                    break
-            if not retest_occurred:
-                continue
-            # 当前棒或前一根处于/接近回测区（触及前高附近）
-            at_retest = (
-                current_high >= extreme_high * (1.0 - RETEST_TOLERANCE) or
-                prev_high >= extreme_high * (1.0 - RETEST_TOLERANCE)
+        # ========== Step 1: 识别显著趋势 ==========
+        trend_result = self._identify_significant_trend(
+            df, i, lookback=mtr_lookback, min_swing_points=3
+        )
+        if trend_result is None:
+            return None
+        
+        trend_direction, swing_highs, swing_lows, trend_strength = trend_result
+        
+        # 趋势强度过滤：至少 40% 才算显著趋势
+        if trend_strength < 0.4:
+            logging.debug(f"MTR 跳过: 趋势强度不足 ({trend_strength:.1%} < 40%)")
+            return None
+        
+        # ========== Step 2: 计算趋势线 ==========
+        if trend_direction == "up":
+            # 上升趋势：连接 swing lows 形成支撑线
+            trendline = self._calculate_trendline(swing_lows, "up")
+            extreme_price = max(h for _, h in swing_highs[-3:])  # 趋势最高点
+        else:
+            # 下降趋势：连接 swing highs 形成压力线
+            trendline = self._calculate_trendline(swing_highs, "down")
+            extreme_price = min(l for _, l in swing_lows[-3:])  # 趋势最低点
+        
+        if trendline is None:
+            logging.debug("MTR 跳过: 无法计算有效趋势线")
+            return None
+        
+        # ========== Step 3: 检测趋势线突破 ==========
+        # 在最近 20 根 K 线内寻找突破点
+        break_bar_idx = None
+        for check_idx in range(max(0, i - 20), i + 1):
+            is_break, break_mag = self._is_trendline_break(
+                df, check_idx, trendline, trend_direction, atr
             )
-            if not at_retest:
-                continue
-            # 强反转棒（阴线、实体占比与收盘位置合格）或二阶段：用信号棒质量验证
-            valid_sell, reason = self.validate_btc_signal_bar(current_bar, "sell")
-            if valid_sell:
+            if is_break:
+                break_bar_idx = check_idx
+                break
+        
+        if break_bar_idx is None:
+            return None
+        
+        # ========== Step 4: 验证突破棒强度 ==========
+        # 突破方向与原趋势相反
+        breakout_direction = "down" if trend_direction == "up" else "up"
+        is_strong, reason = self._is_strong_breakout_bar(
+            df, break_bar_idx, breakout_direction, min_body_ratio=0.55
+        )
+        if not is_strong:
+            logging.debug(f"MTR 跳过: 突破棒不够强 - {reason}")
+            return None
+        
+        # ========== Step 5: 检测弱突破（重叠棒过滤）==========
+        overlap_count = self._count_overlapping_bars(
+            df, break_bar_idx, min(break_bar_idx + 5, i), overlap_threshold=0.5
+        )
+        if overlap_count > max_overlapping_bars:
+            logging.debug(f"MTR 跳过: 突破后重叠棒过多 ({overlap_count} > {max_overlapping_bars})")
+            return None
+        
+        # ========== Step 6: 检测回测（允许假突破）==========
+        # Al Brooks 修正：使用动态 ATR 容差（0.5 * ATR），而非固定百分比
+        at_retest, is_false_bo, retest_bar = self._detect_retest_with_false_breakout(
+            df, i, extreme_price, trend_direction, atr=atr, fallback_tolerance=retest_tolerance
+        )
+        
+        if not at_retest:
+            return None
+        
+        # ========== Step 6.5: 双顶/双底验证（增强 MTR 可信度）==========
+        # Al Brooks: 双顶/双底是 MTR 的核心结构，增加反转可信度
+        is_double_pattern, first_extreme_idx = self._detect_double_top_bottom(
+            df, i, extreme_price, trend_direction, atr=atr, lookback=30, min_bar_gap=5
+        )
+        
+        # 如果有双顶/双底 + 假突破，信号更强
+        has_strong_structure = is_double_pattern or is_false_bo
+        
+        # ========== Step 7: 验证反转信号棒 ==========
+        if trend_direction == "up":
+            # 上升趋势反转 → 做空
+            valid_signal, signal_reason = self.validate_btc_signal_bar(
+                current_bar, "sell", df=df, i=i, signal_type="MTR_Sell"
+            )
+            # Al Brooks 修正：双顶 + 假突破后的阴线更有说服力
+            if valid_signal or (has_strong_structure and current_close < current_open):
                 stop_loss = self.calculate_unified_stop_loss(df, i, "sell", current_close, atr)
-                base_height = extreme_high - current_close
+                if stop_loss is None:
+                    logging.debug(f"MTR_Sell 被跳过: High Risk Filter 止损距离过大")
+                    return None
+                # 如果有假突破，止损设在假突破高点上方
+                # Al Brooks: 结构止损应设在假突破极值 + 0.5 ATR
+                if is_false_bo:
+                    stop_loss = max(stop_loss, current_high + (0.5 * atr if atr else current_high * 0.005))
+                
+                base_height = extreme_price - current_close
                 if atr and atr > 0 and base_height < atr * 0.5:
                     base_height = atr * 2.0
+                
+                # 构建信号详情
+                signal_details = []
+                if is_double_pattern:
+                    signal_details.append("双顶")
+                if is_false_bo:
+                    signal_details.append("假突破")
+                signal_detail = f"({'+'.join(signal_details)})" if signal_details else ""
+                
                 logging.debug(
-                    f"✅ MTR_Sell 触发: 前高={extreme_high:.2f} 回测后强反转棒, "
-                    f"突破棒@={break_idx}, 趋势棒数={trend_bars}"
+                    f"✅ MTR_Sell{signal_detail} 触发: "
+                    f"趋势={trend_direction}, 前高={extreme_price:.2f}, "
+                    f"趋势线突破@{break_bar_idx}, 趋势强度={trend_strength:.1%}"
                 )
                 return ("MTR_Sell", "sell", stop_loss, base_height)
-            # 二阶段（H2/L2 风格）：前一根为第一次回测高点，当前为第二次回测且反转
+            
+            # 二阶段入场（H2 风格）
             if i >= 2:
                 bar_before = df.iloc[i - 2]
                 high_before = float(bar_before["high"])
-                if high_before >= extreme_high * (1.0 - RETEST_TOLERANCE):
-                    valid_sell_2, _ = self.validate_btc_signal_bar(current_bar, "sell")
-                    if valid_sell_2 and current_close < current_open:
+                # Al Brooks 修正：使用动态 ATR 容差
+                secondary_tolerance = (atr * 0.5) if atr and atr > 0 else extreme_price * retest_tolerance
+                if high_before >= extreme_price - secondary_tolerance:
+                    # 前一根也接近高点，当前是第二次测试
+                    if current_close < current_open:  # 阴线
                         stop_loss = self.calculate_unified_stop_loss(df, i, "sell", current_close, atr)
-                        base_height = extreme_high - current_close
-                        if atr and atr > 0 and base_height < atr * 0.5:
-                            base_height = atr * 2.0
-                        logging.debug(
-                            f"✅ MTR_Sell 触发(二阶段): 前高={extreme_high:.2f} 二次回测反转"
-                        )
-                        return ("MTR_Sell", "sell", stop_loss, base_height)
-            break
+                        if stop_loss is None:
+                            logging.debug(f"MTR_Sell(二阶段) 被跳过: High Risk Filter 止损距离过大")
+                        else:
+                            base_height = extreme_price - current_close
+                            if atr and atr > 0 and base_height < atr * 0.5:
+                                base_height = atr * 2.0
+                            logging.debug(f"✅ MTR_Sell(二阶段) 触发: 前高={extreme_price:.2f} 二次回测反转")
+                            return ("MTR_Sell", "sell", stop_loss, base_height)
         
-        # ---------- MTR_Buy：先有下跌趋势 → 上破 EMA → 回测前低 → 强反转棒做多 ----------
-        for break_idx in range(i - 1, max(0, i - MTR_LOOKBACK), -1):
-            break_row = df.iloc[break_idx]
-            break_close = float(break_row["close"])
-            break_ema = float(break_row["ema"])
-            if break_close <= break_ema:
-                continue
-            prev_to_break = break_idx - 1
-            if prev_to_break < 0:
-                continue
-            prev_break_row = df.iloc[prev_to_break]
-            prev_break_close = float(prev_break_row["close"])
-            prev_break_ema = float(prev_break_row["ema"])
-            if prev_break_close >= prev_break_ema:
-                continue
-            trend_start = prev_to_break
-            while trend_start > 0 and float(df.iloc[trend_start]["close"]) < float(df.iloc[trend_start]["ema"]):
-                trend_start -= 1
-            trend_start += 1
-            trend_bars = prev_to_break - trend_start + 1
-            if trend_bars < MIN_TREND_BARS:
-                continue
-            ema_at_end = float(df.iloc[prev_to_break]["ema"])
-            ema_early_idx = max(0, prev_to_break - EMA_SLOPE_LOOKBACK)
-            ema_early = float(df.iloc[ema_early_idx]["ema"])
-            if ema_at_end >= ema_early:
-                continue
-            extreme_low = float(df.iloc[trend_start : prev_to_break + 1]["low"].min())
-            retest_occurred = False
-            for j in range(break_idx + 1, i + 1):
-                if float(df.iloc[j]["low"]) <= extreme_low * (1.0 + RETEST_TOLERANCE):
-                    retest_occurred = True
-                    break
-            if not retest_occurred:
-                continue
-            at_retest = (
-                current_low <= extreme_low * (1.0 + RETEST_TOLERANCE) or
-                prev_low <= extreme_low * (1.0 + RETEST_TOLERANCE)
+        else:
+            # 下降趋势反转 → 做多
+            valid_signal, signal_reason = self.validate_btc_signal_bar(
+                current_bar, "buy", df=df, i=i, signal_type="MTR_Buy"
             )
-            if not at_retest:
-                continue
-            valid_buy, reason = self.validate_btc_signal_bar(current_bar, "buy")
-            if valid_buy:
+            # Al Brooks 修正：双底 + 假突破后的阳线更有说服力
+            if valid_signal or (has_strong_structure and current_close > current_open):
                 stop_loss = self.calculate_unified_stop_loss(df, i, "buy", current_close, atr)
-                base_height = current_close - extreme_low
+                if stop_loss is None:
+                    logging.debug(f"MTR_Buy 被跳过: High Risk Filter 止损距离过大")
+                    return None
+                # 如果有假突破，止损设在假突破低点下方
+                # Al Brooks: 结构止损应设在假突破极值 + 0.5 ATR
+                if is_false_bo:
+                    stop_loss = min(stop_loss, current_low - (0.5 * atr if atr else current_low * 0.005))
+                
+                base_height = current_close - extreme_price
                 if atr and atr > 0 and base_height < atr * 0.5:
                     base_height = atr * 2.0
+                
+                # 构建信号详情
+                signal_details = []
+                if is_double_pattern:
+                    signal_details.append("双底")
+                if is_false_bo:
+                    signal_details.append("假突破")
+                signal_detail = f"({'+'.join(signal_details)})" if signal_details else ""
+                
                 logging.debug(
-                    f"✅ MTR_Buy 触发: 前低={extreme_low:.2f} 回测后强反转棒, "
-                    f"突破棒@={break_idx}, 趋势棒数={trend_bars}"
+                    f"✅ MTR_Buy{signal_detail} 触发: "
+                    f"趋势={trend_direction}, 前低={extreme_price:.2f}, "
+                    f"趋势线突破@{break_bar_idx}, 趋势强度={trend_strength:.1%}"
                 )
                 return ("MTR_Buy", "buy", stop_loss, base_height)
+            
+            # 二阶段入场（L2 风格）
             if i >= 2:
                 bar_before = df.iloc[i - 2]
                 low_before = float(bar_before["low"])
-                if low_before <= extreme_low * (1.0 + RETEST_TOLERANCE):
-                    valid_buy_2, _ = self.validate_btc_signal_bar(current_bar, "buy")
-                    if valid_buy_2 and current_close > current_open:
+                # Al Brooks 修正：使用动态 ATR 容差
+                secondary_tolerance = (atr * 0.5) if atr and atr > 0 else extreme_price * retest_tolerance
+                if low_before <= extreme_price + secondary_tolerance:
+                    if current_close > current_open:  # 阳线
                         stop_loss = self.calculate_unified_stop_loss(df, i, "buy", current_close, atr)
-                        base_height = current_close - extreme_low
-                        if atr and atr > 0 and base_height < atr * 0.5:
-                            base_height = atr * 2.0
-                        logging.debug(
-                            f"✅ MTR_Buy 触发(二阶段): 前低={extreme_low:.2f} 二次回测反转"
-                        )
-                        return ("MTR_Buy", "buy", stop_loss, base_height)
-            break
+                        if stop_loss is None:
+                            logging.debug(f"MTR_Buy(二阶段) 被跳过: High Risk Filter 止损距离过大")
+                        else:
+                            base_height = current_close - extreme_price
+                            if atr and atr > 0 and base_height < atr * 0.5:
+                                base_height = atr * 2.0
+                            logging.debug(f"✅ MTR_Buy(二阶段) 触发: 前低={extreme_price:.2f} 二次回测反转")
+                            return ("MTR_Buy", "buy", stop_loss, base_height)
         
         return None
     

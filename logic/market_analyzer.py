@@ -49,6 +49,24 @@ class MarketCycle(Enum):
     TRADING_RANGE = "TradingRange"  # 交易区间：BLSH，放宽信号棒
 
 
+class AlwaysInDirection(Enum):
+    """
+    Al Brooks "Always In" 方向
+    
+    核心概念：市场始终处于某一方向的控制之下
+    - LONG：多头控制，优先寻找做多机会
+    - SHORT：空头控制，优先寻找做空机会
+    - NEUTRAL：无明确控制方，双向皆可
+    
+    用途：
+    - 决定反转交易的置信度（逆 Always In 方向的信号需要更强确认）
+    - 指导趋势跟踪策略（顺 Always In 方向交易）
+    """
+    LONG = "long"       # Always In Long：多头控制
+    SHORT = "short"     # Always In Short：空头控制
+    NEUTRAL = "neutral"  # 无明确方向
+
+
 class MarketAnalyzer:
     """
     市场状态分析器（周期自适应版）
@@ -95,6 +113,70 @@ class MarketAnalyzer:
     def get_trend_strength(self) -> float:
         """获取当前趋势强度 (0-1)"""
         return self._trend_strength
+    
+    def calculate_ema_deviation(
+        self, df: pd.DataFrame, i: int, ema: float, atr: Optional[float] = None
+    ) -> tuple:
+        """
+        计算 EMA 偏离度评分（替代 Gap Bar 概念）
+        
+        Al Brooks: "Gap Bar（开盘跳空远离 EMA 的棒）在传统市场表示趋势紧迫性。
+        但加密市场 24/7 交易，很少有真正的跳空。因此用 EMA 偏离度替代 Gap Bar 概念。"
+        
+        EMA 偏离度定义：
+        - 当前价格与 EMA20 的距离，以 ATR 为单位
+        - 偏离度 > 2.0 ATR：趋势紧迫，可能是追涨/追跌的好时机
+        - 偏离度 < 0.5 ATR：价格贴近 EMA，适合回调入场
+        
+        Args:
+            df: K线数据
+            i: 当前 K 线索引
+            ema: EMA 值
+            atr: ATR 值
+        
+        Returns:
+            (deviation_score, deviation_direction, urgency_level)
+            - deviation_score: 偏离度评分（以 ATR 为单位）
+            - deviation_direction: 偏离方向 "above" / "below" / "neutral"
+            - urgency_level: 紧迫度 "high" / "medium" / "low"
+        """
+        if i < 1 or ema <= 0:
+            return (0.0, "neutral", "low")
+        
+        close = float(df.iloc[i]["close"])
+        
+        # 计算偏离度
+        deviation = close - ema
+        
+        # 用 ATR 标准化偏离度
+        if atr and atr > 0:
+            deviation_score = abs(deviation) / atr
+        else:
+            # 无 ATR 时用百分比（假设 2% = 高偏离）
+            deviation_score = abs(deviation / ema) * 50  # 2% ≈ 1.0
+        
+        # 偏离方向
+        if deviation > 0:
+            deviation_direction = "above"
+        elif deviation < 0:
+            deviation_direction = "below"
+        else:
+            deviation_direction = "neutral"
+        
+        # 紧迫度等级
+        if deviation_score >= 2.0:
+            urgency_level = "high"  # 远离 EMA，趋势紧迫
+        elif deviation_score >= 1.0:
+            urgency_level = "medium"  # 中等偏离
+        else:
+            urgency_level = "low"  # 贴近 EMA，适合回调入场
+        
+        logging.debug(
+            f"EMA偏离度: score={deviation_score:.2f}ATR, "
+            f"方向={deviation_direction}, 紧迫度={urgency_level}"
+        )
+        
+        return (deviation_score, deviation_direction, urgency_level)
     
     def detect_market_state(self, df: pd.DataFrame, i: int, ema: float) -> MarketState:
         """
@@ -336,6 +418,31 @@ class MarketAnalyzer:
             elif prev_close > 0 and curr_open < prev_close * 0.999:
                 gap_down_count += 0.5
         
+        # ========== 指标6（Al Brooks 修正）：最大回调幅度检测 ==========
+        # Al Brooks: "强趋势的特征是没有任何有意义的回调"
+        # 即使有回调，回调幅度也非常小（< 前一波动的 30%）
+        max_pullback_up = 0.0  # 上涨趋势中的最大回调（最大跌幅）
+        max_pullback_down = 0.0  # 下跌趋势中的最大反弹（最大涨幅）
+        
+        for j in range(1, len(recent)):
+            curr_high = float(recent.iloc[j]["high"])
+            curr_low = float(recent.iloc[j]["low"])
+            prev_high = float(recent.iloc[j - 1]["high"])
+            prev_low = float(recent.iloc[j - 1]["low"])
+            
+            # 上涨趋势中的回调：当前低点相对于前一根高点的跌幅
+            pullback_from_high = prev_high - curr_low
+            max_pullback_up = max(max_pullback_up, pullback_from_high)
+            
+            # 下跌趋势中的反弹：当前高点相对于前一根低点的涨幅
+            bounce_from_low = curr_high - prev_low
+            max_pullback_down = max(max_pullback_down, bounce_from_low)
+        
+        # 计算整体走势幅度
+        overall_high = float(recent["high"].max())
+        overall_low = float(recent["low"].min())
+        overall_move = overall_high - overall_low
+        
         # ========== 综合判断趋势方向和强度 ==========
         trend_direction = None
         trend_strength = 0.0
@@ -361,6 +468,16 @@ class MarketAnalyzer:
         if gap_up_count >= 2:
             up_score += 0.15  # 2 个缺口额外加 0.15
         
+        # Al Brooks 修正：最大回调幅度惩罚
+        # 如果回调幅度 > 整体走势的 30%，说明趋势不够强，减分
+        if overall_move > 0 and max_pullback_up > overall_move * 0.3:
+            pullback_penalty = min((max_pullback_up / overall_move - 0.3) * 0.5, 0.15)
+            up_score -= pullback_penalty
+            logging.debug(
+                f"Strong Trend 回调惩罚(上涨): 最大回调={max_pullback_up:.2f}, "
+                f"整体走势={overall_move:.2f}, 惩罚={pullback_penalty:.2f}"
+            )
+        
         # 下跌趋势判断（优化：阈值降低，更早响应）
         down_score = 0.0
         if max_bearish_streak >= 3:  # 从 4 降到 3
@@ -381,6 +498,16 @@ class MarketAnalyzer:
             down_score += 0.25  # 1 个缺口加 0.25
         if gap_down_count >= 2:
             down_score += 0.15  # 2 个缺口额外加 0.15
+        
+        # Al Brooks 修正：最大反弹幅度惩罚
+        # 如果反弹幅度 > 整体走势的 30%，说明趋势不够强，减分
+        if overall_move > 0 and max_pullback_down > overall_move * 0.3:
+            bounce_penalty = min((max_pullback_down / overall_move - 0.3) * 0.5, 0.15)
+            down_score -= bounce_penalty
+            logging.debug(
+                f"Strong Trend 反弹惩罚(下跌): 最大反弹={max_pullback_down:.2f}, "
+                f"整体走势={overall_move:.2f}, 惩罚={bounce_penalty:.2f}"
+            )
         
         # 确定趋势方向
         if up_score >= 0.5 and up_score > down_score:
@@ -479,24 +606,60 @@ class MarketAnalyzer:
         condition_c_up = slope_pct > SLOPE_THRESHOLD_PCT
         condition_c_down = slope_pct < -SLOPE_THRESHOLD_PCT
         
+        # ========== 条件 D（Al Brooks 修正）：K 线重叠度检测 ==========
+        # Al Brooks: "Tight Channel 的 K 线之间高度重叠，没有任何有意义的回调"
+        # 后一根 K 线与前一根重叠 > 50% 视为高重叠
+        overlap_count = 0
+        for j in range(1, len(lookback_10)):
+            curr_high = float(lookback_10.iloc[j]["high"])
+            curr_low = float(lookback_10.iloc[j]["low"])
+            prev_high = float(lookback_10.iloc[j - 1]["high"])
+            prev_low = float(lookback_10.iloc[j - 1]["low"])
+            
+            # 计算重叠区域
+            overlap = min(curr_high, prev_high) - max(curr_low, prev_low)
+            curr_range = curr_high - curr_low
+            
+            if overlap > 0 and curr_range > 0 and (overlap / curr_range) > 0.5:
+                overlap_count += 1
+        
+        # 至少 6/9 根（66%）有高重叠才算 Tight Channel
+        condition_d = overlap_count >= 6
+        
+        logging.debug(
+            f"TightChannel 重叠度检测: 高重叠K线数={overlap_count}/9, "
+            f"条件D满足={condition_d}"
+        )
+        
         # ========== 综合判断：符合任意两个条件即为 Tight Channel ==========
+        # Al Brooks 修正：增加条件 D（重叠度）作为加分项
+        
         # 上升 Tight Channel
         up_conditions_met = sum([condition_a_up, condition_b_up, condition_c_up])
+        # 重叠度可以作为第四个条件
+        if condition_d:
+            up_conditions_met += 1
+        
         if up_conditions_met >= 2:
             logging.debug(
                 f"🔒 Tight Channel(上升): EMA距离={condition_a_up}, "
                 f"方向一致={condition_b_up}(阳线{bullish_bars}/5), "
-                f"斜率={condition_c_up}({slope_pct:.2%})"
+                f"斜率={condition_c_up}({slope_pct:.2%}), "
+                f"重叠度={condition_d}({overlap_count}/9)"
             )
             return MarketState.TIGHT_CHANNEL
         
         # 下降 Tight Channel
         down_conditions_met = sum([condition_a_down, condition_b_down, condition_c_down])
+        if condition_d:
+            down_conditions_met += 1
+        
         if down_conditions_met >= 2:
             logging.debug(
                 f"🔒 Tight Channel(下降): EMA距离={condition_a_down}, "
                 f"方向一致={condition_b_down}(阴线{bearish_bars}/5), "
-                f"斜率={condition_c_down}({slope_pct:.2%})"
+                f"斜率={condition_c_down}({slope_pct:.2%}), "
+                f"重叠度={condition_d}({overlap_count}/9)"
             )
             return MarketState.TIGHT_CHANNEL
         
@@ -694,3 +857,51 @@ class MarketAnalyzer:
             'tc_bars': self._tight_channel_bars,
             'tc_end_bar': self._last_tight_channel_end_bar,
         }
+
+    def get_always_in_direction(
+        self, df: pd.DataFrame, i: int, ema: float, market_cycle: MarketCycle
+    ) -> AlwaysInDirection:
+        """
+        判断当前 Always In 方向
+        
+        Al Brooks: "在任何给定时刻，市场都处于多头或空头的控制之下"
+        
+        判断逻辑：
+        1. SPIKE 周期：由 Spike 方向决定（价格在 EMA 上方做多，下方做空）
+        2. TIGHT_CHANNEL：由 TightChannel 方向决定
+        3. 其他情况：根据趋势方向和强度判断
+        
+        Args:
+            df: K线数据
+            i: 当前索引
+            ema: EMA值
+            market_cycle: 市场周期
+        
+        Returns:
+            AlwaysInDirection: LONG/SHORT/NEUTRAL
+        """
+        # ========== 1. SPIKE 周期：强烈的 Always In ==========
+        if market_cycle == MarketCycle.SPIKE:
+            current_close = float(df.iloc[i]["close"])
+            if current_close > ema:
+                return AlwaysInDirection.LONG
+            elif current_close < ema:
+                return AlwaysInDirection.SHORT
+            return AlwaysInDirection.NEUTRAL
+        
+        # ========== 2. Tight Channel：由通道方向决定 ==========
+        if self._tight_channel_direction is not None:
+            if self._tight_channel_direction == "up":
+                return AlwaysInDirection.LONG
+            elif self._tight_channel_direction == "down":
+                return AlwaysInDirection.SHORT
+        
+        # ========== 3. 强趋势：由趋势方向决定 ==========
+        if self._trend_strength >= self._params.strong_trend_threshold:
+            if self._trend_direction == "up":
+                return AlwaysInDirection.LONG
+            elif self._trend_direction == "down":
+                return AlwaysInDirection.SHORT
+        
+        # ========== 4. 其他情况：NEUTRAL ==========
+        return AlwaysInDirection.NEUTRAL

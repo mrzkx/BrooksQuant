@@ -93,10 +93,11 @@ async def kline_producer(
                 market_state = last.get("market_state", "Unknown")
                 logging.info(f"市场状态扫描完成，当前市场模式: {market_state}")
 
-            # 创建WebSocket流（必须传入 max_queue_size 防止队列溢出）
+            # 创建合约WebSocket流（必须传入 max_queue_size 防止队列溢出）
+            # 使用 kline_futures_socket 获取合约K线，确保与合约交易价格一致
             bm = BinanceSocketManager(client, max_queue_size=10000)
-            kline_stream = bm.kline_socket(symbol=SYMBOL, interval=INTERVAL)
-            logging.info(f"K线 WebSocket 流已创建: {SYMBOL} {INTERVAL}")
+            kline_stream = bm.kline_futures_socket(symbol=SYMBOL, interval=INTERVAL)
+            logging.info(f"合约K线 WebSocket 流已创建: {SYMBOL} {INTERVAL}")
 
             # 重置重连计数
             reconnect_attempt = 0
@@ -131,7 +132,8 @@ async def kline_producer(
                             # 处理已收盘的K线
                             kline_count += 1
                             kline_open_time = int(k.get("t", 0))
-                            logging.info(
+                            # K线数据降级为 DEBUG（生产环境不需要每根K线都打印）
+                            logging.debug(
                                 f"📊 K线收盘 #{kline_count}: O={float(k['o']):.2f} "
                                 f"H={float(k['h']):.2f} L={float(k['l']):.2f} C={float(k['c']):.2f}"
                             )

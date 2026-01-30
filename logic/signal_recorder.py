@@ -91,6 +91,7 @@ def record_signal_with_tp_impl(
     is_likely_wick_bar_func: Callable,
     satisfies_trader_equation_func: Callable,
     update_signal_cooldown_func: Callable,
+    pattern_origin: Optional[float] = None,
 ) -> None:
     """
     计算 TP、写入结果、更新冷却期（统一流程）。
@@ -106,10 +107,17 @@ def record_signal_with_tp_impl(
         is_likely_wick_bar_func: 插针检测函数
         satisfies_trader_equation_func: 交易者方程校验函数
         update_signal_cooldown_func: 冷却期更新函数
+        pattern_origin: 形态起始点极值（用于 Wedge/FailedBreakout 的 TP2）
     """
+    # 从 result 中获取 pattern_origin（如果有 wedge_tp2_price 则使用它）
+    effective_pattern_origin = pattern_origin
+    if effective_pattern_origin is None and result.wedge_tp2_price is not None:
+        effective_pattern_origin = result.wedge_tp2_price
+    
     tp1, tp2, tp1_ratio, is_climax = calculate_tp1_tp2_func(
         entry_price, result.stop_loss, result.side, result.base_height,
-        result.signal_type, ctx.market_state.value, data, i
+        result.signal_type, ctx.market_state.value, data, i,
+        ema=ctx.ema, pattern_origin=effective_pattern_origin,
     )
     result.tp1_close_ratio = tp1_ratio
     result.is_climax = is_climax

@@ -541,43 +541,81 @@ class DeltaAnalyzer:
 
 class DeltaSignalModifier:
     """
-    Delta 信号调节器（优化版）
+    Delta 信号调节器（实战优化版）
     
     根据动态订单流分析结果调节交易信号强度
+    
+    实战优化说明：
+    - Al Brooks 不直接使用订单流数据，价格行为本身已包含订单流信息
+    - Delta 应该作为**辅助确认**，而非主要决策因素
+    - 但在 BTC 市场，极端订单流往往意味着大资金行动，需要尊重
+    
+    分层策略：
+    - 顺势信号（Spike, H2/L2）：极端订单流下完全阻止（MIN_MODIFIER_TREND = 0.0）
+    - 反转信号（Wedge, MTR, Climax）：极端订单流下强烈减弱但不阻止（MIN_MODIFIER_REVERSAL = 0.3）
     
     检测场景：
     1. 主动买入/卖出 (Aggressive) -> 增强信号
     2. 吸收 (Absorption) -> 强烈减弱信号（隐藏反向力量）
     3. 流动性撤离 (Withdrawal) -> 中度减弱信号（假突破）
-    4. Delta 反向 -> 减弱或阻止信号
+    4. Delta 反向 -> 根据信号类型分层处理
     """
+    
+    # 分层 Delta 最低调节因子（实战优化）
+    # 顺势信号：极端订单流下完全阻止（避免逆势追单）
+    MIN_MODIFIER_TREND = 0.0
+    # 反转信号：极端订单流下强烈减弱但不完全阻止（反转本身就是逆订单流）
+    MIN_MODIFIER_REVERSAL = 0.3
+    
+    # 反转信号类型列表
+    REVERSAL_SIGNAL_PREFIXES = (
+        "Wedge_", "MTR_", "Climax_", "FailedBreakout_", "FinalFlag_"
+    )
     
     @staticmethod
     def calculate_modifier(
         snapshot: DeltaSnapshot, 
         side: str,
-        price_change_pct: float = 0.0
+        price_change_pct: float = 0.0,
+        signal_type: Optional[str] = None
     ) -> Tuple[float, str]:
         """
-        计算信号调节因子
+        计算信号调节因子（实战优化版）
         
         Args:
             snapshot: Delta 快照
             side: 交易方向 ("buy" 或 "sell")
             price_change_pct: K 线价格变化百分比
+            signal_type: 信号类型（用于分层处理）
         
         Returns:
             (modifier, reason)
             - modifier > 1.0: 增强信号（订单流确认）
             - modifier = 1.0: 不调整
             - modifier < 1.0: 减弱信号（订单流不支持）
-            - modifier = 0.0: 阻止信号（强烈反向信号）
+            - modifier = 0.0: 阻止信号（顺势信号遇极端反向订单流）
+        
+        分层策略：
+            - 顺势信号（Spike, H2/L2）：极端订单流下完全阻止
+            - 反转信号（Wedge, MTR, Climax）：极端订单流下强烈减弱但不阻止
         """
         modifier = 1.0
         reasons: List[str] = []
         
         delta_ratio = snapshot.delta_ratio
         trend = snapshot.delta_trend
+        
+        # 判断是否为反转信号（用于分层处理极端订单流）
+        is_reversal_signal = (
+            signal_type is not None and 
+            signal_type.startswith(DeltaSignalModifier.REVERSAL_SIGNAL_PREFIXES)
+        )
+        
+        # 根据信号类型选择最低调节因子
+        min_modifier = (
+            DeltaSignalModifier.MIN_MODIFIER_REVERSAL if is_reversal_signal
+            else DeltaSignalModifier.MIN_MODIFIER_TREND
+        )
         
         if side == "buy":
             # ====== 买入信号检测 ======
@@ -614,10 +652,13 @@ class DeltaSignalModifier:
                     modifier *= 0.6
                     reasons.append(f"卖盘主导(Δ={delta_ratio:.2f})")
                 
-                # 极端卖压 -> 阻止买入
+                # 极端卖压 -> 根据信号类型分层处理
                 if delta_ratio < -0.5 and snapshot.delta_acceleration < -0.1:
-                    modifier = 0.0
-                    reasons = [f"🚫 极端卖压(Δ={delta_ratio:.2f}, 加速下跌)"]
+                    modifier = min_modifier
+                    if is_reversal_signal:
+                        reasons = [f"⚠️ 极端卖压(Δ={delta_ratio:.2f})，反转信号强烈减弱"]
+                    else:
+                        reasons = [f"🚫 极端卖压(Δ={delta_ratio:.2f})，顺势信号阻止"]
         
         else:  # side == "sell"
             # ====== 卖出信号检测 ======
@@ -654,10 +695,13 @@ class DeltaSignalModifier:
                     modifier *= 0.6
                     reasons.append(f"买盘主导(Δ={delta_ratio:.2f})")
                 
-                # 极端买压 -> 阻止卖出
+                # 极端买压 -> 根据信号类型分层处理
                 if delta_ratio > 0.5 and snapshot.delta_acceleration > 0.1:
-                    modifier = 0.0
-                    reasons = [f"🚫 极端买压(Δ={delta_ratio:.2f}, 加速上涨)"]
+                    modifier = min_modifier
+                    if is_reversal_signal:
+                        reasons = [f"⚠️ 极端买压(Δ={delta_ratio:.2f})，反转信号强烈减弱"]
+                    else:
+                        reasons = [f"🚫 极端买压(Δ={delta_ratio:.2f})，顺势信号阻止"]
         
         reason = ", ".join(reasons) if reasons else "Delta中性"
         return (round(modifier, 2), reason)

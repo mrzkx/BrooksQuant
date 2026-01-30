@@ -54,11 +54,16 @@ class H2L2Processor:
         self, ctx: BarContext, data: pd.DataFrame, signal_side: str, row_index: int
     ) -> Tuple[bool, str]:
         """H2/L2 信号棒质量校验：TradingRange 时放宽参数。返回 (bar_valid, bar_reason)。"""
+        # H2/L2 是趋势延续信号，不需要传递 signal_type（不检查反转棒影线要求）
+        # 但仍传递 df 和 i 以启用相对大小和低重叠度检查
         if ctx.market_cycle == MarketCycle.TRADING_RANGE:
             return self.pattern_detector.validate_btc_signal_bar(
-                data.iloc[row_index], signal_side, min_body_ratio=0.40, close_position_pct=0.35
+                data.iloc[row_index], signal_side, min_body_ratio=0.40, close_position_pct=0.35,
+                df=data, i=row_index
             )
-        return self.pattern_detector.validate_btc_signal_bar(data.iloc[row_index], signal_side)
+        return self.pattern_detector.validate_btc_signal_bar(
+            data.iloc[row_index], signal_side, df=data, i=row_index
+        )
 
     async def process_h2_signal(
         self,
@@ -85,6 +90,7 @@ class H2L2Processor:
         h2_signal = h2_machine.update(
             ctx.close, ctx.high, ctx.low, ctx.ema, ctx.atr, data, ctx.i,
             self.pattern_detector.calculate_unified_stop_loss,
+            market_state=ctx.market_state,
         )
         if not h2_signal:
             return None
@@ -138,6 +144,7 @@ class H2L2Processor:
                     )
         
         # 返回纯形态信号（HTF 权重由 strategy.py 统一应用）
+        # Al Brooks: Tight Channel 中 H1 标记为高风险
         return SignalResult(
             signal_type=h2_signal.signal_type,
             side=h2_signal.side,
@@ -145,6 +152,7 @@ class H2L2Processor:
             base_height=h2_signal.base_height,
             delta_modifier=delta_modifier,
             risk_reward=2.0,
+            is_high_risk=h2_signal.is_high_risk,
         )
 
     async def process_l2_signal(
@@ -172,6 +180,7 @@ class H2L2Processor:
         l2_signal = l2_machine.update(
             ctx.close, ctx.high, ctx.low, ctx.ema, ctx.atr, data, ctx.i,
             self.pattern_detector.calculate_unified_stop_loss,
+            market_state=ctx.market_state,
         )
         if not l2_signal:
             return None
@@ -225,6 +234,7 @@ class H2L2Processor:
                     )
         
         # 返回纯形态信号（HTF 权重由 strategy.py 统一应用）
+        # Al Brooks: Tight Channel 中 L1 标记为高风险
         return SignalResult(
             signal_type=l2_signal.signal_type,
             side=l2_signal.side,
@@ -232,4 +242,5 @@ class H2L2Processor:
             base_height=l2_signal.base_height,
             delta_modifier=delta_modifier,
             risk_reward=2.0,
+            is_high_risk=l2_signal.is_high_risk,
         )

@@ -72,11 +72,23 @@ def find_swing_troughs(
 def find_three_lower_highs(
     peaks: List[Tuple[int, float]],
     min_span: int = 3,
-    require_convergence: bool = False,
+    require_convergence: bool = True,
+    require_momentum_decay: bool = True,
 ) -> Optional[Tuple[List[int], List[float]]]:
     """
     从波动峰值序列中找出「高点逐渐降低」的最近三峰：P1 > P2 > P3。
-    可选：要求动能递减（第二推幅度 < 第一推幅度）。
+    
+    Al Brooks 楔形核心原则（修正版）：
+    - require_convergence: 要求动能递减（第二推幅度 < 第一推幅度）
+    - require_momentum_decay: 要求时间递减（第三推时间不应超过第一推的 90%）
+    
+    "三推楔形的本质是动能递减" - Al Brooks
+    
+    Args:
+        peaks: 峰值序列 [(index, value), ...]
+        min_span: 最小索引间隔
+        require_convergence: 是否要求幅度收敛（默认 True）
+        require_momentum_decay: 是否要求动能/时间递减（默认 True）
     
     Returns:
         (peak_indices, peak_values) 或 None
@@ -93,11 +105,28 @@ def find_three_lower_highs(
             continue
         if idx2 - idx1 < min_span or idx3 - idx2 < min_span:
             continue
+        
+        # Al Brooks 修正：幅度收敛检测
         if require_convergence:
             push1 = p1 - p2  # 第一推（从 P1 到 P2 的跌幅）
             push2 = p2 - p3  # 第二推（从 P2 到 P3 的跌幅）
             if push1 <= 0 or push2 >= push1:
+                logging.debug(
+                    f"Wedge 跳过: 幅度未收敛 push1={push1:.2f}, push2={push2:.2f}"
+                )
                 continue
+        
+        # Al Brooks 修正：动能/时间递减检测
+        # "第三推时间不应超过第一推的 90%，否则动能未衰减"
+        if require_momentum_decay:
+            push1_bars = idx2 - idx1  # 第一推的 K 线数
+            push2_bars = idx3 - idx2  # 第二推的 K 线数
+            if push2_bars >= push1_bars * 0.9:
+                logging.debug(
+                    f"Wedge 跳过: 动能未衰减 push1_bars={push1_bars}, push2_bars={push2_bars}"
+                )
+                continue
+        
         return ([idx1, idx2, idx3], [p1, p2, p3])
     return None
 
@@ -105,11 +134,23 @@ def find_three_lower_highs(
 def find_three_higher_lows(
     troughs: List[Tuple[int, float]],
     min_span: int = 3,
-    require_convergence: bool = False,
+    require_convergence: bool = True,
+    require_momentum_decay: bool = True,
 ) -> Optional[Tuple[List[int], List[float]]]:
     """
     从波动谷底序列中找出「低点逐渐升高」的最近三谷：T1 < T2 < T3。
-    可选：要求动能递减（第二推幅度 < 第一推幅度）。
+    
+    Al Brooks 楔形核心原则（修正版）：
+    - require_convergence: 要求动能递减（第二推幅度 < 第一推幅度）
+    - require_momentum_decay: 要求时间递减（第三推时间不应超过第一推的 90%）
+    
+    "三推楔形的本质是动能递减" - Al Brooks
+    
+    Args:
+        troughs: 谷底序列 [(index, value), ...]
+        min_span: 最小索引间隔
+        require_convergence: 是否要求幅度收敛（默认 True）
+        require_momentum_decay: 是否要求动能/时间递减（默认 True）
     
     Returns:
         (trough_indices, trough_values) 或 None
@@ -126,11 +167,28 @@ def find_three_higher_lows(
             continue
         if idx2 - idx1 < min_span or idx3 - idx2 < min_span:
             continue
+        
+        # Al Brooks 修正：幅度收敛检测
         if require_convergence:
             push1 = t2 - t1  # 第一推（从 T1 到 T2 的升幅）
             push2 = t3 - t2  # 第二推（从 T2 到 T3 的升幅）
             if push1 <= 0 or push2 >= push1:
+                logging.debug(
+                    f"Wedge 跳过: 幅度未收敛 push1={push1:.2f}, push2={push2:.2f}"
+                )
                 continue
+        
+        # Al Brooks 修正：动能/时间递减检测
+        # "第三推时间不应超过第一推的 90%，否则动能未衰减"
+        if require_momentum_decay:
+            push1_bars = idx2 - idx1  # 第一推的 K 线数
+            push2_bars = idx3 - idx2  # 第二推的 K 线数
+            if push2_bars >= push1_bars * 0.9:
+                logging.debug(
+                    f"Wedge 跳过: 动能未衰减 push1_bars={push1_bars}, push2_bars={push2_bars}"
+                )
+                continue
+        
         return ([idx1, idx2, idx3], [t1, t2, t3])
     return None
 
@@ -189,8 +247,12 @@ def detect_wedge_reversal_impl(
     leg_span = max(3, params.wedge_min_leg_span)
     
     # ========== 递归三推：高点逐渐降低的三个峰值（Al Brooks 数字化）==========
+    # Al Brooks 修正：启用收敛检测和动能递减检测
     peaks_rec = find_swing_peaks(df, lookback_start, i + 1, min_left=2, min_right=2)
-    three_lower = find_three_lower_highs(peaks_rec, min_span=leg_span, require_convergence=False)
+    three_lower = find_three_lower_highs(
+        peaks_rec, min_span=leg_span, 
+        require_convergence=True, require_momentum_decay=True
+    )
     if three_lower is not None:
         peak_indices, peak_values = three_lower
         idx3 = peak_indices[2]
@@ -212,8 +274,12 @@ def detect_wedge_reversal_impl(
                     return ("Wedge_Sell", "sell", stop_loss, wedge_height, wedge_tp1, wedge_tp2, is_strong)
     
     # ========== 递归三推：低点逐渐升高的三个谷底 ==========
+    # Al Brooks 修正：启用收敛检测和动能递减检测
     troughs_rec = find_swing_troughs(df, lookback_start, i + 1, min_left=2, min_right=2)
-    three_higher = find_three_higher_lows(troughs_rec, min_span=leg_span, require_convergence=False)
+    three_higher = find_three_higher_lows(
+        troughs_rec, min_span=leg_span,
+        require_convergence=True, require_momentum_decay=True
+    )
     if three_higher is not None:
         trough_indices, trough_values = three_higher
         idx3 = trough_indices[2]

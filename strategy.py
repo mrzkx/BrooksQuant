@@ -317,11 +317,20 @@ class AlBrooksStrategy:
         market_state: Optional[str] = None,
         df: Optional[pd.DataFrame] = None,
         current_idx: Optional[int] = None,
+        ema: Optional[float] = None,
+        pattern_origin: Optional[float] = None,
     ) -> Tuple[float, float, float, bool]:
-        """委托 logic.signal_tp 计算 TP1/TP2。"""
+        """
+        委托 logic.signal_tp 计算 TP1/TP2。
+        
+        新增参数：
+        - ema: EMA 值（用于 Wedge/FailedBreakout 的 TP1）
+        - pattern_origin: 形态起始点极值（用于 Wedge/FailedBreakout 的 TP2）
+        """
         return _calculate_tp1_tp2_fn(
             self._params, entry_price, stop_loss, side, base_height,
             signal_type=signal_type, market_state=market_state, df=df, current_idx=current_idx,
+            ema=ema, pattern_origin=pattern_origin,
         )
 
     # ========================================================================
@@ -509,7 +518,8 @@ class AlBrooksStrategy:
         result.htf_modifier = htf_modifier
         result.strength = result.strength * htf_modifier
         if ctx.is_latest_bar and htf_modifier != 1.0:
-            logging.info(f"📊 HTF权重调节 {result.signal_type}: ×{htf_modifier} → 强度={result.strength:.2f}")
+            # HTF权重调节是常见操作，降级为 DEBUG
+            logging.debug(f"📊 HTF权重调节 {result.signal_type}: ×{htf_modifier} → 强度={result.strength:.2f}")
 
     def _record_signal_with_tp(
         self,
@@ -698,6 +708,21 @@ class AlBrooksStrategy:
             arrays.market_states[i] = ctx.market_state.value
             arrays.tight_channel_scores[i] = ctx.tight_channel_score
             
+            # ========== 最新 K 线：记录市场状态日志（DEBUG 级别）==========
+            if ctx.is_latest_bar:
+                trend_icon = "📈" if ctx.trend_direction == "up" else "📉" if ctx.trend_direction == "down" else "➡️"
+                allowed_icon = "🔒" if ctx.allowed_side else "🔓"
+                h2_state = h2_machine.state.value if h2_machine else "N/A"
+                l2_state = l2_machine.state.value if l2_machine else "N/A"
+                # 市场状态详情降级为 DEBUG（生产环境不需要每根K线都打印）
+                logging.debug(
+                    f"📍 市场状态: {ctx.market_state.value} | "
+                    f"周期: {ctx.market_cycle.value} | "
+                    f"{trend_icon} 趋势: {ctx.trend_direction or '无'}({ctx.trend_strength:.0%}) | "
+                    f"{allowed_icon} 允许方向: {ctx.allowed_side or '双向'} | "
+                    f"H2状态: {h2_state} | L2状态: {l2_state}"
+                )
+            
             # ---------- 处理待处理的 Spike 回撤入场（Limit_Entry）----------
             if pending_spike is not None:
                 signal_type, side, stop_loss, limit_price, base_height, spike_idx, is_high_risk = pending_spike
@@ -735,18 +760,29 @@ class AlBrooksStrategy:
                 elif i - spike_idx > 5:
                     pending_spike = None
             
-            # ---------- 市场周期：尖峰阶段 Always In，忽略小回调，不触发反转（FB/Wedge）----------
-            # ---------- 优先级1: Failed Breakout（仅在非 Spike 周期）----------
-            if ctx.market_cycle != MarketCycle.SPIKE:
-                fb_result = self._check_failed_breakout(data, ctx)
-            else:
-                fb_result = None
-            if fb_result:
-                self._apply_htf_modifier_to_result(fb_result, cached_htf_buy_modifier, cached_htf_sell_modifier, ctx)
-                self._record_signal_with_tp(arrays, i, fb_result, ctx, ctx.close, data)
+            # ==========================================================================
+            # Al Brooks 形态优先级（符合 PA 交易理念）
+            # ==========================================================================
+            # 优先级原则：
+            # 1. Climax - 极端信号需要立即响应
+            # 2. Spike - 趋势确立，Always In
+            # 3. H2/L2 - 二次入场是最常用、最可靠的方式
+            # 4. Failed Breakout - 只在 TradingRange 边界触发
+            # 5. Wedge - 楔形反转需要明确结构
+            # 6. MTR - 主要趋势反转，需要更多确认
+            # 7. Final Flag - 趋势耗尽的最后挣扎
+            # ==========================================================================
+            
+            # ---------- 优先级1: Climax 反转（极端信号，需要立即响应）----------
+            # Al Brooks: "Climax 是市场极端情绪的表现，错过就没了"
+            climax_result = self._check_climax(data, ctx)
+            if climax_result:
+                self._apply_htf_modifier_to_result(climax_result, cached_htf_buy_modifier, cached_htf_sell_modifier, ctx)
+                self._record_signal_with_tp(arrays, i, climax_result, ctx, ctx.close, data)
                 continue
             
-            # ---------- 优先级2: Strong Spike ----------
+            # ---------- 优先级2: Strong Spike（趋势确立，Always In）----------
+            # Al Brooks: "强突破后应该 Always In，站在趋势一边"
             spike_result = self._check_spike(data, ctx)
             if spike_result:
                 if spike_result.limit_price is not None:
@@ -776,11 +812,14 @@ class AlBrooksStrategy:
                             
                             if ctx.is_latest_bar:
                                 if delta_modifier == 0.0:
-                                    logging.info(f"🚫 Delta阻止: {spike_result.signal_type} {spike_result.side} - {delta_reason}")
+                                    # 信号被完全阻止，使用 WARNING 级别
+                                    logging.warning(f"🚫 Delta阻止: {spike_result.signal_type} {spike_result.side} - {delta_reason}")
                                 elif delta_modifier < 1.0:
-                                    logging.info(f"⚠️ Delta减弱: {spike_result.signal_type} (调节={delta_modifier:.2f}) - {delta_reason}")
+                                    # 信号被减弱，使用 DEBUG 级别（常见情况）
+                                    logging.debug(f"⚠️ Delta减弱: {spike_result.signal_type} (调节={delta_modifier:.2f}) - {delta_reason}")
                                 elif delta_modifier > 1.0:
-                                    logging.info(f"✅ Delta增强: {spike_result.signal_type} (调节={delta_modifier:.2f}) - {delta_reason}")
+                                    # 信号被增强，使用 DEBUG 级别
+                                    logging.debug(f"✅ Delta增强: {spike_result.signal_type} (调节={delta_modifier:.2f}) - {delta_reason}")
                     
                     if delta_modifier > 0:
                         spike_result.delta_modifier = delta_modifier
@@ -792,14 +831,62 @@ class AlBrooksStrategy:
                             l2_machine.set_strong_trend()
                 continue
             
-            # ---------- 优先级3: Climax 反转 ----------
-            climax_result = self._check_climax(data, ctx)
-            if climax_result:
-                self._apply_htf_modifier_to_result(climax_result, cached_htf_buy_modifier, cached_htf_sell_modifier, ctx)
-                self._record_signal_with_tp(arrays, i, climax_result, ctx, ctx.close, data)
-                continue
+            # ---------- 优先级3: H2/L2 顺势二次入场（最常用、最可靠）----------
+            # Al Brooks: "大多数交易日我只做 H2 买入或 L2 卖出"
+            # 在趋势/通道市场中，H2/L2 是主力入场方式
+            if ctx.market_cycle != MarketCycle.SPIKE:  # Spike 周期内不做 H2/L2，等待回调
+                # 获取 Delta 快照（如果需要）
+                if ctx.is_latest_bar and not delta_snapshot_fetched:
+                    cached_delta_snapshot = await self._get_delta_snapshot("BTCUSDT")
+                    delta_snapshot_fetched = True
+                delta_snapshot_for_hl = cached_delta_snapshot if ctx.is_latest_bar else None
+                
+                h2l2_triggered = False
+                
+                # H2 信号处理
+                if ctx.allowed_side is None or ctx.allowed_side == "buy":
+                    htf_allowed, htf_reason = self.htf_filter.allows_h2_buy(ctx.close)
+                    if not htf_allowed:
+                        if ctx.is_latest_bar:
+                            logging.debug(f"🚫 H2 HTF硬过滤: {htf_reason}")
+                    else:
+                        h2_result = await self._process_h2_signal(
+                            h2_machine, data, ctx, delta_snapshot_for_hl
+                        )
+                        if h2_result:
+                            self._apply_htf_modifier_to_result(h2_result, cached_htf_buy_modifier, cached_htf_sell_modifier, ctx)
+                            self._record_signal_with_tp(arrays, i, h2_result, ctx, ctx.close, data)
+                            h2l2_triggered = True
+                
+                # L2 信号处理（H2 未触发时才检查 L2）
+                if not h2l2_triggered and (ctx.allowed_side is None or ctx.allowed_side == "sell"):
+                    htf_allowed, htf_reason = self.htf_filter.allows_l2_sell(ctx.close)
+                    if not htf_allowed:
+                        if ctx.is_latest_bar:
+                            logging.debug(f"🚫 L2 HTF硬过滤: {htf_reason}")
+                    else:
+                        l2_result = await self._process_l2_signal(
+                            l2_machine, data, ctx, delta_snapshot_for_hl
+                        )
+                        if l2_result:
+                            self._apply_htf_modifier_to_result(l2_result, cached_htf_buy_modifier, cached_htf_sell_modifier, ctx)
+                            self._record_signal_with_tp(arrays, i, l2_result, ctx, ctx.close, data)
+                            h2l2_triggered = True
+                
+                if h2l2_triggered:
+                    continue
             
-            # ---------- 优先级4: Wedge 反转（仅在非 Spike 周期；TR 周期降低信号棒门槛）----------
+            # ---------- 优先级4: Failed Breakout（只在 TradingRange 边界触发）----------
+            # Al Brooks: "假突破在区间边界最有效，趋势中假突破反转成功率低"
+            if ctx.market_state == MarketState.TRADING_RANGE and ctx.market_cycle != MarketCycle.SPIKE:
+                fb_result = self._check_failed_breakout(data, ctx)
+                if fb_result:
+                    self._apply_htf_modifier_to_result(fb_result, cached_htf_buy_modifier, cached_htf_sell_modifier, ctx)
+                    self._record_signal_with_tp(arrays, i, fb_result, ctx, ctx.close, data)
+                    continue
+            
+            # ---------- 优先级5: Wedge 反转（仅在非 Spike 周期）----------
+            # Al Brooks: "楔形三推是经典反转形态，第三推失败是高胜率入场点"
             if ctx.market_cycle != MarketCycle.SPIKE:
                 wedge_result = self._check_wedge(data, ctx)
             else:
@@ -823,18 +910,18 @@ class AlBrooksStrategy:
                         wedge_result.delta_modifier = wedge_boost
                         if wedge_boost > 1.0:
                             wedge_result.strength += 0.3  # Delta 背离加权
-                            logging.info(
+                            # Delta 背离加权是正常分析过程，降级为 DEBUG
+                            logging.debug(
                                 f"✅ Wedge_Buy Delta背离: 强度+0.3, ×{wedge_boost} - {wedge_boost_reason}"
                             )
                 
                 self._apply_htf_modifier_to_result(wedge_result, cached_htf_buy_modifier, cached_htf_sell_modifier, ctx)
-                # Wedge 专用止盈：TP1=EMA，TP2=楔形起点。BTC 5m 楔形易演变为 Wedge Bull/Bear Flag（深度回调），
-                # Brooks 高波动保命：TP1(EMA) 处至少平 50% 仓位并移动止损到保本价
+                # Wedge 专用止盈：TP1=EMA，TP2=楔形起点
                 if wedge_result.wedge_tp1_price is not None and wedge_result.wedge_tp2_price is not None:
                     tp1 = wedge_result.wedge_tp1_price
                     tp2 = wedge_result.wedge_tp2_price
-                    tp1_ratio = 0.5  # 至少 50% 在 TP1 平仓
-                    wedge_result.move_stop_to_breakeven_at_tp1 = True  # TP1 触发后止损移至保本
+                    tp1_ratio = 0.5
+                    wedge_result.move_stop_to_breakeven_at_tp1 = True
                     is_climax = False
                 else:
                     tp1, tp2, tp1_ratio, is_climax = self._calculate_tp1_tp2(
@@ -847,7 +934,8 @@ class AlBrooksStrategy:
                 self._update_signal_cooldown(wedge_result.signal_type, i)
                 continue
             
-            # ---------- 优先级5: MTR 主要趋势反转（利用 BarContext 市场状态）----------
+            # ---------- 优先级6: MTR 主要趋势反转----------
+            # Al Brooks: "MTR 需要多重确认：强趋势 → 突破 EMA → 回测极值 → 强反转棒"
             if ctx.market_cycle != MarketCycle.SPIKE:
                 mtr_result = self._check_mtr(data, ctx)
             else:
@@ -857,8 +945,8 @@ class AlBrooksStrategy:
                 self._record_signal_with_tp(arrays, i, mtr_result, ctx, ctx.close, data)
                 continue
             
-            # ---------- 优先级6: Final Flag Reversal（终极旗形反转）----------
-            # Al Brooks: Final Flag 是趋势耗尽的最后挣扎，突破失败后是高胜率反转入场点
+            # ---------- 优先级7: Final Flag Reversal（终极旗形反转）----------
+            # Al Brooks: "Final Flag 是趋势耗尽的最后挣扎，突破失败后是高胜率反转入场点"
             if ctx.market_state == MarketState.FINAL_FLAG:
                 final_flag_result = self._check_final_flag(data, ctx)
                 if final_flag_result:
@@ -866,45 +954,30 @@ class AlBrooksStrategy:
                     self._record_signal_with_tp(arrays, i, final_flag_result, ctx, ctx.close, data)
                     continue
             
-            # ---------- H2/L2 状态机处理（关注点分离）----------
-            # 获取 Delta 快照（如果需要）
-            if ctx.is_latest_bar and not delta_snapshot_fetched:
-                cached_delta_snapshot = await self._get_delta_snapshot("BTCUSDT")
-                delta_snapshot_fetched = True
-            delta_snapshot_for_hl = cached_delta_snapshot if ctx.is_latest_bar else None
-            
-            # H2 信号处理
-            # 1. 先做 HTF 硬过滤（strategy 决策层）
-            # 2. 再调用 h2l2 做形态识别 + Delta 过滤（signal_h2l2 形态层）
-            # 3. 最后统一应用 HTF 权重（strategy 决策层）
-            if ctx.allowed_side is None or ctx.allowed_side == "buy":
-                # HTF 硬过滤：H2 买入需要 1h 强多头且价格靠近 EMA
-                htf_allowed, htf_reason = self.htf_filter.allows_h2_buy(ctx.close)
-                if not htf_allowed:
-                    if ctx.is_latest_bar:
-                        logging.debug(f"🚫 H2 HTF硬过滤: {htf_reason}")
+            # ========== 最新 K 线：如果没有信号，记录原因 ==========
+            if ctx.is_latest_bar:
+                # 收集跳过原因
+                skip_reasons = []
+                
+                # Spike 周期阻断反转信号
+                if ctx.market_cycle == MarketCycle.SPIKE:
+                    skip_reasons.append("Spike周期(反转信号阻断)")
+                
+                # 强趋势模式
+                if ctx.is_strong_trend_mode:
+                    skip_reasons.append(f"强趋势模式(只允许{ctx.allowed_side or '无'})")
+                
+                # H2/L2 状态
+                if h2_machine.state.value != "WAITING_FOR_PULLBACK":
+                    skip_reasons.append(f"H2等待中({h2_machine.state.value})")
+                if l2_machine.state.value != "WAITING_FOR_BOUNCE":
+                    skip_reasons.append(f"L2等待中({l2_machine.state.value})")
+                
+                # 无信号原因降级为 DEBUG（生产环境不需要每根K线都打印）
+                if skip_reasons:
+                    logging.debug(f"⏸️ 无信号原因: {', '.join(skip_reasons)}")
                 else:
-                    h2_result = await self._process_h2_signal(
-                        h2_machine, data, ctx, delta_snapshot_for_hl
-                    )
-                    if h2_result:
-                        self._apply_htf_modifier_to_result(h2_result, cached_htf_buy_modifier, cached_htf_sell_modifier, ctx)
-                        self._record_signal_with_tp(arrays, i, h2_result, ctx, ctx.close, data)
-            
-            # L2 信号处理
-            if ctx.allowed_side is None or ctx.allowed_side == "sell":
-                # HTF 硬过滤：L2 卖出需要 1h 强空头且价格靠近 EMA
-                htf_allowed, htf_reason = self.htf_filter.allows_l2_sell(ctx.close)
-                if not htf_allowed:
-                    if ctx.is_latest_bar:
-                        logging.debug(f"🚫 L2 HTF硬过滤: {htf_reason}")
-                else:
-                    l2_result = await self._process_l2_signal(
-                        l2_machine, data, ctx, delta_snapshot_for_hl
-                    )
-                    if l2_result:
-                        self._apply_htf_modifier_to_result(l2_result, cached_htf_buy_modifier, cached_htf_sell_modifier, ctx)
-                        self._record_signal_with_tp(arrays, i, l2_result, ctx, ctx.close, data)
+                    logging.debug(f"⏸️ 无信号: 当前形态不满足入场条件")
         
         # ========== Step 5: 应用 TA-Lib 形态加成 ==========
         self._apply_talib_boost(data, arrays)

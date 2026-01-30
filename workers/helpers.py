@@ -102,19 +102,22 @@ async def load_historical_klines(
     client: AsyncClient, history: List[Dict], limit: int = 200
 ) -> Optional[int]:
     """
-    加载历史K线数据到history列表
+    加载合约历史K线数据到history列表
+    
+    使用 futures_klines() 获取合约市场的K线数据，确保与合约交易价格一致。
     
     返回: 最后一根K线的开盘时间戳（毫秒），用于后续补全
     """
     last_timestamp = None
     try:
-        logging.info(f"正在下载历史K线数据（{SYMBOL} {INTERVAL}，{limit}根）...")
-        historical_klines = await client.get_historical_klines(
+        logging.info(f"正在下载合约历史K线数据（{SYMBOL} {INTERVAL}，{limit}根）...")
+        # 使用合约K线接口，确保与合约交易价格一致
+        historical_klines = await client.futures_klines(
             symbol=SYMBOL,
             interval=INTERVAL,
             limit=limit,
         )
-        logging.info(f"成功下载 {len(historical_klines)} 根历史K线数据")
+        logging.info(f"成功下载 {len(historical_klines)} 根合约历史K线数据")
 
         # 清空并重新填充历史数据
         history.clear()
@@ -165,7 +168,8 @@ async def fill_missing_klines(
         if last_timestamp is None:
             logging.warning("历史数据无时间戳，使用简单补全模式")
             limit = min(100, 500 - len(history))
-            missing_klines = await client.get_historical_klines(
+            # 使用合约K线接口
+            missing_klines = await client.futures_klines(
                 symbol=SYMBOL,
                 interval=INTERVAL,
                 limit=limit,
@@ -182,13 +186,14 @@ async def fill_missing_klines(
             missing_count = min(missing_count + 1, 200)
             
             logging.info(
-                f"正在补全缺失的K线数据（从 {last_timestamp} 开始，预计 {missing_count} 根）..."
+                f"正在补全缺失的合约K线数据（从 {last_timestamp} 开始，预计 {missing_count} 根）..."
             )
             
-            missing_klines = await client.get_historical_klines(
+            # 使用合约K线接口
+            missing_klines = await client.futures_klines(
                 symbol=SYMBOL,
                 interval=INTERVAL,
-                start_str=str(last_timestamp),
+                startTime=last_timestamp,
                 limit=missing_count,
             )
 

@@ -107,7 +107,10 @@ class HTFFilter:
     STRONG_SLOPE_THRESHOLD_PCT = 0.005  # 0.5% 视为强多头/强空头
     
     # 价格“靠近 HTF EMA20”的容差（%）：用于 H2/L2 仅允许在回调至 EMA 附近触发
-    PRICE_NEAR_EMA_PCT = 0.008  # 0.8% 内视为靠近 1h EMA20
+    # Al Brooks 修正：从 0.8% 放宽到 1.5%
+    # "HTF 提供背景，但不应完全阻止 LTF 的信号" - Al Brooks
+    # 过于严格的过滤会错过很多有效的 H2/L2 信号
+    PRICE_NEAR_EMA_PCT = 0.015  # 1.5% 内视为靠近 1h EMA20（从 0.8% 放宽）
     
     # 斜率计算使用的 K 线数（6 小时，更能反映趋势）
     SLOPE_LOOKBACK_BARS = 6  # 从 3 根提高到 6 根
@@ -166,17 +169,18 @@ class HTFFilter:
                 return self._snapshot
             
             try:
-                # 获取 1h K 线数据（需要 EMA 周期 + 斜率回看 + 缓冲）
+                # 获取合约 1h K 线数据（需要 EMA 周期 + 斜率回看 + 缓冲）
+                # 使用 futures_klines 确保与合约交易价格一致
                 limit = self.ema_period + self.SLOPE_LOOKBACK_BARS + 5
                 
-                klines = await client.get_klines(
+                klines = await client.futures_klines(
                     symbol=symbol,
                     interval=self.htf_interval,
                     limit=limit
                 )
                 
                 if not klines or len(klines) < self.ema_period:
-                    logging.warning(f"⚠️ HTF K 线数据不足: 获取到 {len(klines) if klines else 0} 根")
+                    logging.warning(f"⚠️ HTF 合约K线数据不足: 获取到 {len(klines) if klines else 0} 根")
                     return self._snapshot
                 
                 # 转换为 DataFrame
