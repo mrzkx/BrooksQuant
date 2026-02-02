@@ -98,6 +98,72 @@ class PatternDetector:
         return kline_range > range_atr_mult * atr
     
     @staticmethod
+    def _should_enable_sensitive_mode(
+        df: pd.DataFrame,
+        i: int,
+        lookback: int = 20,
+    ) -> bool:
+        """
+        检测是否应该启用灵敏模式
+        
+        条件：如果过去 N 根 K 线都没有生成交易信号，则启用灵敏模式
+        
+        实现：检查过去 20 根 K 线的 'signal' 列是否全为空或 None
+        如果没有 'signal' 列，则检查波动率是否过低（ATR < 平均 ATR 的 50%）
+        
+        Args:
+            df: K线数据
+            i: 当前 K 线索引
+            lookback: 回看周期
+        
+        Returns:
+            True 表示应该启用灵敏模式
+        """
+        if i < lookback:
+            return False
+        
+        recent = df.iloc[max(0, i - lookback + 1) : i + 1]
+        
+        # 方法1：检查 'signal' 列（如果存在）
+        if "signal" in recent.columns:
+            # 检查是否所有信号都为空
+            signals = recent["signal"]
+            non_empty_signals = signals.dropna()
+            if len(non_empty_signals) == 0 or (non_empty_signals == "").all():
+                # 使用 DEBUG 级别，避免历史回放时大量输出
+                logging.debug(
+                    f"🔧 检测到无信号期: 过去 {lookback} 根 K 线无交易信号，启用灵敏模式"
+                )
+                return True
+        
+        # 方法2：检查波动率（ATR）是否过低
+        if "atr" in recent.columns:
+            current_atr = float(recent.iloc[-1]["atr"]) if len(recent) > 0 else 0
+            avg_atr = float(recent["atr"].mean()) if len(recent) > 0 else 0
+            
+            # 当前 ATR < 平均 ATR 的 50% 表示波动率极低
+            if avg_atr > 0 and current_atr < avg_atr * 0.5:
+                # 使用 DEBUG 级别，避免历史回放时大量输出
+                logging.debug(
+                    f"🔧 检测到低波动率: ATR={current_atr:.2f} < 平均{avg_atr:.2f}×50%，启用灵敏模式"
+                )
+                return True
+        
+        # 方法3：检查实体大小是否持续偏小
+        if "body_size" in recent.columns:
+            avg_body = float(recent["body_size"].mean()) if len(recent) > 0 else 0
+            max_body = float(recent["body_size"].max()) if len(recent) > 0 else 0
+            
+            # 最大实体 < 平均实体的 1.5 倍，说明没有明显的趋势棒
+            if avg_body > 0 and max_body < avg_body * 1.5:
+                logging.debug(
+                    f"检测到弱势期: 最大实体={max_body:.2f} < 平均{avg_body:.2f}×1.5"
+                )
+                return True
+        
+        return False
+    
+    @staticmethod
     def validate_signal_close(row: pd.Series, side: str, min_close_ratio: float = 0.75) -> bool:
         """
         验证K线收盘价位置是否符合信号要求（通用版）
@@ -129,9 +195,10 @@ class PatternDetector:
         df: Optional[pd.DataFrame] = None,
         i: Optional[int] = None,
         signal_type: Optional[str] = None,
+        sensitive_mode: bool = False,
     ) -> tuple[bool, str]:
         """
-        BTC 专用信号棒质量验证（针对高波动长影线特性 + 背景比较）
+        BTC 专用信号棒质量验证（针对高波动长影线特性 + 背景比较 + 灵敏模式）
         
         Al Brooks: "信号棒的质量决定了交易的成功率"
         
@@ -146,6 +213,11 @@ class PatternDetector:
         6. 低重叠度：信号棒实体与前一根棒的实体重叠部分不应超过 50%
         7. 影线要求：反转棒（Wedge/MTR）的反向影线必须极小（<15%）
         
+        灵敏模式（sensitive_mode=True）：
+        - 当过去 20 根 K 线没有成交时自动启用
+        - min_body_ratio 从 50% 下调至 40%
+        - close_position_pct 从 20% 放宽至 28%
+        
         Args:
             row: K线数据
             side: 交易方向 ("buy" 或 "sell")
@@ -154,14 +226,30 @@ class PatternDetector:
             df: K线 DataFrame（用于背景比较，可选）
             i: 当前 K 线索引（用于背景比较，可选）
             signal_type: 信号类型（用于判断影线要求，可选）
+            sensitive_mode: 是否启用灵敏模式（自动检测或手动指定）
         
         Returns:
             (is_valid, reason): 是否有效及原因
         """
+        # ⭐ 灵敏模式自动检测：如果过去 20 根 K 线没有生成信号
+        if df is not None and i is not None and not sensitive_mode:
+            sensitive_mode = cls._should_enable_sensitive_mode(df, i, lookback=20)
+        
         if min_body_ratio is None:
             min_body_ratio = cls.BTC_MIN_BODY_RATIO
         if close_position_pct is None:
             close_position_pct = cls.BTC_CLOSE_POSITION_PCT
+        
+        # ⭐ 灵敏模式：下调门槛
+        if sensitive_mode:
+            # 实体占比从默认值下调 20%（例如 50% → 40%）
+            min_body_ratio = max(0.35, min_body_ratio - 0.10)
+            # 收盘位置放宽 40%（例如 20% → 28%）
+            close_position_pct = min(0.35, close_position_pct + 0.08)
+            logging.debug(
+                f"🔧 启用灵敏模式: min_body_ratio={min_body_ratio:.0%}, "
+                f"close_position_pct={close_position_pct:.0%}"
+            )
         
         high = float(row["high"])
         low = float(row["low"])
@@ -470,14 +558,21 @@ class PatternDetector:
         market_state: Optional[MarketState] = None
     ) -> Optional[Tuple[str, str, float, Optional[float], float, str, bool]]:
         """
-        检测 Strong Spike（强突破入场）- Al Brooks Spike & Channel 对齐版（修正版）
+        检测 Strong Spike（强突破入场）- Al Brooks Spike & Channel 对齐版（v2.0 累积突破）
         
         Al Brooks 修正：Spike 更注重连续性和跟随情况，单根 K 线的实体占比不是唯一标准
         BTC 高波动性下，65% 实体占比的强趋势棒也应被识别
         
-        增强突破定义：
-        1. Signal Bar（前一根 i-1）实体占比 > 65%（从 70% 降低），且必须突破过去 10 根 K 线的极值
+        增强突破定义（两种模式）：
+        
+        模式 A - 单棒突破（原逻辑）：
+        1. Signal Bar（前一根 i-1）实体占比 > 65%，且必须突破过去 10 根 K 线的极值
         2. Entry Bar（当前 Bar i）续延性验证：同向强 K 线，实体 > 50%
+        
+        模式 B - 累积突破（新增）：
+        1. 连续 3 根 K 线均为同向趋势棒（阳线或阴线）
+        2. 累计涨/跌幅 > 1.5 * ATR
+        3. 即便单根棒实体没到 50%，也判定为有效 Spike
         
         入场模式：
         - EMA 偏离度 <= 1.5*ATR → Market_Entry（市价入场）
@@ -523,6 +618,12 @@ class PatternDetector:
         if atr is not None and atr > 0 and e_range > atr * self._params.atr_spike_filter_mult:
             return None
         
+        # ========== 模式 B: 累积突破检测（优先检测）==========
+        cumulative_result = self._detect_cumulative_spike(df, i, ema, atr, market_state)
+        if cumulative_result is not None:
+            return cumulative_result
+        
+        # ========== 模式 A: 单棒突破（原逻辑）==========
         # ---------- 向上突破 ----------
         if s_close > s_open and e_close > e_open:
             # Signal Bar: 实体占比 > 65%（Al Brooks 修正：从 70% 降低），且突破过去 10 根最高点
@@ -604,6 +705,276 @@ class PatternDetector:
             return (
                 "Spike_Sell", "sell", stop_loss, limit_price, base_height,
                 entry_mode, is_high_risk
+            )
+        
+        return None
+    
+    def _detect_cumulative_spike(
+        self, df: pd.DataFrame, i: int, ema: float, atr: Optional[float],
+        market_state: Optional[MarketState]
+    ) -> Optional[Tuple[str, str, float, Optional[float], float, str, bool]]:
+        """
+        检测累积突破（Cumulative Spike）- Al Brooks 多棒组合突破
+        
+        Al Brooks: "突破不必是单根大阳线，连续的同向趋势棒也是有效突破"
+        
+        条件：
+        1. 连续 3 根 K 线均为同向趋势棒（阳线或阴线）
+        2. 累计涨/跌幅 > 1.5 * ATR
+        3. 即便单根棒实体没到 50%，也判定为有效 Spike
+        
+        Returns:
+            (signal_type, side, stop_loss, limit_price, base_height, entry_mode, is_high_risk) 或 None
+        """
+        if i < 4 or atr is None or atr <= 0:
+            return None
+        
+        # 累积突破需要的参数
+        CUMULATIVE_BARS = 3  # 连续 3 根同向 K 线
+        CUMULATIVE_ATR_MULT = 1.5  # 累计涨跌幅 > 1.5 * ATR
+        
+        # 检查最近 3 根 K 线（i-2, i-1, i）
+        bars = [df.iloc[i - j] for j in range(CUMULATIVE_BARS - 1, -1, -1)]
+        
+        # ---------- 检测向上累积突破 ----------
+        all_bullish = all(float(b["close"]) > float(b["open"]) for b in bars)
+        if all_bullish:
+            # 计算累计涨幅：从第一根开盘到最后一根收盘
+            first_open = float(bars[0]["open"])
+            last_close = float(bars[-1]["close"])
+            cumulative_move = last_close - first_open
+            
+            # 检查累计涨幅是否 > 1.5 * ATR
+            if cumulative_move > atr * CUMULATIVE_ATR_MULT:
+                # 价格需在 EMA 上方
+                if last_close <= ema:
+                    return None
+                
+                # 计算 3 根 K 线的最低点作为止损参考
+                combined_low = min(float(b["low"]) for b in bars)
+                stop_loss = combined_low * (1.0 - 0.001)  # 低点外 0.1%
+                
+                entry_price = last_close
+                risk_distance = entry_price - stop_loss
+                is_high_risk = risk_distance > 2.5 * atr
+                
+                base_height = self.calculate_measured_move(df, i, "buy", market_state, atr)
+                
+                # 入场模式
+                ema_deviation = abs(entry_price - ema) if ema > 0 else 0.0
+                if ema_deviation > 1.5 * atr:
+                    entry_mode = "Limit_Entry"
+                    # 限价入场设在第二根 K 线的中点
+                    limit_price = (float(bars[1]["open"]) + float(bars[1]["close"])) / 2.0
+                else:
+                    entry_mode = "Market_Entry"
+                    limit_price = None
+                
+                logging.debug(
+                    f"✅ 累积突破(买入): {CUMULATIVE_BARS}根连续阳线, "
+                    f"累计涨幅={cumulative_move:.2f} > {atr * CUMULATIVE_ATR_MULT:.2f}"
+                )
+                return (
+                    "Spike_Buy", "buy", stop_loss, limit_price, base_height,
+                    entry_mode, is_high_risk
+                )
+        
+        # ---------- 检测向下累积突破 ----------
+        all_bearish = all(float(b["close"]) < float(b["open"]) for b in bars)
+        if all_bearish:
+            # 计算累计跌幅：从第一根开盘到最后一根收盘
+            first_open = float(bars[0]["open"])
+            last_close = float(bars[-1]["close"])
+            cumulative_move = first_open - last_close  # 跌幅为正数
+            
+            # 检查累计跌幅是否 > 1.5 * ATR
+            if cumulative_move > atr * CUMULATIVE_ATR_MULT:
+                # 价格需在 EMA 下方
+                if last_close >= ema:
+                    return None
+                
+                # 计算 3 根 K 线的最高点作为止损参考
+                combined_high = max(float(b["high"]) for b in bars)
+                stop_loss = combined_high * (1.0 + 0.001)  # 高点外 0.1%
+                
+                entry_price = last_close
+                risk_distance = stop_loss - entry_price
+                is_high_risk = risk_distance > 2.5 * atr
+                
+                base_height = self.calculate_measured_move(df, i, "sell", market_state, atr)
+                
+                # 入场模式
+                ema_deviation = abs(ema - entry_price) if ema > 0 else 0.0
+                if ema_deviation > 1.5 * atr:
+                    entry_mode = "Limit_Entry"
+                    limit_price = (float(bars[1]["open"]) + float(bars[1]["close"])) / 2.0
+                else:
+                    entry_mode = "Market_Entry"
+                    limit_price = None
+                
+                logging.debug(
+                    f"✅ 累积突破(卖出): {CUMULATIVE_BARS}根连续阴线, "
+                    f"累计跌幅={cumulative_move:.2f} > {atr * CUMULATIVE_ATR_MULT:.2f}"
+                )
+                return (
+                    "Spike_Sell", "sell", stop_loss, limit_price, base_height,
+                    entry_mode, is_high_risk
+                )
+        
+        return None
+    
+    def detect_ma_gap_bar(
+        self, df: pd.DataFrame, i: int, ema: float, atr: Optional[float] = None,
+        market_state: Optional[MarketState] = None
+    ) -> Optional[Tuple[str, str, float, Optional[float], float, str]]:
+        """
+        检测 Moving Average Gap Bar（MA 缺口棒）- 加密货币 24 小时市场专用
+        
+        Al Brooks 修正版：在加密市场中，Gap 的定义是 "Moving Average Gap"
+        
+        定义：
+        - 上涨 MA Gap：连续 3 根 K 线的 Low 始终高于 20 EMA
+        - 下跌 MA Gap：连续 3 根 K 线的 High 始终低于 20 EMA
+        
+        当检测到 MA Gap 时：
+        1. 解除 "必须触碰 EMA" 的回调限制
+        2. 只要当前棒是顺势趋势棒（Trend Bar），且突破前一根棒的极值
+        3. 允许直接入场（限价单，订单簿最优价）
+        
+        返回: (signal_type, side, stop_loss, limit_price, base_height, entry_mode) 或 None
+        """
+        # 需要至少 5 根历史（3 根 Gap + 当前棒 + 前一棒）
+        if i < 5:
+            return None
+        
+        # 只在强趋势/通道状态下触发
+        if market_state not in [MarketState.STRONG_TREND, MarketState.TIGHT_CHANNEL, 
+                                MarketState.CHANNEL, MarketState.BREAKOUT]:
+            return None
+        
+        if "body_size" not in df.columns or "kline_range" not in df.columns:
+            return None
+        
+        # 获取当前棒和前一棒
+        current_bar = df.iloc[i]
+        prev_bar = df.iloc[i - 1]
+        
+        curr_close = float(current_bar["close"])
+        curr_open = float(current_bar["open"])
+        curr_high = float(current_bar["high"])
+        curr_low = float(current_bar["low"])
+        curr_body = float(current_bar["body_size"])
+        curr_range = float(current_bar["kline_range"]) if current_bar["kline_range"] > 0 else (curr_high - curr_low)
+        
+        prev_high = float(prev_bar["high"])
+        prev_low = float(prev_bar["low"])
+        
+        # ========== 检测 MA Gap（连续 3 根 K 线与 EMA 的关系）==========
+        MA_GAP_BARS = 3
+        
+        # 检查过去 3 根 K 线（i-3, i-2, i-1）
+        gap_bars = [df.iloc[i - j] for j in range(MA_GAP_BARS, 0, -1)]
+        
+        # 上涨 MA Gap：所有 3 根 K 线的 Low > EMA
+        all_low_above_ema = True
+        for bar in gap_bars:
+            bar_low = float(bar["low"])
+            bar_ema = float(bar["ema"]) if "ema" in bar else ema
+            if bar_low <= bar_ema:
+                all_low_above_ema = False
+                break
+        
+        # 下跌 MA Gap：所有 3 根 K 线的 High < EMA
+        all_high_below_ema = True
+        for bar in gap_bars:
+            bar_high = float(bar["high"])
+            bar_ema = float(bar["ema"]) if "ema" in bar else ema
+            if bar_high >= bar_ema:
+                all_high_below_ema = False
+                break
+        
+        # 如果没有检测到 MA Gap，返回 None
+        if not all_low_above_ema and not all_high_below_ema:
+            return None
+        
+        # ========== 检测当前棒是否为顺势趋势棒 ==========
+        # 趋势棒定义：实体占比 > 50%，收盘方向与 Gap 方向一致
+        if curr_range <= 0:
+            return None
+        
+        body_ratio = curr_body / curr_range
+        MIN_BODY_RATIO = 0.50  # 趋势棒最低实体占比
+        
+        if body_ratio < MIN_BODY_RATIO:
+            return None
+        
+        # ========== 上涨 MA Gap Bar ==========
+        if all_low_above_ema:
+            # 当前棒必须是阳线
+            if curr_close <= curr_open:
+                return None
+            
+            # 当前棒必须突破前一棒最高点
+            if curr_high <= prev_high:
+                return None
+            
+            # 当前棒 Low 也必须高于 EMA（保持 Gap 状态）
+            if curr_low <= ema:
+                return None
+            
+            # 止损：前一棒低点外 0.1%（Gap 状态下止损较紧）
+            stop_loss = prev_low * (1.0 - 0.001)
+            
+            # 入场模式：限价单（订单簿最优价）
+            # 使用前一棒高点作为限价入场点（突破后回撤入场）
+            entry_mode = "Limit_Entry"
+            limit_price = prev_high
+            
+            # 计算目标
+            base_height = self.calculate_measured_move(df, i, "buy", market_state, atr)
+            
+            logging.debug(
+                f"✅ MA Gap Bar (买入): {MA_GAP_BARS}根K线Low>EMA, "
+                f"当前棒突破前高 {prev_high:.2f}, 实体比={body_ratio:.0%}"
+            )
+            
+            return (
+                "GapBar_Buy", "buy", stop_loss, limit_price, base_height,
+                entry_mode
+            )
+        
+        # ========== 下跌 MA Gap Bar ==========
+        if all_high_below_ema:
+            # 当前棒必须是阴线
+            if curr_close >= curr_open:
+                return None
+            
+            # 当前棒必须突破前一棒最低点
+            if curr_low >= prev_low:
+                return None
+            
+            # 当前棒 High 也必须低于 EMA（保持 Gap 状态）
+            if curr_high >= ema:
+                return None
+            
+            # 止损：前一棒高点外 0.1%
+            stop_loss = prev_high * (1.0 + 0.001)
+            
+            # 入场模式：限价单
+            entry_mode = "Limit_Entry"
+            limit_price = prev_low
+            
+            # 计算目标
+            base_height = self.calculate_measured_move(df, i, "sell", market_state, atr)
+            
+            logging.debug(
+                f"✅ MA Gap Bar (卖出): {MA_GAP_BARS}根K线High<EMA, "
+                f"当前棒突破前低 {prev_low:.2f}, 实体比={body_ratio:.0%}"
+            )
+            
+            return (
+                "GapBar_Sell", "sell", stop_loss, limit_price, base_height,
+                entry_mode
             )
         
         return None

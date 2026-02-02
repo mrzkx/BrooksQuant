@@ -121,19 +121,26 @@ async def kline_producer(
                             if current_price <= 0:
                                 current_price = float(k.get("l", 0))
 
-                            # 实时检查止损止盈
+                            # ========== Al Brooks 软止损逻辑 ==========
+                            # 实时检查止盈（TP1/TP2），但止损只在收盘时检查
+                            # Crypto 市场"插针"频繁，收盘价确认止损可避免被假突破误触发
                             await _check_stop_loss_take_profit(
-                                trade_logger, close_queues, current_price
+                                trade_logger, close_queues, current_price, check_stop_loss=False
                             )
 
                             if not k.get("x"):  # 只处理已收盘的K线
                                 continue
+                            
+                            # ========== K 线收盘时检查止损（软止损）==========
+                            close_price = float(k.get("c", 0))
+                            await _check_stop_loss_take_profit(
+                                trade_logger, close_queues, close_price, check_stop_loss=True
+                            )
 
                             # 处理已收盘的K线
                             kline_count += 1
                             kline_open_time = int(k.get("t", 0))
-                            # K线数据降级为 DEBUG（生产环境不需要每根K线都打印）
-                            logging.debug(
+                            logging.info(
                                 f"📊 K线收盘 #{kline_count}: O={float(k['o']):.2f} "
                                 f"H={float(k['h']):.2f} L={float(k['l']):.2f} C={float(k['c']):.2f}"
                             )
@@ -238,9 +245,18 @@ async def kline_producer(
 async def _check_stop_loss_take_profit(
     trade_logger: TradeLogger,
     close_queues: Dict[str, asyncio.Queue],
-    current_price: float
+    current_price: float,
+    check_stop_loss: bool = True,
 ) -> None:
-    """检查止损止盈"""
+    """
+    检查止损止盈（Al Brooks 软止损版）
+    
+    Args:
+        trade_logger: 交易日志器
+        close_queues: 平仓队列
+        current_price: 当前价格
+        check_stop_loss: 是否检查止损（False=只检查止盈，True=检查止盈+止损）
+    """
     if current_price <= 0:
         return
     
@@ -249,7 +265,9 @@ async def _check_stop_loss_take_profit(
         if trade is None:
             continue
         
-        result = trade_logger.check_stop_loss_take_profit(user_name, current_price)
+        result = trade_logger.check_stop_loss_take_profit(
+            user_name, current_price, check_stop_loss=check_stop_loss
+        )
         
         if not result:
             continue

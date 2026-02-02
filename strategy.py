@@ -199,11 +199,13 @@ class AlBrooksStrategy:
         # 定义各方向的信号类型
         buy_signals = [
             "Spike_Buy", "FailedBreakout_Buy", "Wedge_FailedBreakout_Buy", "Climax_Buy",
-            "Wedge_Buy", "MTR_Buy", "Final_Flag_Reversal_Buy", "H1_Buy", "H2_Buy"
+            "Wedge_Buy", "MTR_Buy", "Final_Flag_Reversal_Buy", "H1_Buy", "H2_Buy",
+            "GapBar_Buy"  # 强单边行情专用补位信号
         ]
         sell_signals = [
             "Spike_Sell", "FailedBreakout_Sell", "Wedge_FailedBreakout_Sell", "Climax_Sell",
-            "Wedge_Sell", "MTR_Sell", "Final_Flag_Reversal_Sell", "L1_Sell", "L2_Sell"
+            "Wedge_Sell", "MTR_Sell", "Final_Flag_Reversal_Sell", "L1_Sell", "L2_Sell",
+            "GapBar_Sell"  # 强单边行情专用补位信号
         ]
         
         signals_to_check = buy_signals if side == "buy" else sell_signals
@@ -474,6 +476,202 @@ class AlBrooksStrategy:
             avg_volume=avg_volume,
         )
     
+    def _get_signal_trigger_hints(
+        self, ctx: BarContext, h2_machine, l2_machine, data: pd.DataFrame
+    ) -> List[str]:
+        """
+        获取所有信号的触发条件提示（根据市场状态动态调整）
+        
+        Al Brooks 信号优先级：
+        1. Climax - 极端反转
+        2. Spike - 趋势确立
+        3. H2/L2 - 二次入场
+        4. Failed Breakout - 区间假突破
+        5. Wedge - 楔形反转
+        6. MTR - 主要趋势反转
+        7. Final Flag - 终极旗形
+        """
+        hints = []
+        i = ctx.i
+        current_close = ctx.close
+        current_high = ctx.high
+        current_low = ctx.low
+        ema = ctx.ema
+        atr = ctx.atr or 0
+        
+        # ========== 1. Spike 信号（趋势确立）==========
+        # Spike 在任何市场状态下都可能触发
+        if ctx.market_cycle != MarketCycle.SPIKE:
+            hints.append(f"Spike: 需要强趋势棒(实体>50%K线,收盘在极端25%)")
+        else:
+            hints.append("Spike: ⚡当前处于Spike周期，等待回撤入场或顺势交易")
+        
+        # ========== 1.5 MA Gap Bar 信号（强动能顺势入场）==========
+        # 检查是否有 MA Gap（连续 3 根 K 线与 EMA 保持距离）
+        ma_gap_hint = self._get_ma_gap_bar_hint(data, ctx)
+        if ma_gap_hint:
+            hints.append(ma_gap_hint)
+        
+        # ========== 2. H2/L2 信号（二次入场）==========
+        # 根据 EMA 位置决定显示 H2 还是 L2
+        if current_close > ema:
+            # 价格在 EMA 上方，关注 H2 买入
+            h2_hint = self._get_h2_trigger_hint(h2_machine, ctx)
+            if h2_hint:
+                hints.append(h2_hint)
+        elif current_close < ema:
+            # 价格在 EMA 下方，关注 L2 卖出
+            l2_hint = self._get_l2_trigger_hint(l2_machine, ctx)
+            if l2_hint:
+                hints.append(l2_hint)
+        else:
+            # 价格在 EMA 附近，两边都显示
+            h2_hint = self._get_h2_trigger_hint(h2_machine, ctx)
+            l2_hint = self._get_l2_trigger_hint(l2_machine, ctx)
+            if h2_hint:
+                hints.append(h2_hint)
+            if l2_hint:
+                hints.append(l2_hint)
+        
+        # ========== 3. 反转信号（Climax/Wedge/MTR）==========
+        # 优化 v2.0：高优先级反转信号在 StrongTrend 中有条件放行
+        if ctx.market_cycle == MarketCycle.SPIKE:
+            hints.append("反转信号: ❌Spike周期内禁止(Always In阶段)")
+        elif ctx.is_strong_trend_mode:
+            allowed = ctx.allowed_side or "无"
+            # 不再完全封锁，给出条件放行提示
+            hints.append(f"反转信号: 强趋势中有条件放行(优先{allowed}方向)")
+            hints.append("  - Climax P1: ✅高优先级，检测到即放行")
+            hints.append("  - Wedge P3: ✅动能衰减或强反转棒时放行")
+            hints.append("  - MTR: ✅EMA触碰或穿越时放行")
+        else:
+            # Climax 反转
+            hints.append("Climax: 需要3+根同向强趋势棒后出现反转棒")
+            
+            # Wedge 反转
+            hints.append("Wedge: 需要三推形态(3个递增高点或递减低点)")
+            
+            # MTR 反转
+            hints.append("MTR: 需要趋势线突破+回测+反转信号棒")
+        
+        # ========== 4. Failed Breakout（区间假突破）==========
+        if ctx.market_state == MarketState.TRADING_RANGE:
+            hints.append("FailedBO: ✅交易区间，等待突破失败回撤信号")
+        else:
+            hints.append(f"FailedBO: ❌需要TradingRange(当前{ctx.market_state.value})")
+        
+        # ========== 5. Final Flag（终极旗形）==========
+        if ctx.market_state == MarketState.FINAL_FLAG:
+            hints.append("FinalFlag: ✅终极旗形状态，等待反转信号棒")
+        elif ctx.market_state == MarketState.TIGHT_CHANNEL:
+            hints.append("FinalFlag: TightChannel中，可能演变为FinalFlag")
+        
+        return hints
+    
+    def _get_h2_trigger_hint(self, h2_machine, ctx: BarContext) -> Optional[str]:
+        """获取 H2 状态机触发条件提示"""
+        if h2_machine is None:
+            return None
+        
+        state = h2_machine.state.value
+        
+        if state == "等待回调":
+            if h2_machine.trend_high:
+                return f"H2: 等待回调(高点{h2_machine.trend_high:.0f})"
+            return "H2: 等待建立趋势高点"
+        elif state == "回调中":
+            if h2_machine.trend_high:
+                return f"H2: 回调中，突破{h2_machine.trend_high:.0f}→H1"
+            return "H2: 回调中，等待反弹"
+        elif state == "H1已触发":
+            if h2_machine.h1_high:
+                return f"H2: H1@{h2_machine.h1_high:.0f}，等待回调"
+            return "H2: H1已触发，等待回调"
+        elif state == "等待H2":
+            if h2_machine.h1_high:
+                return f"H2: ⭐突破{h2_machine.h1_high:.0f}→触发买入"
+            return "H2: 等待突破H1高点"
+        
+        return None
+    
+    def _get_l2_trigger_hint(self, l2_machine, ctx: BarContext) -> Optional[str]:
+        """获取 L2 状态机触发条件提示"""
+        if l2_machine is None:
+            return None
+        
+        state = l2_machine.state.value
+        
+        if state == "等待反弹":
+            if l2_machine.trend_low:
+                return f"L2: 等待反弹(低点{l2_machine.trend_low:.0f})"
+            return "L2: 等待建立趋势低点"
+        elif state == "反弹中":
+            if l2_machine.trend_low:
+                return f"L2: 反弹中，跌破{l2_machine.trend_low:.0f}→L1"
+            return "L2: 反弹中，等待回落"
+        elif state == "L1已触发":
+            if l2_machine.l1_low:
+                return f"L2: L1@{l2_machine.l1_low:.0f}，等待反弹"
+            return "L2: L1已触发，等待反弹"
+        elif state == "等待L2":
+            if l2_machine.l1_low:
+                return f"L2: ⭐跌破{l2_machine.l1_low:.0f}→触发卖出"
+            return "L2: 等待跌破L1低点"
+        
+        return None
+
+    def _get_ma_gap_bar_hint(self, data: pd.DataFrame, ctx: BarContext) -> Optional[str]:
+        """
+        获取 MA Gap Bar 触发条件提示
+        
+        MA Gap 定义（加密市场专用）：
+        - 上涨 MA Gap：连续 3 根 K 线的 Low > EMA = 强多头动能
+        - 下跌 MA Gap：连续 3 根 K 线的 High < EMA = 强空头动能
+        """
+        if ctx.i < 5:
+            return None
+        
+        # 检查过去 3 根 K 线是否形成 MA Gap
+        MA_GAP_BARS = 3
+        ema = ctx.ema
+        
+        # 检查上涨 MA Gap
+        all_low_above_ema = True
+        for j in range(1, MA_GAP_BARS + 1):
+            idx = ctx.i - j
+            if idx < 0:
+                all_low_above_ema = False
+                break
+            bar = data.iloc[idx]
+            bar_low = float(bar["low"])
+            bar_ema = float(bar["ema"]) if "ema" in bar else ema
+            if bar_low <= bar_ema:
+                all_low_above_ema = False
+                break
+        
+        # 检查下跌 MA Gap
+        all_high_below_ema = True
+        for j in range(1, MA_GAP_BARS + 1):
+            idx = ctx.i - j
+            if idx < 0:
+                all_high_below_ema = False
+                break
+            bar = data.iloc[idx]
+            bar_high = float(bar["high"])
+            bar_ema = float(bar["ema"]) if "ema" in bar else ema
+            if bar_high >= bar_ema:
+                all_high_below_ema = False
+                break
+        
+        if all_low_above_ema:
+            prev_high = float(data.iloc[ctx.i - 1]["high"])
+            return f"GapBar: ✅上涨MA Gap(3根Low>EMA), 突破{prev_high:.0f}→买入"
+        elif all_high_below_ema:
+            prev_low = float(data.iloc[ctx.i - 1]["low"])
+            return f"GapBar: ✅下跌MA Gap(3根High<EMA), 跌破{prev_low:.0f}→卖出"
+        else:
+            return "GapBar: ❌无MA Gap(需3根K线与EMA保持间距)"
+
     def _volume_confirms_breakout(self, ctx: BarContext) -> bool:
         """
         成交量确认突破：当次或近期成交量 > 近期均量×系数时，视为有效突破。
@@ -512,8 +710,21 @@ class AlBrooksStrategy:
         cached_htf_buy_modifier: float,
         cached_htf_sell_modifier: float,
         ctx: BarContext,
+        spike_htf_bypass: bool = False,
     ) -> None:
-        """对信号结果应用 HTF 权重调节并写日志。"""
+        """
+        对信号结果应用 HTF 权重调节并写日志。
+        
+        Args:
+            spike_htf_bypass: 如果为 True（Spike 周期），跳过 HTF 权重调节
+        """
+        # Spike 周期豁免：不应用 HTF 权重调节
+        if spike_htf_bypass:
+            result.htf_modifier = 1.0
+            if ctx.is_latest_bar:
+                logging.debug(f"⚡ Spike 周期: {result.signal_type} 跳过 HTF 权重调节，保持原始强度")
+            return
+        
         htf_modifier = cached_htf_buy_modifier if result.side == "buy" else cached_htf_sell_modifier
         result.htf_modifier = htf_modifier
         result.strength = result.strength * htf_modifier
@@ -571,6 +782,23 @@ class AlBrooksStrategy:
     ) -> Optional[SignalResult]:
         """委托 logic.signal_checks 检测 Strong Spike。"""
         return self._signal_checker.check_spike(data, ctx)
+
+    def _check_ma_gap_bar(
+        self, data: pd.DataFrame, ctx: BarContext
+    ) -> Optional[SignalResult]:
+        """委托 logic.signal_checks 检测 MA Gap Bar（加密市场专用顺势入场信号）。"""
+        return self._signal_checker.check_ma_gap_bar(data, ctx)
+
+    def _check_gapbar_entry(
+        self, data: pd.DataFrame, ctx: BarContext
+    ) -> Optional[SignalResult]:
+        """
+        委托 logic.signal_checks 检测 GapBar_Entry（强单边行情专用补位信号）。
+        
+        当市场处于 StrongTrend/TightChannel 且 H2/L2 状态机无法触发时，
+        使用此信号作为顺势入场的补位手段。
+        """
+        return self._signal_checker.check_gapbar_entry(data, ctx)
 
     def _check_climax(
         self, data: pd.DataFrame, ctx: BarContext
@@ -635,6 +863,73 @@ class AlBrooksStrategy:
             l2_machine, data, ctx, cached_delta_snapshot
         )
 
+    def _print_market_scan_report(
+        self,
+        ctx: BarContext,
+        h2_machine,
+        l2_machine,
+        data: pd.DataFrame,
+        arrays: SignalArrays,
+        i: int
+    ) -> None:
+        """
+        打印市场状态扫描报告（每根 K 线收盘只打印一次）
+        
+        整合所有市场信息到一个完整的报告中：
+        1. 市场状态与周期
+        2. 趋势方向与强度
+        3. H2/L2 状态机状态
+        4. 可触发信号提示
+        5. 当前信号结果或无信号原因
+        """
+        # ========== 构建报告头 ==========
+        trend_icon = "📈" if ctx.trend_direction == "up" else "📉" if ctx.trend_direction == "down" else "➡️"
+        allowed_icon = "🔒" if ctx.allowed_side else "🔓"
+        h2_state = h2_machine.state.value if h2_machine else "N/A"
+        l2_state = l2_machine.state.value if l2_machine else "N/A"
+        
+        # ========== 检查是否有信号 ==========
+        has_signal = arrays.signals[i] is not None and arrays.signals[i] != ""
+        signal_info = ""
+        if has_signal:
+            signal_type = arrays.signals[i]
+            side = arrays.sides[i]
+            stop_loss = arrays.stop_losses[i]
+            signal_info = f"✅ 信号: {signal_type} {side} | 止损: {stop_loss:.2f}"
+        
+        # ========== 收集无信号原因 ==========
+        skip_reasons = []
+        if not has_signal:
+            if ctx.market_cycle == MarketCycle.SPIKE:
+                skip_reasons.append("Spike周期")
+            if ctx.is_strong_trend_mode:
+                skip_reasons.append(f"强趋势({ctx.allowed_side or '无'})")
+            if h2_machine and h2_machine.state.value != "WAITING_FOR_PULLBACK":
+                skip_reasons.append(f"H2({h2_machine.state.value})")
+            if l2_machine and l2_machine.state.value != "WAITING_FOR_BOUNCE":
+                skip_reasons.append(f"L2({l2_machine.state.value})")
+        
+        # ========== 打印完整报告（单行紧凑格式）==========
+        report_parts = [
+            f"📊 K线#{i}收盘扫描",
+            f"状态:{ctx.market_state.value}",
+            f"周期:{ctx.market_cycle.value}",
+            f"{trend_icon}{ctx.trend_direction or '无'}({ctx.trend_strength:.0%})",
+            f"{allowed_icon}{ctx.allowed_side or '双向'}",
+            f"H2:{h2_state}",
+            f"L2:{l2_state}",
+        ]
+        
+        if has_signal:
+            report_parts.append(signal_info)
+        elif skip_reasons:
+            report_parts.append(f"⏸️ 原因: {', '.join(skip_reasons)}")
+        else:
+            report_parts.append("⏸️ 形态不满足")
+        
+        # 单行输出完整报告
+        logging.info(" | ".join(report_parts))
+    
     def _apply_talib_boost(
         self, 
         data: pd.DataFrame, 
@@ -697,6 +992,10 @@ class AlBrooksStrategy:
         cached_htf_buy_modifier = self.htf_filter.get_signal_modifier("buy")
         cached_htf_sell_modifier = self.htf_filter.get_signal_modifier("sell")
         
+        # Spike 周期 HTF 豁免标记（动态更新）
+        # Al Brooks: "Spike 是 Always In 阶段，应参与第一波暴涨/暴跌"
+        spike_htf_bypass = False
+        
         # Delta 快照缓存
         cached_delta_snapshot: Optional[DeltaSnapshot] = None
         delta_snapshot_fetched = False
@@ -708,20 +1007,15 @@ class AlBrooksStrategy:
             arrays.market_states[i] = ctx.market_state.value
             arrays.tight_channel_scores[i] = ctx.tight_channel_score
             
-            # ========== 最新 K 线：记录市场状态日志（DEBUG 级别）==========
-            if ctx.is_latest_bar:
-                trend_icon = "📈" if ctx.trend_direction == "up" else "📉" if ctx.trend_direction == "down" else "➡️"
-                allowed_icon = "🔒" if ctx.allowed_side else "🔓"
-                h2_state = h2_machine.state.value if h2_machine else "N/A"
-                l2_state = l2_machine.state.value if l2_machine else "N/A"
-                # 市场状态详情降级为 DEBUG（生产环境不需要每根K线都打印）
-                logging.debug(
-                    f"📍 市场状态: {ctx.market_state.value} | "
-                    f"周期: {ctx.market_cycle.value} | "
-                    f"{trend_icon} 趋势: {ctx.trend_direction or '无'}({ctx.trend_strength:.0%}) | "
-                    f"{allowed_icon} 允许方向: {ctx.allowed_side or '双向'} | "
-                    f"H2状态: {h2_state} | L2状态: {l2_state}"
-                )
+            # ========== Spike 周期 HTF 豁免检测 ==========
+            # Al Brooks: "Spike 是 Always In 阶段，应参与第一波暴涨/暴跌，而非被 HTF 过滤掉"
+            spike_htf_bypass = (ctx.market_cycle == MarketCycle.SPIKE)
+            if spike_htf_bypass and ctx.is_latest_bar:
+                logging.info(f"⚡ Spike 周期检测: 暂时屏蔽 HTF 过滤器，允许参与第一波行情")
+            
+            # ========== 最新 K 线：市场状态扫描报告（每根 K 线收盘只打印一次）==========
+            # 注意：这里只记录状态信息，不打印日志
+            # 完整的扫描报告将在信号检测完成后统一打印
             
             # ---------- 处理待处理的 Spike 回撤入场（Limit_Entry）----------
             if pending_spike is not None:
@@ -777,7 +1071,7 @@ class AlBrooksStrategy:
             # Al Brooks: "Climax 是市场极端情绪的表现，错过就没了"
             climax_result = self._check_climax(data, ctx)
             if climax_result:
-                self._apply_htf_modifier_to_result(climax_result, cached_htf_buy_modifier, cached_htf_sell_modifier, ctx)
+                self._apply_htf_modifier_to_result(climax_result, cached_htf_buy_modifier, cached_htf_sell_modifier, ctx, spike_htf_bypass)
                 self._record_signal_with_tp(arrays, i, climax_result, ctx, ctx.close, data)
                 continue
             
@@ -823,12 +1117,38 @@ class AlBrooksStrategy:
                     
                     if delta_modifier > 0:
                         spike_result.delta_modifier = delta_modifier
-                        self._apply_htf_modifier_to_result(spike_result, cached_htf_buy_modifier, cached_htf_sell_modifier, ctx)
+                        self._apply_htf_modifier_to_result(spike_result, cached_htf_buy_modifier, cached_htf_sell_modifier, ctx, spike_htf_bypass)
                         self._record_signal_with_tp(arrays, i, spike_result, ctx, ctx.close, data)
                         if spike_result.side == "buy":
                             h2_machine.set_strong_trend()
                         else:
                             l2_machine.set_strong_trend()
+                continue
+            
+            # ---------- 优先级2.5: MA Gap Bar（强动能顺势入场，解除回调限制）----------
+            # Al Brooks 加密市场修正：连续 3 根 K 线与 EMA 保持 Gap = 最强动能
+            # 此时解除"必须触碰 EMA"的回调限制，顺势趋势棒突破前高/低即可入场
+            ma_gap_result = self._check_ma_gap_bar(data, ctx)
+            if ma_gap_result:
+                self._apply_htf_modifier_to_result(ma_gap_result, cached_htf_buy_modifier, cached_htf_sell_modifier, ctx, spike_htf_bypass)
+                self._record_signal_with_tp(arrays, i, ma_gap_result, ctx, ctx.close, data)
+                if ma_gap_result.side == "buy":
+                    h2_machine.set_strong_trend()
+                else:
+                    l2_machine.set_strong_trend()
+                continue
+            
+            # ---------- 优先级2.6: GapBar Entry（强单边行情专用补位信号）----------
+            # 当市场处于 StrongTrend/TightChannel 且 H2/L2 长时间无法触发时，
+            # 使用 GapBar_Entry 作为补位手段
+            gapbar_result = self._check_gapbar_entry(data, ctx)
+            if gapbar_result:
+                self._apply_htf_modifier_to_result(gapbar_result, cached_htf_buy_modifier, cached_htf_sell_modifier, ctx, spike_htf_bypass)
+                self._record_signal_with_tp(arrays, i, gapbar_result, ctx, ctx.close, data)
+                if gapbar_result.side == "buy":
+                    h2_machine.set_strong_trend()
+                else:
+                    l2_machine.set_strong_trend()
                 continue
             
             # ---------- 优先级3: H2/L2 顺势二次入场（最常用、最可靠）----------
@@ -845,31 +1165,37 @@ class AlBrooksStrategy:
                 
                 # H2 信号处理
                 if ctx.allowed_side is None or ctx.allowed_side == "buy":
+                    # Spike 周期豁免 HTF 硬过滤
                     htf_allowed, htf_reason = self.htf_filter.allows_h2_buy(ctx.close)
-                    if not htf_allowed:
+                    if not htf_allowed and not spike_htf_bypass:
                         if ctx.is_latest_bar:
                             logging.debug(f"🚫 H2 HTF硬过滤: {htf_reason}")
                     else:
+                        if spike_htf_bypass and not htf_allowed and ctx.is_latest_bar:
+                            logging.debug(f"⚡ H2 Spike豁免: 跳过 HTF 硬过滤 ({htf_reason})")
                         h2_result = await self._process_h2_signal(
                             h2_machine, data, ctx, delta_snapshot_for_hl
                         )
                         if h2_result:
-                            self._apply_htf_modifier_to_result(h2_result, cached_htf_buy_modifier, cached_htf_sell_modifier, ctx)
+                            self._apply_htf_modifier_to_result(h2_result, cached_htf_buy_modifier, cached_htf_sell_modifier, ctx, spike_htf_bypass)
                             self._record_signal_with_tp(arrays, i, h2_result, ctx, ctx.close, data)
                             h2l2_triggered = True
                 
                 # L2 信号处理（H2 未触发时才检查 L2）
                 if not h2l2_triggered and (ctx.allowed_side is None or ctx.allowed_side == "sell"):
+                    # Spike 周期豁免 HTF 硬过滤
                     htf_allowed, htf_reason = self.htf_filter.allows_l2_sell(ctx.close)
-                    if not htf_allowed:
+                    if not htf_allowed and not spike_htf_bypass:
                         if ctx.is_latest_bar:
                             logging.debug(f"🚫 L2 HTF硬过滤: {htf_reason}")
                     else:
+                        if spike_htf_bypass and not htf_allowed and ctx.is_latest_bar:
+                            logging.debug(f"⚡ L2 Spike豁免: 跳过 HTF 硬过滤 ({htf_reason})")
                         l2_result = await self._process_l2_signal(
                             l2_machine, data, ctx, delta_snapshot_for_hl
                         )
                         if l2_result:
-                            self._apply_htf_modifier_to_result(l2_result, cached_htf_buy_modifier, cached_htf_sell_modifier, ctx)
+                            self._apply_htf_modifier_to_result(l2_result, cached_htf_buy_modifier, cached_htf_sell_modifier, ctx, spike_htf_bypass)
                             self._record_signal_with_tp(arrays, i, l2_result, ctx, ctx.close, data)
                             h2l2_triggered = True
                 
@@ -881,7 +1207,7 @@ class AlBrooksStrategy:
             if ctx.market_state == MarketState.TRADING_RANGE and ctx.market_cycle != MarketCycle.SPIKE:
                 fb_result = self._check_failed_breakout(data, ctx)
                 if fb_result:
-                    self._apply_htf_modifier_to_result(fb_result, cached_htf_buy_modifier, cached_htf_sell_modifier, ctx)
+                    self._apply_htf_modifier_to_result(fb_result, cached_htf_buy_modifier, cached_htf_sell_modifier, ctx, spike_htf_bypass)
                     self._record_signal_with_tp(arrays, i, fb_result, ctx, ctx.close, data)
                     continue
             
@@ -915,7 +1241,7 @@ class AlBrooksStrategy:
                                 f"✅ Wedge_Buy Delta背离: 强度+0.3, ×{wedge_boost} - {wedge_boost_reason}"
                             )
                 
-                self._apply_htf_modifier_to_result(wedge_result, cached_htf_buy_modifier, cached_htf_sell_modifier, ctx)
+                self._apply_htf_modifier_to_result(wedge_result, cached_htf_buy_modifier, cached_htf_sell_modifier, ctx, spike_htf_bypass)
                 # Wedge 专用止盈：TP1=EMA，TP2=楔形起点
                 if wedge_result.wedge_tp1_price is not None and wedge_result.wedge_tp2_price is not None:
                     tp1 = wedge_result.wedge_tp1_price
@@ -941,7 +1267,7 @@ class AlBrooksStrategy:
             else:
                 mtr_result = None
             if mtr_result:
-                self._apply_htf_modifier_to_result(mtr_result, cached_htf_buy_modifier, cached_htf_sell_modifier, ctx)
+                self._apply_htf_modifier_to_result(mtr_result, cached_htf_buy_modifier, cached_htf_sell_modifier, ctx, spike_htf_bypass)
                 self._record_signal_with_tp(arrays, i, mtr_result, ctx, ctx.close, data)
                 continue
             
@@ -950,34 +1276,13 @@ class AlBrooksStrategy:
             if ctx.market_state == MarketState.FINAL_FLAG:
                 final_flag_result = self._check_final_flag(data, ctx)
                 if final_flag_result:
-                    self._apply_htf_modifier_to_result(final_flag_result, cached_htf_buy_modifier, cached_htf_sell_modifier, ctx)
+                    self._apply_htf_modifier_to_result(final_flag_result, cached_htf_buy_modifier, cached_htf_sell_modifier, ctx, spike_htf_bypass)
                     self._record_signal_with_tp(arrays, i, final_flag_result, ctx, ctx.close, data)
                     continue
             
-            # ========== 最新 K 线：如果没有信号，记录原因 ==========
+            # ========== 最新 K 线：打印市场状态扫描报告 ==========
             if ctx.is_latest_bar:
-                # 收集跳过原因
-                skip_reasons = []
-                
-                # Spike 周期阻断反转信号
-                if ctx.market_cycle == MarketCycle.SPIKE:
-                    skip_reasons.append("Spike周期(反转信号阻断)")
-                
-                # 强趋势模式
-                if ctx.is_strong_trend_mode:
-                    skip_reasons.append(f"强趋势模式(只允许{ctx.allowed_side or '无'})")
-                
-                # H2/L2 状态
-                if h2_machine.state.value != "WAITING_FOR_PULLBACK":
-                    skip_reasons.append(f"H2等待中({h2_machine.state.value})")
-                if l2_machine.state.value != "WAITING_FOR_BOUNCE":
-                    skip_reasons.append(f"L2等待中({l2_machine.state.value})")
-                
-                # 无信号原因降级为 DEBUG（生产环境不需要每根K线都打印）
-                if skip_reasons:
-                    logging.debug(f"⏸️ 无信号原因: {', '.join(skip_reasons)}")
-                else:
-                    logging.debug(f"⏸️ 无信号: 当前形态不满足入场条件")
+                self._print_market_scan_report(ctx, h2_machine, l2_machine, data, arrays, i)
         
         # ========== Step 5: 应用 TA-Lib 形态加成 ==========
         self._apply_talib_boost(data, arrays)

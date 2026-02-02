@@ -262,9 +262,7 @@ LARGE_BALANCE_POSITION_PCT = TRADING_CONFIG["large_balance_position_pct"]
 # 止盈止损执行方式（已改为程序执行，不挂委托）
 # ============================================================================
 # 止损、TP1、TP2 均由程序根据 K 线监控判断后市价平仓，不在交易所挂 STOP_MARKET/TAKE_PROFIT_MARKET。
-# 以下配置已废弃，仅保留兼容（不再使用）：
-# HARD_STOP_BUFFER_PCT = 硬止损缓冲百分比（原用于挂硬止损单）
-HARD_STOP_BUFFER_PCT = float(os.getenv("HARD_STOP_BUFFER_PCT", "0.15")) / 100
+# 原 HARD_STOP_BUFFER_PCT 配置已废弃并删除
 
 
 # ============================================================================
@@ -320,8 +318,7 @@ def setup_logging() -> str:
     return log_file
 
 
-# 初始化日志系统
-setup_logging()
+# 日志系统将在 main.py 中初始化，避免重复初始化
 
 
 # ============================================================================

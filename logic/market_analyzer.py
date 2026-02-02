@@ -20,7 +20,7 @@ Al Brooks 核心市场状态：
 import logging
 import pandas as pd
 from enum import Enum
-from typing import Optional
+from typing import Optional, Dict
 
 from .interval_params import get_interval_params, IntervalParams
 
@@ -67,6 +67,29 @@ class AlwaysInDirection(Enum):
     NEUTRAL = "neutral"  # 无明确方向
 
 
+# ============================================================================
+# 状态惯性配置（State Inertia Configuration）
+# ============================================================================
+
+# 状态最小保持期（K 线数）
+STATE_MIN_HOLD: Dict[MarketState, int] = {
+    MarketState.STRONG_TREND: 3,    # 强趋势至少保持 3 根
+    MarketState.TIGHT_CHANNEL: 3,   # 紧凑通道至少保持 3 根
+    MarketState.TRADING_RANGE: 2,   # 交易区间至少保持 2 根
+    MarketState.BREAKOUT: 2,        # 突破至少保持 2 根
+    MarketState.CHANNEL: 1,         # 通道无保持要求
+    MarketState.FINAL_FLAG: 1,      # Final Flag 无保持要求
+}
+
+# 滞后阈值配置（Hysteresis Thresholds）
+STRONG_TREND_ENTER_THRESHOLD = 0.50   # 进入 StrongTrend 的得分阈值
+STRONG_TREND_EXIT_THRESHOLD = 0.35    # 退出 StrongTrend 的得分阈值（滞后）
+
+# 物理退出条件：反向强趋势棒的参数
+REVERSAL_BAR_BODY_RATIO = 0.80        # 实体占比 > 80%
+REVERSAL_BAR_ATR_MULT = 1.2           # 长度 > 1.2 * ATR
+
+
 class MarketAnalyzer:
     """
     市场状态分析器（周期自适应版）
@@ -93,6 +116,7 @@ class MarketAnalyzer:
         # 市场周期状态机：滞后保持，避免尖峰/区间频繁切换
         self._last_cycle: Optional[MarketCycle] = None
         self._cycle_hold_bars: int = 0  # 剩余保持周期数（>0 时沿用上一周期）
+        self._last_cycle_bar: int = -1  # 上次处理周期的 K 线索引（防重复）
         
         # Final Flag 检测：TightChannel 历史追踪
         self._tight_channel_bars: int = 0  # 连续 TightChannel 计数
@@ -100,10 +124,21 @@ class MarketAnalyzer:
         self._tight_channel_extreme: Optional[float] = None  # TightChannel 期间的极值
         self._last_tight_channel_end_bar: Optional[int] = None  # 最近 TightChannel 结束的 bar 索引
         
+        # ============== 状态惯性机制（State Inertia）==============
+        self._current_state: Optional[MarketState] = None  # 当前锁定的市场状态
+        self._state_hold_bars: int = 0  # 剩余保持 K 线数
+        self._state_entry_bar: Optional[int] = None  # 进入当前状态的 bar 索引
+        
+        # ============== 防重复处理机制 ==============
+        # 跟踪最后处理的 K 线索引，防止同一 K 线被多次处理导致状态反复切换
+        self._last_processed_bar: int = -1  # 上次处理的 K 线索引
+        self._last_returned_state: Optional[MarketState] = None  # 上次返回的状态（缓存）
+        
         logging.info(
             f"📊 MarketAnalyzer 初始化: 周期={kline_interval}, "
             f"斜率阈值={self._params.slope_threshold_pct:.2%}, "
-            f"趋势阈值={self._params.strong_trend_threshold}"
+            f"趋势阈值={self._params.strong_trend_threshold}, "
+            f"状态惯性: 进入阈值={STRONG_TREND_ENTER_THRESHOLD}, 退出阈值={STRONG_TREND_EXIT_THRESHOLD}"
         )
     
     def get_trend_direction(self) -> Optional[str]:
@@ -180,7 +215,16 @@ class MarketAnalyzer:
     
     def detect_market_state(self, df: pd.DataFrame, i: int, ema: float) -> MarketState:
         """
-        检测当前市场状态
+        检测当前市场状态（带状态惯性机制 + 防重复处理）
+        
+        状态惯性（State Inertia）机制：
+        1. 最小保持期：状态进入后必须保持一定 K 线数
+        2. 滞后阈值（Hysteresis）：进入和退出使用不同阈值
+        3. 物理退出条件：即使得分降低，需满足物理条件才能退出
+        
+        防重复处理：
+        - 同一根 K 线（相同索引 i）只处理一次
+        - 重复调用直接返回缓存的状态
         
         优先级：
         1. Strong Trend（强趋势）- 最高优先级，禁止逆势交易
@@ -190,88 +234,293 @@ class MarketAnalyzer:
         5. Trading Range（交易区间）
         6. Channel（通道模式）- 默认
         """
+        # ========== 防重复处理：同一 K 线只检测一次 ==========
+        if i == self._last_processed_bar and self._last_returned_state is not None:
+            # 同一根 K 线，直接返回缓存的状态，不打印日志
+            return self._last_returned_state
+        
         if i < 10:
             self._trend_direction = None
             self._trend_strength = 0.0
+            self._current_state = MarketState.CHANNEL
+            self._last_processed_bar = i
+            self._last_returned_state = MarketState.CHANNEL
             return MarketState.CHANNEL
         
+        # ========== 状态惯性检查：是否仍在最小保持期内 ==========
+        # 只有当 K 线索引前进时才递减保持期
+        bars_advanced = i - self._last_processed_bar if self._last_processed_bar >= 0 else 1
+        
+        if self._state_hold_bars > 0 and self._current_state is not None:
+            # 检查是否需要强制退出（物理退出条件）
+            force_exit, exit_reason = self._check_physical_exit(df, i, ema)
+            
+            if force_exit:
+                # 物理退出触发
+                old_state = self._current_state
+                self._state_hold_bars = 0
+                # 使用 DEBUG 级别，避免历史回放时大量输出
+                logging.debug(
+                    f"⚡ 状态强制退出: {old_state.value} → 检测新状态 | "
+                    f"原因: {exit_reason}"
+                )
+            else:
+                # 递减保持期（按前进的 K 线数量）
+                self._state_hold_bars = max(0, self._state_hold_bars - bars_advanced)
+                
+                # 如果还有保持期，继续保持当前状态
+                if self._state_hold_bars > 0:
+                    self._last_processed_bar = i
+                    self._last_returned_state = self._current_state
+                    return self._current_state
+        
+        # 更新最后处理的 K 线索引
+        self._last_processed_bar = i
+        
+        # ========== 检测候选状态 ==========
+        candidate_state = self._detect_candidate_state(df, i, ema)
+        
+        # ========== 状态切换逻辑 ==========
+        result_state = self._apply_state_transition(df, i, ema, candidate_state)
+        self._last_returned_state = result_state
+        return result_state
+    
+    def _check_physical_exit(self, df: pd.DataFrame, i: int, ema: float) -> tuple:
+        """
+        检查物理退出条件
+        
+        Al Brooks: 强趋势的退出不应仅依赖得分下降，需要明确的价格行为信号
+        
+        物理退出条件：
+        1. 价格收盘在 EMA 的另一侧
+        2. 出现反向的强趋势棒（实体占比 > 80% 且长度 > 1.2 * ATR）
+        
+        Returns:
+            (should_exit: bool, reason: str)
+        """
+        if self._current_state is None:
+            return (False, "")
+        
+        current_close = float(df.iloc[i]["close"])
+        
+        # ========== 条件 1：价格收盘在 EMA 另一侧 ==========
+        if self._current_state == MarketState.STRONG_TREND:
+            if self._trend_direction == "up" and current_close < ema:
+                return (True, f"价格收盘在 EMA 下方 (close={current_close:.2f} < ema={ema:.2f})")
+            elif self._trend_direction == "down" and current_close > ema:
+                return (True, f"价格收盘在 EMA 上方 (close={current_close:.2f} > ema={ema:.2f})")
+        
+        # ========== 条件 2：出现反向强趋势棒 ==========
+        bar_open = float(df.iloc[i]["open"])
+        bar_high = float(df.iloc[i]["high"])
+        bar_low = float(df.iloc[i]["low"])
+        bar_range = bar_high - bar_low
+        
+        if bar_range > 0:
+            body_size = abs(current_close - bar_open)
+            body_ratio = body_size / bar_range
+            
+            # 获取 ATR
+            atr = float(df.iloc[i].get("atr", bar_range)) if "atr" in df.columns else bar_range
+            
+            # 检查是否为反向强趋势棒
+            is_strong_bar = (body_ratio >= REVERSAL_BAR_BODY_RATIO and 
+                           bar_range >= atr * REVERSAL_BAR_ATR_MULT)
+            
+            if is_strong_bar:
+                is_bullish = current_close > bar_open
+                is_bearish = current_close < bar_open
+                
+                if self._current_state == MarketState.STRONG_TREND:
+                    if self._trend_direction == "up" and is_bearish:
+                        return (True, f"出现反向强阴线 (实体比={body_ratio:.1%}, 长度={bar_range:.2f} > {atr * REVERSAL_BAR_ATR_MULT:.2f})")
+                    elif self._trend_direction == "down" and is_bullish:
+                        return (True, f"出现反向强阳线 (实体比={body_ratio:.1%}, 长度={bar_range:.2f} > {atr * REVERSAL_BAR_ATR_MULT:.2f})")
+                
+                elif self._current_state == MarketState.TIGHT_CHANNEL:
+                    tc_dir = self._tight_channel_direction
+                    if tc_dir == "up" and is_bearish:
+                        return (True, f"TightChannel(上) 出现反向强阴线")
+                    elif tc_dir == "down" and is_bullish:
+                        return (True, f"TightChannel(下) 出现反向强阳线")
+        
+        return (False, "")
+    
+    def _detect_candidate_state(self, df: pd.DataFrame, i: int, ema: float) -> MarketState:
+        """
+        检测候选市场状态（不考虑惯性）
+        
+        返回基于当前 K 线数据的"理想"状态
+        """
         # ========== 优先检测 STRONG_TREND（强趋势）==========
-        # Al Brooks: 连续同向K线 = 趋势，不要逆势交易
         strong_trend = self._detect_strong_trend(df, i, ema)
         if strong_trend is not None:
-            self._tight_channel_bars = 0  # 强趋势时重置 TightChannel 计数
             return strong_trend
         
-        # 优先检测 TIGHT_CHANNEL
+        # ========== 检测 TIGHT_CHANNEL ==========
         tight_channel_state = self._detect_tight_channel(df, i, ema)
         if tight_channel_state is not None:
-            # 追踪 TightChannel 历史
-            self._tight_channel_bars += 1
-            tc_dir = self.get_tight_channel_direction(df, i)
-            self._tight_channel_direction = tc_dir
-            # 更新极值
-            if tc_dir == "up":
-                current_high = float(df.iloc[i]["high"])
-                if self._tight_channel_extreme is None or current_high > self._tight_channel_extreme:
-                    self._tight_channel_extreme = current_high
-            elif tc_dir == "down":
-                current_low = float(df.iloc[i]["low"])
-                if self._tight_channel_extreme is None or current_low < self._tight_channel_extreme:
-                    self._tight_channel_extreme = current_low
             return tight_channel_state
-        
-        # TightChannel 刚结束：记录结束点
-        if self._tight_channel_bars > 0:
-            self._last_tight_channel_end_bar = i - 1
         
         # ========== 检测 FINAL_FLAG（终极旗形）==========
         final_flag = self._detect_final_flag(df, i, ema)
         if final_flag is not None:
             return final_flag
         
-        # 重置 TightChannel 追踪（若不在 TightChannel 且不在 FinalFlag）
-        self._tight_channel_bars = 0
-        self._tight_channel_direction = None
-        self._tight_channel_extreme = None
-        
-        # 计算最近20根K线的EMA穿越次数（向量化）
+        # ========== 检测 TRADING_RANGE ==========
+        # 方法1: EMA 穿越次数（向量化）
         recent = df.iloc[max(0, i - 20) : i + 1]
         
-        # 使用预计算的 above_ema 列或即时计算
         if "above_ema" in recent.columns:
             above_ema_series = recent["above_ema"]
         else:
             above_ema_series = recent["close"] > recent["ema"]
         
-        # 向量化计算穿越次数：检测布尔值变化
         ema_crosses = int(above_ema_series.astype(int).diff().abs().sum())
         
-        # 频繁穿越EMA -> Trading Range
-        if ema_crosses >= 4:
+        # 提高阈值从 4 到 6，减少 TradingRange 的触发
+        if ema_crosses >= 6:
             return MarketState.TRADING_RANGE
         
-        # 检测强突破（Spike）- ⭐ 优化：进一步放宽条件
+        # ⭐ 方法2: 实体重叠度检测（Al Brooks: 高重叠 = 区间震荡）
+        # 如果过去 10 根 K 线中有 7 根的实体高度重叠，强制判定为 TradingRange
+        overlap_count = self._detect_body_overlap(df, i, lookback=10, overlap_threshold=0.5)
+        if overlap_count >= 7:
+            logging.debug(
+                f"📊 TradingRange(实体重叠): {overlap_count}/10 根K线实体高度重叠"
+            )
+            return MarketState.TRADING_RANGE
+        
+        # ========== 检测 BREAKOUT ==========
         if i >= 1 and "body_size" in df.columns:
-            # 使用预计算的 body_size 列（向量化）
             recent_bodies = df["body_size"].iloc[max(0, i - 10):i + 1]
             avg_body = recent_bodies.mean() if len(recent_bodies) > 0 else 0
             current_body = df.iloc[i]["body_size"]
             
-            if avg_body > 0:
-                # ⭐ 优化：从 1.8x 降到 1.5x（更容易触发 BREAKOUT）
-                if current_body > avg_body * 1.5:
-                    close = df.iloc[i]["close"]
-                    high = df.iloc[i]["high"]
-                    low = df.iloc[i]["low"]
-                    
-                    if (high - low) > 0:
-                        # ⭐ 优化：body_ratio 从 0.8 降到 0.7（双向）
-                        if close > ema and (close - low) / (high - low) > 0.7:
-                            return MarketState.BREAKOUT
-                        elif close < ema and (high - close) / (high - low) > 0.7:
-                            return MarketState.BREAKOUT
+            if avg_body > 0 and current_body > avg_body * 1.5:
+                close = df.iloc[i]["close"]
+                high = df.iloc[i]["high"]
+                low = df.iloc[i]["low"]
+                
+                if (high - low) > 0:
+                    if close > ema and (close - low) / (high - low) > 0.7:
+                        return MarketState.BREAKOUT
+                    elif close < ema and (high - close) / (high - low) > 0.7:
+                        return MarketState.BREAKOUT
         
         return MarketState.CHANNEL
+    
+    def _apply_state_transition(
+        self, df: pd.DataFrame, i: int, ema: float, candidate_state: MarketState
+    ) -> MarketState:
+        """
+        应用状态转换逻辑（含滞后阈值）
+        
+        核心逻辑：
+        1. 如果候选状态与当前状态相同，继续保持
+        2. 如果候选状态优先级更高，切换并重置保持期
+        3. 如果候选状态优先级更低，检查滞后阈值
+        """
+        old_state = self._current_state
+        
+        # ========== 情况 1：首次检测或当前无状态 ==========
+        if old_state is None:
+            self._switch_state(candidate_state, i, "初始状态")
+            return candidate_state
+        
+        # ========== 情况 2：候选状态与当前状态相同 ==========
+        if candidate_state == old_state:
+            # 更新 TightChannel 追踪
+            if candidate_state == MarketState.TIGHT_CHANNEL:
+                self._update_tight_channel_tracking(df, i)
+            return old_state
+        
+        # ========== 情况 3：从 StrongTrend 退出的滞后检查 ==========
+        if old_state == MarketState.STRONG_TREND:
+            # 使用滞后阈值：得分必须低于 EXIT_THRESHOLD 才能退出
+            if self._trend_strength >= STRONG_TREND_EXIT_THRESHOLD:
+                # 得分仍高于退出阈值，保持 StrongTrend
+                logging.debug(
+                    f"🔒 StrongTrend 滞后保持: 得分={self._trend_strength:.2f} >= "
+                    f"退出阈值={STRONG_TREND_EXIT_THRESHOLD}"
+                )
+                return old_state
+            else:
+                # 得分低于退出阈值，允许切换
+                self._switch_state(candidate_state, i, 
+                    f"得分降至 {self._trend_strength:.2f} < 退出阈值 {STRONG_TREND_EXIT_THRESHOLD}")
+                return candidate_state
+        
+        # ========== 情况 4：从 TightChannel 退出 ==========
+        if old_state == MarketState.TIGHT_CHANNEL:
+            # TightChannel 退出时记录结束点
+            if self._tight_channel_bars > 0:
+                self._last_tight_channel_end_bar = i - 1
+            self._switch_state(candidate_state, i, "TightChannel 条件不再满足")
+            return candidate_state
+        
+        # ========== 情况 5：其他状态切换 ==========
+        self._switch_state(candidate_state, i, f"检测到新状态 {candidate_state.value}")
+        return candidate_state
+    
+    def _switch_state(self, new_state: MarketState, bar_index: int, reason: str):
+        """
+        执行状态切换
+        
+        校验：如果新状态与旧状态相同，跳过切换和日志
+        
+        Args:
+            new_state: 新状态
+            bar_index: 当前 K 线索引
+            reason: 切换原因
+        """
+        old_state = self._current_state
+        old_state_name = old_state.value if old_state else "None"
+        
+        # ========== 校验：新状态与旧状态相同时，禁止打印切换日志 ==========
+        if old_state == new_state:
+            # 状态相同，无需切换，静默返回
+            return
+        
+        # 设置新状态
+        self._current_state = new_state
+        self._state_entry_bar = bar_index
+        self._state_hold_bars = STATE_MIN_HOLD.get(new_state, 1)
+        
+        # 更新 TightChannel 追踪
+        if new_state == MarketState.TIGHT_CHANNEL:
+            self._tight_channel_bars += 1
+        elif old_state == MarketState.TIGHT_CHANNEL:
+            # 重置 TightChannel 追踪
+            self._tight_channel_bars = 0
+            self._tight_channel_direction = None
+            self._tight_channel_extreme = None
+        
+        if new_state == MarketState.STRONG_TREND:
+            # 进入 StrongTrend 时重置 TightChannel
+            self._tight_channel_bars = 0
+        
+        # 日志记录状态切换（使用 DEBUG 级别，避免历史回放时大量输出）
+        # 只有在 is_latest_bar=True 时才会被策略层打印为 INFO
+        logging.debug(
+            f"🔄 状态切换: {old_state_name} → {new_state.value} | "
+            f"保持期={self._state_hold_bars}根 | 原因: {reason}"
+        )
+    
+    def _update_tight_channel_tracking(self, df: pd.DataFrame, i: int):
+        """更新 TightChannel 追踪数据"""
+        self._tight_channel_bars += 1
+        tc_dir = self.get_tight_channel_direction(df, i)
+        self._tight_channel_direction = tc_dir
+        
+        if tc_dir == "up":
+            current_high = float(df.iloc[i]["high"])
+            if self._tight_channel_extreme is None or current_high > self._tight_channel_extreme:
+                self._tight_channel_extreme = current_high
+        elif tc_dir == "down":
+            current_low = float(df.iloc[i]["low"])
+            if self._tight_channel_extreme is None or current_low < self._tight_channel_extreme:
+                self._tight_channel_extreme = current_low
     
     def get_market_cycle(
         self, df: pd.DataFrame, i: int, ema: float, market_state: MarketState
@@ -283,23 +532,45 @@ class MarketAnalyzer:
         - Channel（通道）：STRONG_TREND / TIGHT_CHANNEL / CHANNEL
         - Trading Range（交易区间）：TRADING_RANGE → BLSH，降低信号棒门槛
         
-        带简单滞后：一旦进入 Spike 保持 2 根 K 线，避免尖峰与通道来回切换。
+        带状态惯性 + 防重复处理：
+        - 各周期都有最小保持期，避免频繁切换
+        - 同一根 K 线只处理一次
         """
+        # ========== 防重复处理：同一 K 线只检测一次 ==========
+        if i == self._last_cycle_bar and self._last_cycle is not None:
+            return self._last_cycle
+        
+        # 计算 K 线前进数
+        bars_advanced = i - self._last_cycle_bar if self._last_cycle_bar >= 0 else 1
+        self._last_cycle_bar = i
+        
         # 滞后：若仍在保持期内，沿用上一周期
         if self._cycle_hold_bars > 0 and self._last_cycle is not None:
-            self._cycle_hold_bars -= 1
-            return self._last_cycle
+            # 按 K 线前进数递减保持期
+            self._cycle_hold_bars = max(0, self._cycle_hold_bars - bars_advanced)
+            if self._cycle_hold_bars > 0:
+                return self._last_cycle
+        
+        # 确定新周期
+        old_cycle = self._last_cycle
         
         if market_state == MarketState.BREAKOUT:
             cycle = MarketCycle.SPIKE
-            self._cycle_hold_bars = 2  # 尖峰后保持 2 根
+            self._cycle_hold_bars = 4  # Spike 保持 4 根（从 2 增加到 4）
         elif market_state == MarketState.TRADING_RANGE:
             cycle = MarketCycle.TRADING_RANGE
-            self._cycle_hold_bars = 0
+            self._cycle_hold_bars = 3  # TradingRange 保持 3 根（新增）
         else:
             # STRONG_TREND, TIGHT_CHANNEL, CHANNEL
             cycle = MarketCycle.CHANNEL
-            self._cycle_hold_bars = 0
+            self._cycle_hold_bars = 2  # Channel 保持 2 根（新增）
+        
+        # 记录周期切换（只在真正切换时打印）
+        if old_cycle is not None and old_cycle != cycle:
+            logging.debug(
+                f"📊 周期切换: {old_cycle.value} → {cycle.value} | "
+                f"保持期={self._cycle_hold_bars}根"
+            )
         
         self._last_cycle = cycle
         return cycle
@@ -521,8 +792,16 @@ class MarketAnalyzer:
         self._trend_direction = trend_direction
         self._trend_strength = trend_strength
         
-        # 判断是否达到强趋势状态（周期自适应阈值）
-        if trend_strength >= self._params.strong_trend_threshold:
+        # 判断是否达到强趋势状态
+        # 使用滞后阈值：如果当前已经是 StrongTrend，使用更低的退出阈值
+        if self._current_state == MarketState.STRONG_TREND:
+            # 已在 StrongTrend，使用退出阈值判断是否保持
+            threshold = STRONG_TREND_EXIT_THRESHOLD
+        else:
+            # 尚未进入 StrongTrend，使用进入阈值
+            threshold = STRONG_TREND_ENTER_THRESHOLD
+        
+        if trend_strength >= threshold:
             # 构建 Gap 信息字符串
             gap_info = ""
             if gap_up_count > 0:
@@ -539,6 +818,61 @@ class MarketAnalyzer:
             return MarketState.STRONG_TREND
         
         return None
+    
+    def _detect_body_overlap(
+        self, df: pd.DataFrame, i: int, lookback: int = 10, overlap_threshold: float = 0.5
+    ) -> int:
+        """
+        检测实体重叠度（用于 TradingRange 判定）
+        
+        Al Brooks: "区间震荡的特征是 K 线高度重叠，没有明确的方向"
+        
+        逻辑：检查过去 N 根 K 线中，有多少根的实体与前一根实体有显著重叠
+        
+        Args:
+            df: K线数据
+            i: 当前 K 线索引
+            lookback: 回看周期
+            overlap_threshold: 重叠比例阈值（默认 50%）
+        
+        Returns:
+            重叠的 K 线数量
+        """
+        if i < lookback:
+            return 0
+        
+        overlap_count = 0
+        
+        for j in range(i - lookback + 2, i + 1):
+            if j < 1 or j >= len(df):
+                continue
+            
+            curr = df.iloc[j]
+            prev = df.iloc[j - 1]
+            
+            # 当前 K 线实体
+            curr_close = float(curr["close"])
+            curr_open = float(curr["open"])
+            curr_body_top = max(curr_close, curr_open)
+            curr_body_bottom = min(curr_close, curr_open)
+            curr_body_size = curr_body_top - curr_body_bottom
+            
+            # 前一根 K 线实体
+            prev_close = float(prev["close"])
+            prev_open = float(prev["open"])
+            prev_body_top = max(prev_close, prev_open)
+            prev_body_bottom = min(prev_close, prev_open)
+            
+            # 计算实体重叠区域
+            overlap_top = min(curr_body_top, prev_body_top)
+            overlap_bottom = max(curr_body_bottom, prev_body_bottom)
+            overlap_size = max(0, overlap_top - overlap_bottom)
+            
+            # 重叠比例（相对于当前 K 线实体）
+            if curr_body_size > 0 and overlap_size / curr_body_size >= overlap_threshold:
+                overlap_count += 1
+        
+        return overlap_count
     
     def _detect_tight_channel(self, df: pd.DataFrame, i: int, ema: float) -> Optional[MarketState]:
         """

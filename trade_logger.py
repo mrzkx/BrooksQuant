@@ -561,8 +561,23 @@ class TradeLogger:
             logging.warning(f"[{user}] 未找到最近的已关闭交易，无法更新盈亏")
             return False
 
-    def check_stop_loss_take_profit(self, user: str, current_price: float) -> Optional[Any]:
-        """检查止损止盈（Al Brooks 动态退出，仅内存）"""
+    def check_stop_loss_take_profit(
+        self, user: str, current_price: float, check_stop_loss: bool = True
+    ) -> Optional[Any]:
+        """
+        检查止损止盈（Al Brooks 动态退出，仅内存）
+        
+        Al Brooks 软止损修正：
+        - check_stop_loss=False: 只检查止盈（实时调用）
+        - check_stop_loss=True: 检查止盈+止损（K线收盘时调用）
+        
+        Crypto 市场"插针"频繁，止损只在收盘时检查可避免被假突破误触发。
+        
+        Args:
+            user: 用户名
+            current_price: 当前价格
+            check_stop_loss: 是否检查止损（默认 True）
+        """
         current_price = float(current_price)
 
         with self._lock:
@@ -708,36 +723,45 @@ class TradeLogger:
                         del self._trailing_stop[user]
                     return self._close_position_unlocked(user, float(trade.tp2_price), "tp2")
 
-            if not trade.tp1_price and not trade.breakeven_moved:
-                breakeven_hit = (
-                    trade.side == "buy"
-                    and current_price >= float(trade.entry_price) + initial_risk
-                ) or (
-                    trade.side == "sell"
-                    and current_price <= float(trade.entry_price) - initial_risk
-                )
-                if breakeven_hit:
-                    trade.stop_loss = float(trade.entry_price)
-                    trade.breakeven_moved = True
-                    ts_state["trailing_stop"] = float(trade.entry_price)
-                    self._redis_save_position(user, trade)
-                    self._redis_save_aux(user)
-                    logging.info(f"💡 [{user}] Breakeven触发！止损移至入场价: {float(trade.entry_price):.2f}")
+            # ========== Al Brooks 软止损：只在 K 线收盘时检查止损 ==========
+            # Crypto 市场"插针"频繁，收盘价确认止损可避免被假突破误触发
+            if check_stop_loss:
+                # Breakeven 检查（收盘时）
+                if not trade.tp1_price and not trade.breakeven_moved:
+                    breakeven_hit = (
+                        trade.side == "buy"
+                        and current_price >= float(trade.entry_price) + initial_risk
+                    ) or (
+                        trade.side == "sell"
+                        and current_price <= float(trade.entry_price) - initial_risk
+                    )
+                    if breakeven_hit:
+                        trade.stop_loss = float(trade.entry_price)
+                        trade.breakeven_moved = True
+                        ts_state["trailing_stop"] = float(trade.entry_price)
+                        self._redis_save_position(user, trade)
+                        self._redis_save_aux(user)
+                        logging.info(f"💡 [{user}] Breakeven触发！止损移至入场价: {float(trade.entry_price):.2f}")
 
-            effective_stop = ts_state["trailing_stop"] if ts_state["activated"] else float(trade.stop_loss)
-            stop_hit = (trade.side == "buy" and current_price <= effective_stop) or (
-                trade.side == "sell" and current_price >= effective_stop
-            )
-            if stop_hit:
-                if ts_state["activated"] and ts_state["max_profit"] > 0:
-                    reason = "trailing_stop"
-                elif trade.breakeven_moved and float(trade.stop_loss) == float(trade.entry_price):
-                    reason = "breakeven_stop"
-                else:
-                    reason = "stop_loss"
-                if user in self._trailing_stop:
-                    del self._trailing_stop[user]
-                return self._close_position_unlocked(user, effective_stop, reason)
+                # 止损检查（收盘时）
+                effective_stop = ts_state["trailing_stop"] if ts_state["activated"] else float(trade.stop_loss)
+                stop_hit = (trade.side == "buy" and current_price <= effective_stop) or (
+                    trade.side == "sell" and current_price >= effective_stop
+                )
+                if stop_hit:
+                    if ts_state["activated"] and ts_state["max_profit"] > 0:
+                        reason = "trailing_stop"
+                    elif trade.breakeven_moved and float(trade.stop_loss) == float(trade.entry_price):
+                        reason = "breakeven_stop"
+                    else:
+                        reason = "stop_loss"
+                    if user in self._trailing_stop:
+                        del self._trailing_stop[user]
+                    logging.info(
+                        f"🛑 [{user}] 软止损触发（收盘确认）: {reason}, "
+                        f"收盘价={current_price:.2f}, 止损位={effective_stop:.2f}"
+                    )
+                    return self._close_position_unlocked(user, effective_stop, reason)
 
             if not trade.tp1_price:
                 tp_hit = (trade.side == "buy" and current_price >= float(trade.take_profit)) or (

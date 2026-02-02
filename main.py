@@ -81,19 +81,16 @@ async def main() -> None:
 
     logging.info(f"交易对: {SYMBOL}, K线周期: {KLINE_INTERVAL}")
 
-    # 初始化策略
+    # 初始化策略（策略内部会打印初始化日志）
     strategy = AlBrooksStrategy(
         ema_period=20,
         kline_interval=KLINE_INTERVAL,
         redis_url=REDIS_URL,
     )
-    # 获取 Delta 窗口大小
-    delta_window = strategy.delta_analyzer.WINDOW_SECONDS if strategy.delta_analyzer else 300
-    logging.info(f"策略已初始化: EMA周期=20, K线周期={KLINE_INTERVAL}, Delta窗口={delta_window}秒")
 
     # 初始化交易日志器（内存 + Redis 当前状态持久化；启动时先查币安再查 Redis）
+    # trade_logger 内部会打印初始化日志，这里不需要重复打印
     trade_logger = TradeLogger(redis_url=REDIS_URL)
-    logging.info("交易日志器已初始化")
 
     # 创建队列
     user_queues = [asyncio.Queue() for _ in users]
@@ -126,7 +123,9 @@ async def main() -> None:
         )
     )
 
-    logging.info(f"已创建 {len(tasks)} 个任务（含动态订单流监控，Delta窗口={KLINE_INTERVAL}）")
+    # 获取 Delta 窗口大小用于日志
+    delta_window = strategy.delta_analyzer.WINDOW_SECONDS if strategy.delta_analyzer else 300
+    logging.info(f"已创建 {len(tasks)} 个任务（含动态订单流监控，Delta窗口={delta_window}秒）")
     logging.info("所有任务已启动，程序运行中...")
 
     try:
