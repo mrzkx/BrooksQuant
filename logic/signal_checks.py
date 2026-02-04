@@ -540,6 +540,302 @@ class SignalChecker:
             strength=0.8,  # 高置信度
         )
 
+    def check_spike_market_entry(
+        self, data: pd.DataFrame, ctx: BarContext
+    ) -> Optional[SignalResult]:
+        """
+        检测 Spike_Market_Entry 信号 - 突破阶段直接入场
+        
+        Al Brooks: "在突破阶段（Breakout Phase），收盘价就是买入信号"
+        
+        触发场景：MarketCycle.SPIKE 期间
+        
+        触发条件：
+        1. 当前棒是强趋势棒（实体占比 > 60%，收盘在极端 25%）
+        2. 价格处于 EMA 上方（买入）或下方（卖出）
+        
+        入场点：当前棒收盘价直接市价入场
+        
+        Returns:
+            SignalResult 或 None
+        """
+        # 只在 Spike 周期触发
+        if ctx.market_cycle != MarketCycle.SPIKE:
+            return None
+        
+        i = ctx.i
+        if i < 3:
+            return None
+        
+        ema = ctx.ema
+        atr = ctx.atr
+        
+        # 获取当前 K 线数据
+        current_bar = data.iloc[i]
+        curr_close = float(current_bar["close"])
+        curr_open = float(current_bar["open"])
+        curr_high = float(current_bar["high"])
+        curr_low = float(current_bar["low"])
+        curr_body = abs(curr_close - curr_open)
+        curr_range = curr_high - curr_low
+        
+        if curr_range <= 0:
+            return None
+        
+        # ========== 条件1: 强趋势棒验证（实体占比 > 60%，收盘在极端 25%）==========
+        MIN_BODY_RATIO = 0.60
+        CLOSE_POSITION_PCT = 0.25  # 收盘在顶部/底部 25% 区域
+        
+        body_ratio = curr_body / curr_range
+        if body_ratio < MIN_BODY_RATIO:
+            return None
+        
+        # 判断方向
+        is_bullish = curr_close > curr_open
+        is_bearish = curr_close < curr_open
+        
+        if not is_bullish and not is_bearish:
+            return None  # 十字星，跳过
+        
+        # ========== 条件2: 价格相对 EMA 位置 ==========
+        signal_side = None
+        stop_loss = 0.0
+        
+        if is_bullish and curr_close > ema:
+            # 看涨：收盘价必须在 K 线顶部 25% 区域
+            close_from_high = (curr_high - curr_close) / curr_range
+            if close_from_high > CLOSE_POSITION_PCT:
+                return None
+            
+            signal_side = "buy"
+            # 止损：当前棒低点外 0.1%
+            stop_loss = curr_low * (1.0 - 0.001)
+        
+        elif is_bearish and curr_close < ema:
+            # 看跌：收盘价必须在 K 线底部 25% 区域
+            close_from_low = (curr_close - curr_low) / curr_range
+            if close_from_low > CLOSE_POSITION_PCT:
+                return None
+            
+            signal_side = "sell"
+            # 止损：当前棒高点外 0.1%
+            stop_loss = curr_high * (1.0 + 0.001)
+        
+        if signal_side is None:
+            return None
+        
+        # ========== 冷却期检查 ==========
+        signal_type = f"Spike_Market_{signal_side.capitalize()}"
+        if self._check_cooldown(signal_type, signal_side, i, ctx.is_latest_bar):
+            return None
+        
+        # ========== 方向过滤（Spike 周期不严格限制，但仍检查 allowed_side）==========
+        # Spike 周期已经是强动能，allowed_side 检查可以放宽
+        if ctx.allowed_side is not None and signal_side != ctx.allowed_side:
+            # Spike 周期内仍允许顺势交易，但记录日志
+            if ctx.is_latest_bar:
+                logging.debug(
+                    f"⚠️ Spike_Market_Entry 方向检查: {signal_type} - "
+                    f"allowed_side={ctx.allowed_side}，但 Spike 周期放行"
+                )
+        
+        # ========== 计算 base_height ==========
+        base_height = (atr * 2.0) if atr and atr > 0 else curr_range
+        
+        # 入场模式：市价入场
+        entry_mode = "Market_Entry"
+        
+        # 日志输出
+        if ctx.is_latest_bar:
+            logging.info(
+                f"🚀 检测到 Spike 突破阶段，激活应急入场逻辑（跳过 H2 等待） | "
+                f"信号: {signal_type} | 实体比: {body_ratio:.0%} | "
+                f"入场: {curr_close:.2f} | 止损: {stop_loss:.2f}"
+            )
+        
+        return SignalResult(
+            signal_type=signal_type,
+            side=signal_side,
+            stop_loss=stop_loss,
+            base_height=base_height,
+            entry_mode=entry_mode,
+            risk_reward=2.0,
+            strength=0.8,  # Spike 阶段的信号具有高置信度
+        )
+
+    def check_micro_channel_h1(
+        self, data: pd.DataFrame, ctx: BarContext
+    ) -> Optional[SignalResult]:
+        """
+        检测 Micro_Channel_H1 信号 - 微型通道顺势补位
+        
+        Al Brooks: "在微型通道（Micro Channel）中，不会出现标准的回调（阴线），
+        此时 High 1 (H1) 或 Breakout Bar Close 即可作为入场信号。"
+        
+        触发场景：MarketState.STRONG_TREND 或 TIGHT_CHANNEL
+        
+        触发条件：
+        1. Gap 检测：连续至少 3 根 K 线完全脱离 EMA（Low > EMA 或 High < EMA）
+        2. H1 触发：当前 K 线最高点突破了前一根 K 线的最高点（买入）
+                    或当前 K 线最低点跌破了前一根 K 线的最低点（卖出）
+        3. 豁免条件：跳过 _has_counting_bars（阴线计数）的检查
+        
+        Returns:
+            SignalResult 或 None
+        """
+        # 只在 StrongTrend 或 TightChannel 状态下触发
+        if ctx.market_state not in [MarketState.STRONG_TREND, MarketState.TIGHT_CHANNEL]:
+            return None
+        
+        i = ctx.i
+        if i < 5:
+            return None
+        
+        ema = ctx.ema
+        atr = ctx.atr
+        
+        # 获取当前 K 线数据
+        current_bar = data.iloc[i]
+        curr_close = float(current_bar["close"])
+        curr_open = float(current_bar["open"])
+        curr_high = float(current_bar["high"])
+        curr_low = float(current_bar["low"])
+        
+        # 前一根 K 线
+        prev_bar = data.iloc[i - 1]
+        prev_high = float(prev_bar["high"])
+        prev_low = float(prev_bar["low"])
+        
+        # ========== Step 1: 计算 GapCount（连续脱离 EMA 的 K 线数）==========
+        MIN_GAP_COUNT = 3   # 最少需要 3 根
+        STRONG_GAP_COUNT = 5  # 5 根以上忽略 HTF 反向限制
+        
+        # 检查向上 Gap（Low > EMA）
+        up_gap_count = 0
+        for j in range(1, min(20, i)):
+            bar = data.iloc[i - j]
+            bar_low = float(bar["low"])
+            bar_ema = float(bar["ema"]) if "ema" in bar else ema
+            if bar_low > bar_ema:
+                up_gap_count += 1
+            else:
+                break
+        
+        # 检查向下 Gap（High < EMA）
+        down_gap_count = 0
+        for j in range(1, min(20, i)):
+            bar = data.iloc[i - j]
+            bar_high = float(bar["high"])
+            bar_ema = float(bar["ema"]) if "ema" in bar else ema
+            if bar_high < bar_ema:
+                down_gap_count += 1
+            else:
+                break
+        
+        # 如果没有足够的 Gap，返回 None
+        if up_gap_count < MIN_GAP_COUNT and down_gap_count < MIN_GAP_COUNT:
+            return None
+        
+        # ========== Step 2: H1 触发检测（突破前一棒极值）==========
+        signal_side = None
+        stop_loss = 0.0
+        gap_count = 0
+        
+        # 上涨微型通道 H1
+        if up_gap_count >= MIN_GAP_COUNT:
+            # 当前棒必须是阳线
+            if curr_close <= curr_open:
+                return None
+            
+            # H1 触发：当前棒最高点突破前一棒最高点
+            if curr_high <= prev_high:
+                return None
+            
+            # 当前棒 Low 也必须高于 EMA（保持 Gap 状态）
+            if curr_low <= ema:
+                return None
+            
+            signal_side = "buy"
+            gap_count = up_gap_count
+            
+            # 止损：前一棒低点外 0.1%
+            stop_loss = prev_low * (1.0 - 0.001)
+        
+        # 下跌微型通道 L1
+        elif down_gap_count >= MIN_GAP_COUNT:
+            # 当前棒必须是阴线
+            if curr_close >= curr_open:
+                return None
+            
+            # L1 触发：当前棒最低点跌破前一棒最低点
+            if curr_low >= prev_low:
+                return None
+            
+            # 当前棒 High 也必须低于 EMA（保持 Gap 状态）
+            if curr_high >= ema:
+                return None
+            
+            signal_side = "sell"
+            gap_count = down_gap_count
+            
+            # 止损：前一棒高点外 0.1%
+            stop_loss = prev_high * (1.0 + 0.001)
+        
+        if signal_side is None:
+            return None
+        
+        # ========== Step 3: 冷却期检查 ==========
+        # 使用 H1 信号类型
+        signal_type = f"MicroChannel_H1_{signal_side.capitalize()}"
+        if self._check_cooldown(signal_type, signal_side, i, ctx.is_latest_bar):
+            return None
+        
+        # ========== Step 4: 方向过滤 ==========
+        # Gap >= 5 根时，忽略反向限制（短线动能压倒长线趋势）
+        ignore_htf_filter = gap_count >= STRONG_GAP_COUNT
+        
+        if not ignore_htf_filter:
+            if ctx.allowed_side is not None and signal_side != ctx.allowed_side:
+                if ctx.is_latest_bar:
+                    logging.debug(
+                        f"🚫 MicroChannel_H1 方向过滤: {signal_type} - "
+                        f"趋势={ctx.trend_direction}，只允许{ctx.allowed_side}"
+                    )
+                return None
+        else:
+            # Gap >= 5 根，忽略 HTF 反向限制
+            if ctx.is_latest_bar:
+                logging.info(
+                    f"⚡ 微型通道强动能放行: {signal_type} - "
+                    f"GapCount={gap_count} >= 5，短线动能压倒长线趋势"
+                )
+        
+        # ========== Step 5: 计算 base_height ==========
+        base_height = (atr * 2.0) if atr and atr > 0 else (curr_high - curr_low)
+        
+        # 入场模式：限价单（使用突破价位）
+        entry_mode = "Limit_Entry"
+        limit_price = prev_high if signal_side == "buy" else prev_low
+        
+        # 日志输出
+        if ctx.is_latest_bar:
+            logging.info(
+                f"🚀 检测到微型通道，激活应急入场逻辑（跳过 H2 等待） | "
+                f"信号: H1_{signal_side.capitalize()} 触发 (GapCount: {gap_count}) | "
+                f"限价入场: {limit_price:.2f} | 止损: {stop_loss:.2f}"
+            )
+        
+        return SignalResult(
+            signal_type=signal_type,
+            side=signal_side,
+            stop_loss=stop_loss,
+            base_height=base_height,
+            limit_price=limit_price,
+            entry_mode=entry_mode,
+            risk_reward=2.0,
+            strength=0.75 + (0.1 if gap_count >= STRONG_GAP_COUNT else 0.0),  # Gap 越多强度越高
+        )
+
     def check_gapbar_entry(
         self, data: pd.DataFrame, ctx: BarContext
     ) -> Optional[SignalResult]:

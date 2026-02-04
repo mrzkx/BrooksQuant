@@ -200,12 +200,16 @@ class AlBrooksStrategy:
         buy_signals = [
             "Spike_Buy", "FailedBreakout_Buy", "Wedge_FailedBreakout_Buy", "Climax_Buy",
             "Wedge_Buy", "MTR_Buy", "Final_Flag_Reversal_Buy", "H1_Buy", "H2_Buy",
-            "GapBar_Buy"  # 强单边行情专用补位信号
+            "GapBar_Buy",  # 强单边行情专用补位信号
+            "Spike_Market_Buy",  # Spike 阶段直接入场
+            "MicroChannel_H1_Buy",  # 微型通道 H1 补位
         ]
         sell_signals = [
             "Spike_Sell", "FailedBreakout_Sell", "Wedge_FailedBreakout_Sell", "Climax_Sell",
             "Wedge_Sell", "MTR_Sell", "Final_Flag_Reversal_Sell", "L1_Sell", "L2_Sell",
-            "GapBar_Sell"  # 强单边行情专用补位信号
+            "GapBar_Sell",  # 强单边行情专用补位信号
+            "Spike_Market_Sell",  # Spike 阶段直接入场
+            "MicroChannel_H1_Sell",  # 微型通道 L1 补位
         ]
         
         signals_to_check = buy_signals if side == "buy" else sell_signals
@@ -800,6 +804,30 @@ class AlBrooksStrategy:
         """
         return self._signal_checker.check_gapbar_entry(data, ctx)
 
+    def _check_spike_market_entry(
+        self, data: pd.DataFrame, ctx: BarContext
+    ) -> Optional[SignalResult]:
+        """
+        委托 logic.signal_checks 检测 Spike_Market_Entry（突破阶段直接入场）。
+        
+        Al Brooks: "在突破阶段（Breakout Phase），收盘价就是买入信号"
+        
+        触发场景：MarketCycle.SPIKE 期间
+        """
+        return self._signal_checker.check_spike_market_entry(data, ctx)
+
+    def _check_micro_channel_h1(
+        self, data: pd.DataFrame, ctx: BarContext
+    ) -> Optional[SignalResult]:
+        """
+        委托 logic.signal_checks 检测 Micro_Channel_H1（微型通道 H1 补位）。
+        
+        Al Brooks: "在微型通道中，不会出现标准的回调，H1 即可作为入场信号"
+        
+        触发场景：MarketState.STRONG_TREND 或 TIGHT_CHANNEL
+        """
+        return self._signal_checker.check_micro_channel_h1(data, ctx)
+
     def _check_climax(
         self, data: pd.DataFrame, ctx: BarContext
     ) -> Optional[SignalResult]:
@@ -1150,6 +1178,44 @@ class AlBrooksStrategy:
                 else:
                     l2_machine.set_strong_trend()
                 continue
+            
+            # ==========================================================================
+            # Context_Bypass（背景豁免）: 微型通道/强突破阶段的应急入场逻辑
+            # ==========================================================================
+            # Al Brooks: "在极强动能阶段（微型通道），不会出现标准的回调（阴线），
+            # 此时 H1 或 Breakout Bar Close 即可作为入场信号，无需死等 H2/L2"
+            # ==========================================================================
+            
+            context_bypass_active = (
+                ctx.market_cycle == MarketCycle.SPIKE or 
+                ctx.market_state in [MarketState.STRONG_TREND, MarketState.TIGHT_CHANNEL]
+            )
+            
+            if context_bypass_active:
+                # ---------- 优先级2.7: Spike_Market_Entry（Spike 阶段直接入场）----------
+                # Al Brooks: "在突破阶段（Breakout Phase），收盘价就是买入信号"
+                if ctx.market_cycle == MarketCycle.SPIKE:
+                    spike_market_result = self._check_spike_market_entry(data, ctx)
+                    if spike_market_result:
+                        self._apply_htf_modifier_to_result(spike_market_result, cached_htf_buy_modifier, cached_htf_sell_modifier, ctx, spike_htf_bypass)
+                        self._record_signal_with_tp(arrays, i, spike_market_result, ctx, ctx.close, data)
+                        if spike_market_result.side == "buy":
+                            h2_machine.set_strong_trend()
+                        else:
+                            l2_machine.set_strong_trend()
+                        continue
+                
+                # ---------- 优先级2.8: Micro_Channel_H1（微型通道 H1 补位）----------
+                # Al Brooks: "在微型通道中，H1 即可作为高胜率入场点，无需 Counting Bars"
+                micro_h1_result = self._check_micro_channel_h1(data, ctx)
+                if micro_h1_result:
+                    self._apply_htf_modifier_to_result(micro_h1_result, cached_htf_buy_modifier, cached_htf_sell_modifier, ctx, spike_htf_bypass)
+                    self._record_signal_with_tp(arrays, i, micro_h1_result, ctx, ctx.close, data)
+                    if micro_h1_result.side == "buy":
+                        h2_machine.set_strong_trend()
+                    else:
+                        l2_machine.set_strong_trend()
+                    continue
             
             # ---------- 优先级3: H2/L2 顺势二次入场（最常用、最可靠）----------
             # Al Brooks: "大多数交易日我只做 H2 买入或 L2 卖出"
