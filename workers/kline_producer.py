@@ -1,27 +1,20 @@
 """
-K线生产者模块
-
-负责订阅K线数据、生成策略信号并分发给用户队列
+K线生产者 — 订阅 K 线、驱动 BrooksStrategy、分发信号
 """
-
 import asyncio
 import logging
 from typing import Dict, List, Optional
 
 import pandas as pd
-
 from binance import BinanceSocketManager, AsyncClient
 from binance.exceptions import ReadLoopClosed
 
 from config import SYMBOL as CONFIG_SYMBOL, OBSERVE_MODE
-from strategy import AlBrooksStrategy
+from strategy import BrooksStrategy
 from trade_logger import TradeLogger
 from workers.helpers import load_historical_klines, fill_missing_klines
+from logic.constants import signal_side, is_spike_signal
 
-# HTF 过滤器
-from logic.htf_filter import get_htf_filter
-
-# 尝试导入 websockets 异常
 try:
     from websockets.exceptions import ConnectionClosed
 except ImportError:
@@ -34,14 +27,9 @@ INTERVAL = AsyncClient.KLINE_INTERVAL_5MINUTE
 async def kline_producer(
     user_queues: List[asyncio.Queue],
     close_queues: Dict[str, asyncio.Queue],
-    strategy: AlBrooksStrategy,
+    strategy: BrooksStrategy,
     trade_logger: TradeLogger,
 ) -> None:
-    """
-    订阅 K 线，生成策略信号并分发给所有用户队列
-    
-    支持自动重连和指数退避机制，基于时间戳精确补全缺失的 K 线
-    """
     history: List[Dict] = []
     kline_count = 0
     reconnect_attempt = 0
@@ -58,12 +46,11 @@ async def kline_producer(
                    if reconnect_attempt > 0 else "")
             )
 
-            # 创建客户端
             try:
                 if client is not None:
                     try:
                         await client.close_connection()
-                    except:
+                    except Exception:
                         pass
                 client = await AsyncClient.create()
                 logging.info("Binance 客户端已创建")
@@ -71,35 +58,23 @@ async def kline_producer(
                 logging.error(f"创建 Binance 客户端失败: {e}", exc_info=True)
                 raise
 
-            # 加载或补全历史K线数据
             if reconnect_attempt == 0:
                 last_kline_timestamp = await load_historical_klines(client, history)
             else:
-                logging.info(f"重连后补全数据，上次最后K线时间戳: {last_kline_timestamp}")
                 last_kline_timestamp = await fill_missing_klines(client, history, last_kline_timestamp)
 
-            # ========== 初始化 HTF 过滤器（1h EMA20）==========
-            # Al Brooks: "大周期的趋势是日内交易最好的保护伞"
-            htf_filter = get_htf_filter(htf_interval="1h", ema_period=20)
-            await htf_filter.update(client, SYMBOL)
-            htf_update_counter = 0  # 每 12 根 K 线（5分钟周期 = 1小时）更新一次 HTF
-            HTF_UPDATE_INTERVAL = 12  # 12 * 5分钟 = 1小时
-
-            # 进行一次信号扫描
             if len(history) >= 50:
                 df = pd.DataFrame(history)
-                signals_df = await strategy.generate_signals(df)
-                last = signals_df.iloc[-1]
-                market_state = last.get("market_state", "Unknown")
-                logging.info(f"市场状态扫描完成，当前市场模式: {market_state}")
+                result = strategy.on_new_bar(df)
+                logging.info(
+                    f"市场状态扫描完成: state={strategy.mstate.state.value} "
+                    f"AI={strategy.mstate.always_in.name}"
+                )
 
-            # 创建合约WebSocket流（必须传入 max_queue_size 防止队列溢出）
-            # 使用 kline_futures_socket 获取合约K线，确保与合约交易价格一致
             bm = BinanceSocketManager(client, max_queue_size=10000)
             kline_stream = bm.kline_futures_socket(symbol=SYMBOL, interval=INTERVAL)
             logging.info(f"合约K线 WebSocket 流已创建: {SYMBOL} {INTERVAL}")
 
-            # 重置重连计数
             reconnect_attempt = 0
             kline_count = len(history)
 
@@ -116,42 +91,29 @@ async def kline_producer(
                             if not k:
                                 continue
 
-                            # 获取实时价格
                             current_price = float(k.get("c", 0))
                             if current_price <= 0:
                                 current_price = float(k.get("l", 0))
 
-                            # ========== Al Brooks 软止损逻辑 ==========
-                            # 实时检查止盈（TP1/TP2），但止损只在收盘时检查
-                            # Crypto 市场"插针"频繁，收盘价确认止损可避免被假突破误触发
                             await _check_stop_loss_take_profit(
                                 trade_logger, close_queues, current_price, check_stop_loss=False
                             )
 
-                            if not k.get("x"):  # 只处理已收盘的K线
+                            if not k.get("x"):
                                 continue
-                            
-                            # ========== K 线收盘时检查止损（软止损）==========
+
                             close_price = float(k.get("c", 0))
                             await _check_stop_loss_take_profit(
                                 trade_logger, close_queues, close_price, check_stop_loss=True
                             )
 
-                            # 处理已收盘的K线
                             kline_count += 1
                             kline_open_time = int(k.get("t", 0))
                             logging.info(
-                                f"📊 K线收盘 #{kline_count}: O={float(k['o']):.2f} "
+                                f"K线收盘 #{kline_count}: O={float(k['o']):.2f} "
                                 f"H={float(k['h']):.2f} L={float(k['l']):.2f} C={float(k['c']):.2f}"
                             )
-                            
-                            # ========== 定期更新 HTF 数据（每 12 根 K 线 = 1 小时）==========
-                            htf_update_counter += 1
-                            if htf_update_counter >= HTF_UPDATE_INTERVAL:
-                                await htf_filter.update(client, SYMBOL)
-                                htf_update_counter = 0
 
-                            # 更新历史数据
                             kline_data = {
                                 "timestamp": kline_open_time,
                                 "open": float(k["o"]),
@@ -167,23 +129,18 @@ async def kline_producer(
                             if len(history) < 50:
                                 continue
 
-                            # 生成信号
                             df = pd.DataFrame(history)
-                            signals_df = await strategy.generate_signals(df)
-                            last = signals_df.iloc[-1]
+                            result = strategy.on_new_bar(df)
 
                             trade_logger.increment_kline()
 
-                            # 周期结束时检测 TP1 是否已被交易所触发（仅此时检测，不轮询）
                             for u in list(trade_logger.positions.keys()):
                                 if trade_logger.needs_tp1_fill_sync(u) and u in close_queues:
                                     await close_queues[u].put({"action": "sync_tp1"})
 
-                            if last["signal"]:
-                                signal = _build_signal(last, k, df)
-                                _log_signal(signal, last)
-                                
-                                # 广播给所有用户
+                            if result is not None:
+                                signal = _build_signal(result)
+                                _log_signal(signal)
                                 for q in user_queues:
                                     await q.put(signal)
 
@@ -201,7 +158,6 @@ async def kline_producer(
                             await asyncio.sleep(1)
 
             except asyncio.CancelledError:
-                logging.info("K线生产者任务已取消")
                 raise
             except (ReadLoopClosed, ConnectionClosed, ConnectionError, OSError) as e:
                 logging.warning(f"WebSocket 连接错误: {e}")
@@ -209,15 +165,14 @@ async def kline_producer(
                 if client is not None:
                     try:
                         await client.close_connection()
-                    except:
+                    except Exception:
                         pass
-                delay = min(base_delay * (2**reconnect_attempt), 60)
+                delay = min(base_delay * (2 ** reconnect_attempt), 60)
                 logging.info(f"等待 {delay} 秒后尝试重连...")
                 await asyncio.sleep(delay)
                 continue
 
         except asyncio.CancelledError:
-            logging.info("K线生产者任务已取消")
             break
         except Exception as e:
             logging.error(f"K线生产者发生未预期的错误: {e}", exc_info=True)
@@ -225,20 +180,17 @@ async def kline_producer(
             if client is not None:
                 try:
                     await client.close_connection()
-                except:
+                except Exception:
                     pass
             if reconnect_attempt >= max_reconnect_attempts:
                 logging.error(f"达到最大重连次数 ({max_reconnect_attempts})，停止重连")
                 break
-            delay = min(base_delay * (2**reconnect_attempt), 60)
-            logging.info(f"等待 {delay} 秒后尝试重连...")
+            delay = min(base_delay * (2 ** reconnect_attempt), 60)
             await asyncio.sleep(delay)
 
-    # 最终清理
     try:
         await client.close_connection()
-        logging.info("Binance 客户端连接已关闭")
-    except:
+    except Exception:
         pass
 
 
@@ -248,67 +200,42 @@ async def _check_stop_loss_take_profit(
     current_price: float,
     check_stop_loss: bool = True,
 ) -> None:
-    """
-    检查止损止盈（Al Brooks 软止损版）
-    
-    Args:
-        trade_logger: 交易日志器
-        close_queues: 平仓队列
-        current_price: 当前价格
-        check_stop_loss: 是否检查止损（False=只检查止盈，True=检查止盈+止损）
-    """
     if current_price <= 0:
         return
-    
     for user_name in list(trade_logger.positions.keys()):
         trade = trade_logger.positions.get(user_name)
         if trade is None:
             continue
-        
         result = trade_logger.check_stop_loss_take_profit(
             user_name, current_price, check_stop_loss=check_stop_loss
         )
-        
         if not result:
             continue
-        
-        # 处理TP1操作（返回字典）
+
         if isinstance(result, dict) and result.get("action") == "tp1":
             tp1_info = result
             logging.info(
-                f"[{user_name}] TP1触发: 平仓50% @ {tp1_info['close_price']:.2f}, "
-                f"新止损={tp1_info['new_stop_loss']:.2f}"
+                f"[{user_name}] TP1触发: 平仓50% @ {tp1_info['close_price']:.2f}"
             )
-            print(f"[{user_name}] 🎯 TP1触发: 平仓50% @ {tp1_info['close_price']:.2f}")
-            
             if not OBSERVE_MODE and user_name in close_queues:
                 tp1_request = {
                     "action": "tp1",
-                    "side": "SELL" if tp1_info["trade"].side.lower() == "buy" else "BUY",  # 平仓方向
+                    "side": "SELL" if tp1_info["trade"].side.lower() == "buy" else "BUY",
                     "close_quantity": tp1_info["close_quantity"],
                     "close_price": tp1_info["close_price"],
                     "new_stop_loss": tp1_info["new_stop_loss"],
                     "tp2_price": tp1_info["tp2_price"],
                     "remaining_quantity": tp1_info["trade"].remaining_quantity,
-                    # OCO 风格订单所需字段
                     "entry_price": float(tp1_info["trade"].entry_price),
                     "position_side": tp1_info["trade"].side,
                 }
                 await close_queues[user_name].put(tp1_request)
-                logging.info(f"[{user_name}] 已发送TP1请求到队列（含OCO字段）")
-        
         else:
-            # 完全平仓（Trade对象）
             closed_trade = result
             logging.info(
                 f"[{user_name}] {closed_trade.exit_reason}: "
-                f"价格={current_price:.2f}, 盈亏={closed_trade.pnl:.4f} USDT ({closed_trade.pnl_percent:.2f}%)"
+                f"价格={current_price:.2f}, 盈亏={closed_trade.pnl:.4f} USDT"
             )
-            print(
-                f"[{user_name}] {closed_trade.exit_reason}: "
-                f"价格={current_price:.2f}, 盈亏={closed_trade.pnl:.4f} USDT ({closed_trade.pnl_percent:.2f}%)"
-            )
-            
             if not OBSERVE_MODE and user_name in close_queues:
                 close_request = {
                     "action": "close",
@@ -318,129 +245,32 @@ async def _check_stop_loss_take_profit(
                     "exit_reason": closed_trade.exit_reason,
                 }
                 await close_queues[user_name].put(close_request)
-                logging.info(f"[{user_name}] 已发送平仓请求到队列")
 
 
-def _build_signal(last, k, df) -> Dict:
-    """构建信号字典"""
-    entry_price = last["close"]
-    stop_loss = last["stop_loss"]
-    risk_reward_ratio = last.get("risk_reward_ratio", 1.0)
-    base_height = last.get("base_height", None)
-    tp1_price = last.get("tp1_price", None)
-    tp2_price = last.get("tp2_price", None)
-    tight_channel_score = last.get("tight_channel_score", 0.0)
-    market_state = last.get("market_state", "Unknown")
-    atr_value = last.get("atr", None)
-    
-    # 动态分批出场参数
-    tp1_close_ratio = last.get("tp1_close_ratio", 0.5)
-    is_climax_bar = last.get("is_climax_bar", False)
-    move_stop_to_breakeven_at_tp1 = last.get("move_stop_to_breakeven_at_tp1", False)
-    
-    # TA-Lib 形态加成
-    talib_boost = last.get("talib_boost", 0.0) or 0.0
-    talib_patterns_str = last.get("talib_patterns", None)
-    
-    # 计算信号强度（基础强度 + TA-Lib 加成）
-    current_bar = df.iloc[-1]
-    base_strength = abs(current_bar["close"] - current_bar["open"])
-    # 信号强度 = 基础强度 × (1 + TA-Lib 加成)
-    signal_strength = base_strength * (1 + talib_boost)
-    
-    # 计算止盈（与 strategy._calculate_tp1_tp2 口径一致：无 tp1/tp2 时用 stop_distance + risk_reward_ratio + base_height）
-    if tp1_price and tp2_price:
-        take_profit = tp2_price
-    else:
-        if last["side"] == "buy":
-            stop_distance = entry_price - stop_loss
-        else:
-            stop_distance = stop_loss - entry_price
-        
-        min_tp_distance = stop_distance * 2.0
-        traditional_tp_distance = stop_distance * risk_reward_ratio
-        
-        if base_height and base_height > 0:
-            actual_tp_distance = max(base_height, traditional_tp_distance, min_tp_distance)
-        else:
-            actual_tp_distance = max(traditional_tp_distance, min_tp_distance)
-        
-        if last["side"] == "buy":
-            take_profit = entry_price + actual_tp_distance
-        else:
-            take_profit = entry_price - actual_tp_distance
-
-    # 市场周期状态机：Spike / Channel / TradingRange（由 market_state 映射）
-    market_cycle = "Spike" if market_state == "Breakout" else ("TradingRange" if market_state == "TradingRange" else "Channel")
-    
+def _build_signal(result) -> Dict:
+    """从 SignalResult 构建信号字典"""
+    side = signal_side(result.signal_type)
+    is_spike = is_spike_signal(result.signal_type)
     return {
-        "signal": last["signal"],
-        "side": last["side"],
-        "price": entry_price,
-        "stop_loss": stop_loss,
-        "take_profit": take_profit,
-        "risk_reward_ratio": risk_reward_ratio,
-        "market_state": market_state,
-        "market_cycle": market_cycle,
-        "signal_strength": signal_strength,
-        "tp1_price": tp1_price,
-        "tp2_price": tp2_price,
-        "tight_channel_score": tight_channel_score,
-        "atr": atr_value,
-        # 动态分批出场参数（Wedge: TP1 至少 50% 平仓 + 移动止损到保本，Brooks 高波动保命）
-        "tp1_close_ratio": tp1_close_ratio,
-        "is_climax_bar": is_climax_bar,
-        "move_stop_to_breakeven_at_tp1": move_stop_to_breakeven_at_tp1,
-        # TA-Lib 形态增强
-        "talib_boost": talib_boost,
-        "talib_patterns": talib_patterns_str,
+        "signal": result.signal_type.name,
+        "side": side,
+        "price": result.entry_price,
+        "stop_loss": result.stop_loss,
+        "take_profit": result.tp2,
+        "tp1_price": result.tp1,
+        "tp2_price": result.tp2,
+        "market_state": result.reason,
+        "is_spike": is_spike,
+        "signal_strength": 1.0,
+        "tp1_close_ratio": 0.5,
     }
 
 
-def _log_signal(signal: Dict, last) -> None:
-    """记录信号日志"""
-    state_map = {
-        "Breakout": "突破模式(Spike)",
-        "Channel": "通道模式(Channel)",
-        "TradingRange": "区间模式(Range)",
-        "Unknown": "未知状态",
-    }
-    state_display = state_map.get(signal["market_state"], signal["market_state"])
-    
-    tp1_price = signal.get("tp1_price")
-    tp2_price = signal.get("tp2_price")
-    
-    # TA-Lib 形态信息
-    talib_boost = signal.get("talib_boost", 0.0) or 0.0
-    talib_patterns = signal.get("talib_patterns")
-    talib_info = ""
-    if talib_boost > 0 and talib_patterns:
-        talib_info = f", TA-Lib +{talib_boost:.0%} [{talib_patterns}]"
-    
-    # 动态平仓比例
-    tp1_ratio = signal.get("tp1_close_ratio", 0.5)
-    tp1_pct = int(tp1_ratio * 100)
-    tp2_pct = 100 - tp1_pct
-    
-    if tp1_price and tp2_price:
-        logging.info(
-            f"🎯 触发交易信号: {signal['signal']} {signal['side']} @ {signal['price']:.2f}, "
-            f"止损={signal['stop_loss']:.2f}, TP1={tp1_price:.2f}({tp1_pct}%), TP2={tp2_price:.2f}({tp2_pct}%), "
-            f"市场模式={state_display}{talib_info}"
-        )
-        print(
-            f"🎯 触发信号: {signal['signal']} {signal['side']} @ {signal['price']:.2f}, "
-            f"止损={signal['stop_loss']:.2f}, TP1={tp1_price:.2f}({tp1_pct}%), TP2={tp2_price:.2f}({tp2_pct}%)"
-            + (f" [TA-Lib: {talib_patterns}]" if talib_patterns else "")
-        )
-    else:
-        logging.info(
-            f"🎯 触发交易信号: {signal['signal']} {signal['side']} @ {signal['price']:.2f}, "
-            f"止损={signal['stop_loss']:.2f}, 止盈={signal['take_profit']:.2f}, "
-            f"盈亏比=1:{signal['risk_reward_ratio']:.1f}, 市场模式={state_display}{talib_info}"
-        )
-        print(
-            f"🎯 触发信号: {signal['signal']} {signal['side']} @ {signal['price']:.2f}, "
-            f"止损={signal['stop_loss']:.2f}, 止盈={signal['take_profit']:.2f}"
-            + (f" [TA-Lib: {talib_patterns}]" if talib_patterns else "")
-        )
+def _log_signal(signal: Dict) -> None:
+    tp1 = signal.get("tp1_price", 0)
+    tp2 = signal.get("tp2_price", 0)
+    entry_type = "市价" if signal.get("is_spike") else "限价"
+    logging.info(
+        f"信号: {signal['signal']} {signal['side']} @ {signal['price']:.2f} ({entry_type}), "
+        f"SL={signal['stop_loss']:.2f}, TP1={tp1:.2f}, TP2={tp2:.2f}"
+    )

@@ -67,55 +67,53 @@ def _mask_url_password(url: str) -> str:
 # Redis 配置（生产环境强制）
 # ============================================================================
 
-def get_redis_url() -> str:
+def get_redis_url() -> Optional[str]:
     """
-    获取 Redis 连接 URL
-    
+    获取 Redis 连接 URL（可选）
+
     优先级：
     1. REDIS_URL 环境变量（完整连接字符串）
     2. 从独立环境变量组装：REDIS_HOST, REDIS_PORT, REDIS_PASSWORD, REDIS_DB
-    
-    生产环境强制配置：未配置时抛出异常，Delta 订单流分析依赖 Redis
+
+    未配置时返回 None（TradeLogger 退化为纯内存模式）。
     """
     redis_url = os.getenv("REDIS_URL")
-    
+
     if redis_url:
         safe_url = _mask_url_password(redis_url)
         logging.info(f"Redis 配置: {safe_url}")
         return redis_url
-    
-    # 从独立环境变量组装
+
     redis_host = os.getenv("REDIS_HOST")
     redis_port = os.getenv("REDIS_PORT", "6379")
     redis_db = os.getenv("REDIS_DB", "0")
     redis_password = os.getenv("REDIS_PASSWORD")
-    
+
     if redis_host:
         if redis_password:
             redis_url = f"redis://:{redis_password}@{redis_host}:{redis_port}/{redis_db}"
         else:
             redis_url = f"redis://{redis_host}:{redis_port}/{redis_db}"
-        
         logging.info(f"Redis 配置: {redis_host}:{redis_port}/{redis_db}")
         return redis_url
-    
-    # 生产环境强制配置：未配置 Redis 时抛出异常
-    error_msg = (
-        "❌ Redis 未配置！生产环境强制要求配置 Redis。\n"
-        "Delta 订单流分析功能依赖 Redis 进行数据缓存。\n"
-        "请设置以下环境变量之一：\n"
-        "  方式1: REDIS_URL=redis://host:6379/0\n"
-        "  方式2: REDIS_HOST (可选: REDIS_PORT, REDIS_DB, REDIS_PASSWORD)"
-    )
-    logging.critical(error_msg)
-    raise RuntimeError(error_msg)
+
+    logging.info("Redis 未配置，TradeLogger 将使用纯内存模式")
+    return None
 
 
 # ============================================================================
 # 导出配置常量
 # ============================================================================
 
-REDIS_URL = get_redis_url()
+REDIS_URL: Optional[str] = get_redis_url()
+
+# Delta 订单流分析开关（默认关闭；启用时需配置 Redis）
+DELTA_ENABLED = os.getenv("DELTA_ENABLED", "false").lower() in ("true", "1", "yes")
+if DELTA_ENABLED and REDIS_URL is None:
+    raise RuntimeError(
+        "DELTA_ENABLED=true 但 Redis 未配置。"
+        "Delta 订单流依赖 Redis 缓存，请设置 REDIS_URL 或 REDIS_HOST。"
+    )
 
 
 # ============================================================================
@@ -125,51 +123,30 @@ REDIS_URL = get_redis_url()
 def get_trading_config() -> dict:
     """
     获取交易参数配置
-    
+
     环境变量：
     - OBSERVE_BALANCE: 观察模式的模拟总资金（USDT），默认 10000
     - POSITION_SIZE_PERCENT: 开仓使用资金百分比（小资金时），默认 100（即 100%）
     - LEVERAGE: 杠杆倍数，默认 20
     - SYMBOL: 交易对，默认 BTCUSDT
     - INTERVAL: K线周期，默认 5m
-    - TICK_SIZE: 合约最小价格步长（用于动态止损 SignalBar±TickSize），默认 0.01
-    - USE_SIGNAL_BAR_ONLY_STOP: 是否使用纯信号棒止损（true=SignalBar极值±TickSize），默认 true
-    - TRADER_EQUATION_ENABLED: 是否启用交易者方程过滤（WinRate×Reward>Risk），默认 true
-    - TRADER_EQUATION_WIN_RATE: 交易者方程默认胜率（0~1），默认 0.4
-    - VOLUME_BREAKOUT_CONFIRM_ENABLED: 是否启用成交量确认突破（有效突破类信号需放量），默认 false
-    - VOLUME_BREAKOUT_MULTIPLIER: 成交量确认倍数（当根或近期量 > 均量×此值），默认 1.2
-    - OPEN_INTEREST_ENABLED: 是否启用持仓量确认（需数据源支持，当前为预留），默认 false
-    - ORDER_PRICE_OFFSET_PCT: 追价限价单偏移百分比（买 Ask+偏移/卖 Bid-偏移），默认 0.05
-    - ORDER_PRICE_OFFSET_TICKS: 追价限价单偏移 tick 数（与 ORDER_PRICE_OFFSET_PCT 二选一），默认 0
-    
-    动态仓位配置（资金管理）：
+    - TICK_SIZE: 合约最小价格步长，默认 0.01
+    - ORDER_PRICE_OFFSET_PCT: 追价限价单偏移百分比，默认 0.05
+    - ORDER_PRICE_OFFSET_TICKS: 追价限价单偏移 tick 数，默认 0
     - LARGE_BALANCE_THRESHOLD: 大资金阈值（USDT），默认 1000
-    - LARGE_BALANCE_POSITION_PCT: 大资金时的仓位百分比，默认 50（即 50%）
-    
-    规则：
-    - 余额 <= LARGE_BALANCE_THRESHOLD: 使用 POSITION_SIZE_PERCENT
-    - 余额 > LARGE_BALANCE_THRESHOLD: 使用 LARGE_BALANCE_POSITION_PCT
+    - LARGE_BALANCE_POSITION_PCT: 大资金时的仓位百分比，默认 50
     """
-    # 使用默认值避免空字符串导致的转换异常
     observe_balance_str = os.getenv("OBSERVE_BALANCE", "10000")
-    position_size_str = os.getenv("POSITION_SIZE_PERCENT", "100")  # 小资金默认 100%
+    position_size_str = os.getenv("POSITION_SIZE_PERCENT", "100")
     leverage_str = os.getenv("LEVERAGE", "20")
     symbol_str = os.getenv("SYMBOL", "BTCUSDT")
     interval_str = os.getenv("INTERVAL", "5m")
     tick_size_str = os.getenv("TICK_SIZE", "0.01")
-    use_signal_bar_only_stop_str = os.getenv("USE_SIGNAL_BAR_ONLY_STOP", "true")
-    trader_equation_enabled_str = os.getenv("TRADER_EQUATION_ENABLED", "true")
-    trader_equation_win_rate_str = os.getenv("TRADER_EQUATION_WIN_RATE", "0.4")
-    volume_breakout_confirm_str = os.getenv("VOLUME_BREAKOUT_CONFIRM_ENABLED", "false")
-    volume_breakout_multiplier_str = os.getenv("VOLUME_BREAKOUT_MULTIPLIER", "1.2")
-    open_interest_enabled_str = os.getenv("OPEN_INTEREST_ENABLED", "false")
     order_price_offset_pct_str = os.getenv("ORDER_PRICE_OFFSET_PCT", "0.05")
     order_price_offset_ticks_str = os.getenv("ORDER_PRICE_OFFSET_TICKS", "0")
-    
-    # 动态仓位配置
     large_balance_threshold_str = os.getenv("LARGE_BALANCE_THRESHOLD", "1000")
     large_balance_position_pct_str = os.getenv("LARGE_BALANCE_POSITION_PCT", "50")
-    
+
     try:
         observe_balance = float(observe_balance_str) if observe_balance_str else 10000.0
         position_size_percent = float(position_size_str) if position_size_str else 100.0
@@ -177,19 +154,12 @@ def get_trading_config() -> dict:
         large_balance_threshold = float(large_balance_threshold_str) if large_balance_threshold_str else 1000.0
         large_balance_position_pct = float(large_balance_position_pct_str) if large_balance_position_pct_str else 50.0
         tick_size = float(tick_size_str) if tick_size_str else 0.01
-        use_signal_bar_only_stop = use_signal_bar_only_stop_str.lower() in ("true", "1", "yes")
-        trader_equation_enabled = trader_equation_enabled_str.lower() in ("true", "1", "yes")
-        trader_equation_win_rate = float(trader_equation_win_rate_str) if trader_equation_win_rate_str else 0.4
-        volume_breakout_confirm = volume_breakout_confirm_str.lower() in ("true", "1", "yes")
-        volume_breakout_multiplier = float(volume_breakout_multiplier_str) if volume_breakout_multiplier_str else 1.2
-        open_interest_enabled = open_interest_enabled_str.lower() in ("true", "1", "yes")
         order_price_offset_pct = float(order_price_offset_pct_str) if order_price_offset_pct_str else 0.0
         order_price_offset_ticks = int(order_price_offset_ticks_str) if order_price_offset_ticks_str else 0
     except ValueError as e:
         logging.error(f"交易参数配置格式错误: {e}")
         raise RuntimeError(f"交易参数配置格式错误: {e}")
-    
-    # 参数范围验证
+
     if observe_balance <= 0:
         raise RuntimeError(f"OBSERVE_BALANCE 必须大于 0，当前值: {observe_balance}")
     if not (0 < position_size_percent <= 100):
@@ -202,28 +172,20 @@ def get_trading_config() -> dict:
         raise RuntimeError(f"LARGE_BALANCE_POSITION_PCT 必须在 (0, 100] 范围内，当前值: {large_balance_position_pct}")
     if tick_size <= 0:
         raise RuntimeError(f"TICK_SIZE 必须大于 0，当前值: {tick_size}")
-    if not (0 <= trader_equation_win_rate <= 1):
-        raise RuntimeError(f"TRADER_EQUATION_WIN_RATE 必须在 [0, 1]，当前值: {trader_equation_win_rate}")
-    
+
     config = {
         "observe_balance": observe_balance,
-        "position_size_percent": position_size_percent,  # 小资金仓位
+        "position_size_percent": position_size_percent,
         "leverage": leverage,
         "symbol": symbol_str or "BTCUSDT",
         "interval": interval_str or "5m",
         "tick_size": tick_size,
-        "use_signal_bar_only_stop": use_signal_bar_only_stop,
-        "trader_equation_enabled": trader_equation_enabled,
-        "trader_equation_win_rate": trader_equation_win_rate,
-        "volume_breakout_confirm_enabled": volume_breakout_confirm,
-        "volume_breakout_multiplier": volume_breakout_multiplier,
-        "open_interest_enabled": open_interest_enabled,
         "order_price_offset_pct": order_price_offset_pct,
         "order_price_offset_ticks": order_price_offset_ticks,
         "large_balance_threshold": large_balance_threshold,
         "large_balance_position_pct": large_balance_position_pct,
     }
-    
+
     logging.info(
         f"交易参数: 模拟资金={config['observe_balance']} USDT, "
         f"小资金仓位={config['position_size_percent']}%, "
@@ -231,9 +193,9 @@ def get_trading_config() -> dict:
         f"大资金仓位={config['large_balance_position_pct']}%, "
         f"杠杆={config['leverage']}x, "
         f"交易对={config['symbol']}, K线周期={config['interval']}, "
-        f"止损模式={'信号棒极值+TickSize' if config['use_signal_bar_only_stop'] else '两棒+ATR'}, tick_size={config['tick_size']}"
+        f"tick_size={config['tick_size']}"
     )
-    
+
     return config
 
 
@@ -247,12 +209,6 @@ LEVERAGE = TRADING_CONFIG["leverage"]
 SYMBOL = TRADING_CONFIG["symbol"]
 KLINE_INTERVAL = TRADING_CONFIG["interval"]
 TICK_SIZE = TRADING_CONFIG["tick_size"]
-USE_SIGNAL_BAR_ONLY_STOP = TRADING_CONFIG["use_signal_bar_only_stop"]
-TRADER_EQUATION_ENABLED = TRADING_CONFIG["trader_equation_enabled"]
-TRADER_EQUATION_WIN_RATE = TRADING_CONFIG["trader_equation_win_rate"]
-VOLUME_BREAKOUT_CONFIRM_ENABLED = TRADING_CONFIG["volume_breakout_confirm_enabled"]
-VOLUME_BREAKOUT_MULTIPLIER = TRADING_CONFIG["volume_breakout_multiplier"]
-OPEN_INTEREST_ENABLED = TRADING_CONFIG["open_interest_enabled"]
 ORDER_PRICE_OFFSET_PCT = TRADING_CONFIG["order_price_offset_pct"]
 ORDER_PRICE_OFFSET_TICKS = TRADING_CONFIG["order_price_offset_ticks"]
 LARGE_BALANCE_THRESHOLD = TRADING_CONFIG["large_balance_threshold"]

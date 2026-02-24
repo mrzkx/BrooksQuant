@@ -5,16 +5,13 @@ BrooksQuant 交易系统 - 主入口
 
 模块结构：
 - main.py: 主入口和程序初始化
-- workers/: 异步工作者模块
-  - kline_producer.py: K线数据流生产者
-  - user_worker.py: 用户信号处理工作者
-  - stats_worker.py: 统计打印工作者
-  - helpers.py: 辅助函数
-- order_executor.py: 订单执行逻辑
-- strategy.py: 策略逻辑
-- trade_logger.py: 交易日志
+- strategy.py: BrooksStrategy（EA 逻辑的 Python 实现）
+- logic/: 策略核心模块（constants, indicators, swing, hl, market_state, filters, signals, scan, sl, tp）
+- workers/: 异步工作者模块（kline_producer, user_worker, stats_worker, helpers）
+- order_executor.py: 订单执行逻辑（混合入场: Spike 市价 / 其他限价）
+- trade_logger.py: 交易日志（内存 + 可选 Redis）
 - user_manager.py: 用户管理
-- delta_flow.py: 订单流分析
+- delta_flow.py: 订单流分析（可选模块，默认不启用）
 """
 
 import asyncio
@@ -23,6 +20,7 @@ import logging
 from config import (
     load_user_credentials,
     REDIS_URL,
+    DELTA_ENABLED,
     OBSERVE_BALANCE,
     POSITION_SIZE_PERCENT,
     LEVERAGE,
@@ -30,18 +28,11 @@ from config import (
     KLINE_INTERVAL,
     OBSERVE_MODE,
 )
-from strategy import AlBrooksStrategy
+from strategy import BrooksStrategy
 from trade_logger import TradeLogger
 from user_manager import TradingUser
-
-# 动态订单流模块
-from delta_flow import aggtrade_worker
-
-# 工作者模块
 from workers import kline_producer, user_worker, print_stats_periodically
 
-
-# 交易参数
 SYMBOL = CONFIG_SYMBOL
 
 
@@ -57,11 +48,9 @@ async def main() -> None:
     logging.info("BrooksQuant 交易系统启动")
     logging.info("=" * 60)
 
-    # 加载用户凭证
     credentials = load_user_credentials()
     logging.info(f"已加载 {len(credentials)} 组用户凭据")
 
-    # 观察模式下，如果没有配置凭据，创建一个默认用户
     if OBSERVE_MODE and len(credentials) == 0:
         from config import UserCredentials
         credentials = [UserCredentials(api_key="", api_secret="")]
@@ -72,43 +61,38 @@ async def main() -> None:
             "需要在环境变量中配置至少一组用户凭据：USER1_API_KEY/USER1_API_SECRET"
         )
 
-    # 创建用户
     users = [TradingUser(f"User{i+1}", cred) for i, cred in enumerate(credentials)]
     logging.info(f"已创建 {len(users)} 个交易用户: {[u.name for u in users]}")
 
-    # 显示运行模式
     _log_mode_info()
-
     logging.info(f"交易对: {SYMBOL}, K线周期: {KLINE_INTERVAL}")
 
-    # 初始化策略（策略内部会打印初始化日志）
-    strategy = AlBrooksStrategy(
-        ema_period=20,
-        kline_interval=KLINE_INTERVAL,
-        redis_url=REDIS_URL,
-    )
+    strategy = BrooksStrategy()
 
-    # 初始化交易日志器（内存 + Redis 当前状态持久化；启动时先查币安再查 Redis）
-    # trade_logger 内部会打印初始化日志，这里不需要重复打印
     trade_logger = TradeLogger(redis_url=REDIS_URL)
 
-    # 创建队列
     user_queues = [asyncio.Queue() for _ in users]
     close_queues = {user.name: asyncio.Queue() for user in users}
 
     logging.info("正在启动所有任务...")
-    
-    # 创建任务列表
+
     tasks = [
         asyncio.create_task(
             kline_producer(user_queues, close_queues, strategy, trade_logger)
         ),
-        asyncio.create_task(
-            aggtrade_worker(SYMBOL, REDIS_URL, KLINE_INTERVAL)
-        ),
     ]
-    
-    # 为每个用户创建工作者
+
+    if DELTA_ENABLED:
+        from delta_flow import aggtrade_worker
+        tasks.append(
+            asyncio.create_task(
+                aggtrade_worker(SYMBOL, REDIS_URL, KLINE_INTERVAL)
+            )
+        )
+        logging.info("Delta 订单流分析已启用")
+    else:
+        logging.info("Delta 订单流分析已禁用（DELTA_ENABLED=false）")
+
     for user, queue in zip(users, user_queues):
         tasks.append(
             asyncio.create_task(
@@ -116,16 +100,13 @@ async def main() -> None:
             )
         )
 
-    # 添加统计打印任务
     tasks.append(
         asyncio.create_task(
             print_stats_periodically(trade_logger, users)
         )
     )
 
-    # 获取 Delta 窗口大小用于日志
-    delta_window = strategy.delta_analyzer.WINDOW_SECONDS if strategy.delta_analyzer else 300
-    logging.info(f"已创建 {len(tasks)} 个任务（含动态订单流监控，Delta窗口={delta_window}秒）")
+    logging.info(f"已创建 {len(tasks)} 个任务")
     logging.info("所有任务已启动，程序运行中...")
 
     try:
@@ -136,41 +117,30 @@ async def main() -> None:
         logging.error(f"发生错误: {e}", exc_info=True)
     finally:
         logging.info("正在清理资源...")
-        
-        # 取消所有运行中的任务
+
         for task in tasks:
             if not task.done():
                 task.cancel()
-        
-        # 等待所有任务完成取消（给予清理时间）
+
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-        
-        # 关闭用户连接
+
         for user in users:
             try:
                 await user.close()
             except Exception as e:
                 logging.warning(f"关闭用户 {user.name} 连接时出错: {e}")
-        
-        # 关闭 Delta 分析器的 Redis 连接
-        try:
-            if strategy.delta_analyzer:
-                await strategy.delta_analyzer.close()
-        except Exception as e:
-            logging.warning(f"关闭 Delta 分析器时出错: {e}")
-        
-        # 关闭 trade_logger 的 Redis 连接
+
         try:
             await trade_logger.close()
         except Exception as e:
             logging.warning(f"关闭交易日志器时出错: {e}")
-        
+
         logging.info("程序已正常退出")
 
 
 def _log_mode_info():
-    """记录运行模式信息（同时写日志与控制台）"""
+    """记录运行模式信息"""
     sep = "=" * 60
     if OBSERVE_MODE:
         line1 = "观察模式已启用 - 将进行模拟交易，不会实际下单"

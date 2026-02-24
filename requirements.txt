@@ -1,5 +1,6 @@
 python-binance
 pandas
+numpy
 python-dotenv
 greenlet==3.3.0
 redis==7.1.0

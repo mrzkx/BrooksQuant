@@ -1,18 +1,16 @@
 //+------------------------------------------------------------------+
-//|                                              BrooksQuant_EA.mq5 |
-//|                          Al Brooks Price Action Trading System  |
-//|                      Ported from Python BrooksQuant v2.0        |
+//|                                                AlBrooks_v4.mq5   |
+//|                          Al Brooks Price Action Trading System   |
+//|                                                           v4     |
 //+------------------------------------------------------------------+
 #property copyright "BrooksQuant Team"
 #property link      "https://github.com/brooksquant"
-#property version   "2.00"
+#property version   "4.11"
 #property description "Al Brooks Price Action EA - MT5 Implementation"
-#property description "Signals: Spike, H2/L2, Wedge, Climax, MTR, Failed Breakout"
+#property description "Full PA Signals + Barb Wire Filter + Measuring Gap + Breakout Mode"
+#property description "严格 NewBar 驱动: 除移动止损与价格监控(OnTickExitOnly)外, 所有计算均在 IsNewBar 为 true 时执行"
 #property strict
 
-//+------------------------------------------------------------------+
-//| Include Files                                                     |
-//+------------------------------------------------------------------+
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
 #include <Trade\OrderInfo.mqh>
@@ -20,64 +18,60 @@
 //+------------------------------------------------------------------+
 //| Enumerations                                                      |
 //+------------------------------------------------------------------+
-
-// 市场状态（Al Brooks 核心概念）
 enum ENUM_MARKET_STATE
 {
-    MARKET_STATE_STRONG_TREND,    // 强趋势（禁止逆势）
-    MARKET_STATE_BREAKOUT,        // 突破
-    MARKET_STATE_CHANNEL,         // 通道
-    MARKET_STATE_TRADING_RANGE,   // 交易区间
-    MARKET_STATE_TIGHT_CHANNEL,   // 紧凑通道（禁止反转）
-    MARKET_STATE_FINAL_FLAG       // 终极旗形（高胜率反转）
+    MARKET_STATE_STRONG_TREND,
+    MARKET_STATE_BREAKOUT,
+    MARKET_STATE_CHANNEL,
+    MARKET_STATE_TRADING_RANGE,
+    MARKET_STATE_TIGHT_CHANNEL,
+    MARKET_STATE_FINAL_FLAG
 };
 
-// 市场周期状态机
 enum ENUM_MARKET_CYCLE
 {
-    MARKET_CYCLE_SPIKE,           // 尖峰阶段（Always In）
-    MARKET_CYCLE_CHANNEL,         // 通道阶段
-    MARKET_CYCLE_TRADING_RANGE    // 交易区间
+    MARKET_CYCLE_SPIKE,
+    MARKET_CYCLE_CHANNEL,
+    MARKET_CYCLE_TRADING_RANGE
 };
 
-// H2 状态机状态
-enum ENUM_H2_STATE
+// Always In 方向 - Brooks 最核心概念
+enum ENUM_ALWAYS_IN
 {
-    H2_WAITING_FOR_PULLBACK,      // 等待回调
-    H2_IN_PULLBACK,               // 回调中
-    H2_H1_DETECTED,               // H1已检测
-    H2_WAITING_FOR_H2             // 等待H2
+    AI_LONG,
+    AI_SHORT,
+    AI_NEUTRAL
 };
 
-// L2 状态机状态
-enum ENUM_L2_STATE
-{
-    L2_WAITING_FOR_BOUNCE,        // 等待反弹
-    L2_IN_BOUNCE,                 // 反弹中
-    L2_L1_DETECTED,               // L1已检测
-    L2_WAITING_FOR_L2             // 等待L2
-};
-
-// 信号类型
 enum ENUM_SIGNAL_TYPE
 {
     SIGNAL_NONE,
-    // Context Bypass 应急入场（最高优先级）
-    SIGNAL_SPIKE_MARKET_BUY,      // SPIKE周期市价入场
-    SIGNAL_SPIKE_MARKET_SELL,     // SPIKE周期市价入场
-    SIGNAL_MICRO_CH_H1_BUY,       // Tight Channel H1 快速入场
-    SIGNAL_MICRO_CH_H1_SELL,      // Tight Channel L1 快速入场
-    SIGNAL_EMERGENCY_SPIKE_BUY,   // 极值棒下一根开盘市价多
-    SIGNAL_EMERGENCY_SPIKE_SELL,  // 极值棒下一根开盘市价空
-    // 标准 Spike
     SIGNAL_SPIKE_BUY,
     SIGNAL_SPIKE_SELL,
-    // H2/L2 状态机信号
     SIGNAL_H1_BUY,
     SIGNAL_H2_BUY,
     SIGNAL_L1_SELL,
     SIGNAL_L2_SELL,
-    // 反转信号（仅限 TRADING_RANGE 或 FINAL_FLAG）
+    SIGNAL_MICRO_CH_BUY,
+    SIGNAL_MICRO_CH_SELL,
+    SIGNAL_DT_BUY,          // Double Bottom买
+    SIGNAL_DT_SELL,          // Double Top卖
+    SIGNAL_TREND_BAR_BUY,   // 趋势K线入场
+    SIGNAL_TREND_BAR_SELL,
+    SIGNAL_REV_BAR_BUY,     // 反转K线入场
+    SIGNAL_REV_BAR_SELL,
+    SIGNAL_II_BUY,           // ii/iii连续内包线
+    SIGNAL_II_SELL,
+    SIGNAL_OUTSIDE_BAR_BUY,  // 外包线反转
+    SIGNAL_OUTSIDE_BAR_SELL,
+    SIGNAL_MEASURED_MOVE_BUY,// 等距运动
+    SIGNAL_MEASURED_MOVE_SELL,
+    SIGNAL_TR_BREAKOUT_BUY,  // TR突破
+    SIGNAL_TR_BREAKOUT_SELL,
+    SIGNAL_BO_PULLBACK_BUY,  // 突破回调
+    SIGNAL_BO_PULLBACK_SELL,
+    SIGNAL_GAP_BAR_BUY,      // 缺口K线
+    SIGNAL_GAP_BAR_SELL,
     SIGNAL_WEDGE_BUY,
     SIGNAL_WEDGE_SELL,
     SIGNAL_CLIMAX_BUY,
@@ -86,8 +80,6 @@ enum ENUM_SIGNAL_TYPE
     SIGNAL_MTR_SELL,
     SIGNAL_FAILED_BO_BUY,
     SIGNAL_FAILED_BO_SELL,
-    SIGNAL_GAPBAR_BUY,
-    SIGNAL_GAPBAR_SELL,
     SIGNAL_FINAL_FLAG_BUY,
     SIGNAL_FINAL_FLAG_SELL
 };
@@ -96,222 +88,329 @@ enum ENUM_SIGNAL_TYPE
 //| Input Parameters                                                  |
 //+------------------------------------------------------------------+
 input group "=== 基础设置 ==="
-input double   InpLotSize           = 0.02;       // 基础手数
-input int      InpMagicNumber       = 20260203;  // Magic Number
-input int      InpMaxPositions      = 1;         // 最大持仓数量
-input bool     InpEnableTrading     = true;      // 启用实盘交易
+input double   InpLotSize           = 0.02;
+input int      InpMagicNumber       = 20260203;
+input int      InpMaxPositions      = 1;
 
-input group "=== Al Brooks 参数 ==="
-input int      InpEMAPeriod         = 20;        // EMA 周期
-input int      InpATRPeriod         = 20;        // ATR 周期
-input int      InpLookbackPeriod    = 20;        // 回看周期
+input group "=== Al Brooks 核心参数 ==="
+input int      InpEMAPeriod         = 20;
+input int      InpATRPeriod         = 20;
 
-input group "=== 信号棒质量参数 ==="
-input double   InpMinBodyRatio      = 0.50;      // 最小实体占比 (0.5 = 50%)
-input double   InpClosePositionPct  = 0.25;      // 收盘位置要求 (0.25 = 顶/底25%)
-
-input group "=== 趋势检测参数 ==="
-input double   InpSlopeThreshold    = 0.008;     // 强斜率阈值 (0.008 = 0.8%)
-input double   InpStrongTrendScore  = 0.50;      // 强趋势得分阈值 (0-1)
-
-input group "=== 信号控制 ==="
-input int      InpSignalCooldown    = 3;         // 信号冷却期（K线数）
-input bool     InpEnableSpike       = true;      // 启用 Spike 信号
-input bool     InpEnableH2L2        = true;      // 启用 H2/L2 信号
-input bool     InpEnableWedge       = true;      // 启用 Wedge 信号
-input bool     InpEnableClimax      = true;      // 启用 Climax 信号
-input bool     InpEnableMTR         = true;      // 启用 MTR 信号
-input bool     InpEnableFailedBO    = true;      // 启用 Failed Breakout 信号
-
-input group "=== V型反转 (Spike Climax) ==="
-input bool     InpEnableSpikeClimax  = true;     // 启用 Spike 中的 V 型反转
-input double   InpSpikeClimaxATRMult = 3.5;      // Climax 棒最小长度 (×ATR)
-input double   InpReversalCoverage   = 0.60;     // 反转棒覆盖率要求 (60%)
-input double   InpReversalPenetration= 0.40;     // 反转棒穿透率 (穿入 Climax 实体 40%)
-input int      InpMinSpikeBars       = 3;        // Spike 最少持续 K 线数
-input double   InpReversalClosePos   = 0.65;     // 反转棒收盘位置 (在强势 65% 区域)
-input bool     InpRequireSecondEntry = true;     // 强趋势反转要求"第二入场" (Al Brooks: 80%第一次失败)
-input int      InpSecondEntryLookback= 10;       // 第二入场：回看 K 线数（检测第一次失败）
-
-input group "=== Context Bypass 应急入场 ==="
-input bool     InpEnableSpikeMarket = true;      // 启用 Spike Market Entry
-input bool     InpEnableEmergencySpike = true;   // 启用 Emergency Spike（极值棒下一根开盘市价）
-input double   InpEmergencySpikeATRMult = 3.0;  // 极值棒实体最小倍数 (×ATR)
-input double   InpEmergencySpikeClosePct= 0.10;  // 极强收盘：收盘在极端的比例 (10%)
-input bool     InpEnableMicroChH1   = true;      // 启用 Micro Channel H1
-input int      InpGapCountThreshold = 3;         // Micro Channel H1 GapCount 阈值
-input int      InpHTFBypassGapCount = 5;         // HTF过滤失效的 GapCount 阈值
-
-input group "=== 20 Gap Bar 法则 (过度延伸保护) ==="
-input bool     InpEnable20GapRule   = true;      // 启用 20 Gap Bar 法则
-input int      InpGapBarThreshold   = 20;        // Gap Bar 阈值（过度延伸警戒线）
-input bool     InpBlockFirstPullback= true;      // 屏蔽第一次回测入场 (H1/L1)
-input int      InpConsolidationBars = 5;         // 恢复条件：横盘整理最少 K 线数
-input double   InpConsolidationRange= 1.5;       // 恢复条件：整理区间 ≤ X × ATR
-
-input group "=== HTF 过滤 ==="
-input ENUM_TIMEFRAMES InpHTFTimeframe = PERIOD_H1; // HTF 周期
-input int      InpHTFEMAPeriod      = 20;        // HTF EMA 周期
-input bool     InpEnableHTFFilter   = true;      // 启用 HTF 过滤
+input group "=== 信号开关 ==="
+input bool     InpEnableSpike       = true;
+input bool     InpEnableH2L2        = true;
+input bool     InpEnableWedge       = true;
+input bool     InpEnableClimax      = true;
+input bool     InpEnableMTR         = true;
+input bool     InpEnableFailedBO    = true;
+input bool     InpEnableDTDB        = true;   // Double Top/Bottom
+input bool     InpEnableTrendBar    = true;   // 趋势K线入场
+input bool     InpEnableRevBar      = true;   // 反转K线入场
+input bool     InpEnableIIPattern   = true;   // ii/iii连续内包线
+input bool     InpEnableOutsideBar  = true;   // 外包线反转
+input bool     InpEnableMeasuredMove= true;   // 等距运动
+input bool     InpEnableTRBreakout  = true;   // TR突破
+input bool     InpEnableBOPullback  = true;   // 突破回调
+input bool     InpEnableGapBar      = true;   // 缺口K线
 
 input group "=== 风险管理 ==="
-input double   InpRiskRewardRatio   = 2.0;       // 风险回报比
-input double   InpTP1Multiplier     = 0.8;       // TP1 基础倍数 (ATR 参考)
-input double   InpTP2RiskMultiple   = 2.0;       // TP2 风险倍数
-input double   InpTP1ClosePercent   = 50.0;      // TP1 平仓比例 (%)
-input double   InpMaxStopATRMult    = 3.0;       // 最大止损 ATR 倍数
+input double   InpTP1ClosePercent   = 50.0;  // Scalp仓位占比(TP1=1:1),Runner占剩余
+input double   InpMaxStopATRMult   = 3.0;    // 最大止损ATR倍数
+input int      InpMaxSlippage       = 10;     // 最大滑点(点数),用于SetDeviationInPoints
 
-input group "=== 混合止损机制 (Hybrid Stop) ==="
-input bool     InpEnableHardStop    = true;      // 启用硬止损（发送到服务器）
-input double   InpHardStopBufferMult = 1.5;      // 硬止损放宽倍数（灾难保护线）
-input bool     InpEnableSoftStop    = true;      // 启用软止损（收盘价逻辑止损）
+input group "=== 高级设置 ==="
+input bool     InpUseSignalBarSLInStrongTrend = true;  // 强趋势下取信号K线止损与结构止损的更紧者
+input int      InpMinStopsLevelPoints = 30;   // 最小止步点数兜底(经纪商STOPS_LEVEL为0或过小时用此值,防invalid stops)
+input bool     InpEnableHTFFilter   = true;
+input bool     InpEnableWeekendFilter = true;  // 周末/周五尾盘过滤
+input int      InpFridayCloseHour   = 22;     // 周五GMT≥此值禁止开新仓(22=收盘前约2h),0=仅六日
+input int      InpMondayOpenHour    = 0;      // 周日GMT此点前禁止开新仓,0=周日全天禁
+input double   InpFridayMinProfitR  = 1.5;   // 过周末门槛: 利润≥此倍数R且强趋势才保留,否则平
+input double   InpMondayGapResetATR = 0.5;   // 周一跳空超此ATR倍数则重置H/L计数,0=不重置
+input bool     InpEnableVerboseLog  = false;
+input bool     InpDebugMode         = false;  // 为 true 时输出 Print 日志；回测时保持 false 可显著提速
 
-input group "=== 黄金专用设置 (XAUUSD) ==="
-input bool     InpEnableSpreadFilter = true;     // 启用点差过滤
-input double   InpMaxSpreadMult      = 2.0;      // 最大点差倍数（相对平均）
-input int      InpSpreadLookback     = 20;       // 点差回看周期
-input bool     InpEnableSessionWeight = true;    // 启用时段权重
-input int      InpUSSessionStart     = 14;       // 美盘开始时间 (GMT)
-input int      InpUSSessionEnd       = 22;       // 美盘结束时间 (GMT)
-input int      InpAsiaSessionStart   = 0;        // 亚盘开始时间 (GMT)
-input int      InpAsiaSessionEnd     = 8;        // 亚盘结束时间 (GMT)
+input group "=== 止损与保本细化 ==="
+input bool     InpTrailStopOnNewBarOnly = true;  // 移动止损仅在新K线收盘后评估(减少改单次数)
+input int      InpSoftStopConfirmMode   = 0;     // 软止损确认: 0=收盘破 1=实体破 2=连续N根收破
+input int      InpSoftStopConfirmBars   = 2;     // 连续收破根数(仅当确认模式=2时有效)
+input double  InpBreakevenATRMult      = 0.1;   // 保本距离ATR倍数(0=用下方固定点数)
+input int      InpBreakevenPoints       = 5;     // 保本固定点数(当ATR倍数=0时用)
 
-input group "=== 订单类型设置 ==="
-input bool     InpUseLimitOrders    = true;      // H2/L2使用限价单
-input double   InpLimitOrderOffset  = 0.0;       // 限价单偏移（点）
+//+------------------------------------------------------------------+
+//| 内部常量                                                          |
+//+------------------------------------------------------------------+
+// 方向中性形态计算: 1=多 -1=空，用 (high-low)*direction 等统一逻辑
+#define DIR_LONG   1
+#define DIR_SHORT -1
+
+const double   InpMinBodyRatio       = 0.50;
+const double   InpClosePositionPct   = 0.25;
+const int      InpLookbackPeriod     = 20;
+const double   InpStrongTrendScore   = 0.50;
+const int      InpSignalCooldown     = 3;
+
+// Spike 参数
+const int      InpMinSpikeBars       = 3;    // Brooks: Spike至少3根连续趋势K线
+const double   InpSpikeOverlapMax    = 0.30; // Spike K线之间最大重叠比例
+
+// Climax 反转
+const double   InpSpikeClimaxATRMult = 3.0;
+const bool     InpRequireSecondEntry = true;
+const int      InpSecondEntryLookback= 10;
+
+// 20 Gap Bar 法则
+const bool     InpEnable20GapRule    = true;
+const int      InpGapBarThreshold    = 20;
+const bool     InpBlockFirstPullback = true;
+const int      InpConsolidationBars  = 5;
+const double   InpConsolidationRange = 1.5;
+
+// HTF 过滤
+const ENUM_TIMEFRAMES InpHTFTimeframe = PERIOD_H1;
+const int      InpHTFEMAPeriod       = 20;
+
+// 混合止损
+const bool     InpEnableHardStop     = true;
+const double   InpHardStopBufferMult = 1.5;
+const bool     InpEnableSoftStop     = true;
+
+// 点差过滤
+const bool     InpEnableSpreadFilter  = true;
+const double   InpMaxSpreadMult       = 2.0;
+const int      InpSpreadLookback      = 20;
+
+// 时段 (周末/周五尾盘过滤用)
+const int      InpGMTOffset           = 0;
+
+// Stop Order入场 - Brooks: 所有入场用Stop Order确认方向
+const bool     InpUseStopOrders      = true;
+const double   InpStopOrderOffset    = 0.0;
+
+// Barb Wire 参数 - Brooks: 连续小K线/doji区域,避免交易
+const bool     InpEnableBarbWireFilter = true;
+const int      InpBarbWireMinBars    = 3;     // 至少3根小K线构成Barb Wire
+const double   InpBarbWireBodyRatio  = 0.35;  // 小K线实体占比阈值
+const double   InpBarbWireRangeRatio = 0.5;   // 小K线range相对ATR的阈值
+
+// Measuring Gap 参数 - Brooks: 突破缺口,趋势中点标志
+const bool     InpEnableMeasuringGap = true;
+const double   InpMeasuringGapMinSize = 0.3;  // 最小缺口大小(ATR倍数)
+
+// Breakout Mode 参数 - Brooks: 突破后特殊交易模式
+const bool     InpEnableBreakoutMode = true;
+const int      InpBreakoutModeBars   = 5;     // 突破模式持续K线数
+const double   InpBreakoutModeATRMult = 1.5;  // 突破K线最小range(ATR倍数)
+
+// ATR 动态阈值 - 替代固定百分比,适配 XAUUSD/EURUSD 等不同价位品种
+const double   InpNearTrendlineATRMult = 0.2;  // 靠近趋势线/第三极值ATR倍数
+const double   InpMinBufferATRMult     = 0.2;  // 最小缓冲ATR倍数(替代entryPrice*0.002)
+
+// TTR (Tight Trading Range) - Brooks: 紧凑区间观望,避免反复吃耳光
+const double   InpTTROverlapThreshold = 0.40;  // 重叠度阈值: 总范围/各棒range之和<此值视为TTR
+const double   InpTTRRangeATRMult     = 2.5;   // TTR时区间宽度上限(ATR倍数)
+
+// Swing Point / H-L Count - Brooks Push 定义
+const int      InpSwingConfirmDepth   = 3;    // 确认波段点所需前后K线数(depth=1为临时)
+const double   InpHLResetNewExtremeATR = 0.5;  // 显著新极值超越前波段ATR倍数时重置计数
+const double   InpHLMinPullbackATR     = 0.2;  // 最小回调/反弹深度ATR倍数(Brooks Push)
 
 //+------------------------------------------------------------------+
 //| Global Variables                                                  |
+//| 逻辑/状态变量均在 g_* 中，无独立 debug 全局变量；静态配置已用 const           |
 //+------------------------------------------------------------------+
 CTrade         trade;
 CPositionInfo  positionInfo;
 
-// 技术指标句柄
+// 指标句柄：仅此三处，OnInit 创建 / GetMarketData 使用 / OnDeinit 释放，无未引用句柄；无 SendMail/SendNotification
 int handleEMA;
 int handleATR;
-int handleHTFEMA;          // HTF EMA 句柄
+int handleHTFEMA;
 
-// HTF 数据
 double        g_HTFEMABuffer[];
-string        g_HTFTrendDir = "";    // "up" / "down" / ""
+string        g_HTFTrendDir = "";
 
-// 市场状态
 ENUM_MARKET_STATE   g_MarketState      = MARKET_STATE_CHANNEL;
 ENUM_MARKET_CYCLE   g_MarketCycle      = MARKET_CYCLE_CHANNEL;
-string              g_TrendDirection   = "";     // "up" / "down" / ""
+ENUM_ALWAYS_IN      g_AlwaysIn         = AI_NEUTRAL;
+string              g_TrendDirection   = "";
 double              g_TrendStrength    = 0.0;
-double              g_TightChannelScore = 0.0;
-string              g_TightChannelDir  = "";     // "up" / "down" / ""
+string              g_TightChannelDir  = "";
 
-// H2 状态机变量
-ENUM_H2_STATE g_H2State              = H2_WAITING_FOR_PULLBACK;
-double        g_H2_TrendHigh         = 0.0;
-double        g_H2_PullbackStartLow  = 0.0;
-double        g_H2_H1High            = 0.0;
-int           g_H2_H1BarIndex        = -1;
-bool          g_H2_IsStrongTrend     = false;
+// Swing Point 追踪 - Brooks H/L计数基于swing point而非EMA
+struct SwingPoint
+{
+    double price;
+    int    barIndex;
+    bool   isHigh;  // true=swing high, false=swing low
+};
+SwingPoint g_SwingPoints[];
+int        g_SwingPointCount = 0;
+#define MAX_SWING_POINTS 40
 
-// L2 状态机变量
-ENUM_L2_STATE g_L2State              = L2_WAITING_FOR_BOUNCE;
-double        g_L2_TrendLow          = 0.0;
-double        g_L2_BounceStartHigh   = 0.0;
-double        g_L2_L1Low             = 0.0;
-int           g_L2_L1BarIndex        = -1;
-bool          g_L2_IsStrongTrend     = false;
+// 缓存常用swing point值(性能优化)
+double     g_CachedSH1 = 0;  // 最近第1个swing high
+double     g_CachedSH2 = 0;  // 最近第2个swing high
+double     g_CachedSL1 = 0;  // 最近第1个swing low
+double     g_CachedSL2 = 0;  // 最近第2个swing low
 
-// 信号冷却期管理
+// 临时高低点 - 未达depth确认前的潜在波段点,用于止损以降低延迟
+double     g_TempSwingHigh = 0;
+double     g_TempSwingLow  = 0;
+int        g_TempSwingHighBar = -1;
+int        g_TempSwingLowBar  = -1;
+
+// M5 波段点 - 用于 Runner 结构跟踪(仅当新 Higher Low 时上移止损)
+#define MAX_M5_SWINGS 12
+double     g_M5SwingLows[MAX_M5_SWINGS];
+double     g_M5SwingHighs[MAX_M5_SWINGS];
+int        g_M5SwingLowBars[MAX_M5_SWINGS];
+int        g_M5SwingHighBars[MAX_M5_SWINGS];
+int        g_M5SwingLowCount  = 0;
+int        g_M5SwingHighCount = 0;
+
+// H计数 (基于swing point)
+int    g_H_Count           = 0;  // 当前H计数(H1,H2...)
+double g_H_LastSwingHigh   = 0;  // 上一个swing high
+double g_H_LastPullbackLow = 0;  // 上一个回调低点
+int    g_H_LastPBLowBar    = -1;
+
+// L计数 (基于swing point)
+int    g_L_Count           = 0;
+double g_L_LastSwingLow    = 0;
+double g_L_LastBounceHigh  = 0;
+int    g_L_LastBounceBar   = -1;
+
+// 信号冷却期
 datetime      g_LastBuySignalTime    = 0;
 datetime      g_LastSellSignalTime   = 0;
 int           g_LastBuySignalBar     = -999;
 int           g_LastSellSignalBar    = -999;
+double        g_LastBuyEntryPrice    = 0;
+double        g_LastSellEntryPrice   = 0;
 
 // Tight Channel 追踪
 int           g_TightChannelBars     = 0;
 double        g_TightChannelExtreme  = 0.0;
 int           g_LastTightChannelEndBar = -1;
 
-// GapCount 追踪（连续远离EMA的K线数）
-int           g_GapCount             = 0;
-double        g_GapCountExtreme      = 0.0;   // 追踪方向的极值
+// Trading Range 边界
+double        g_TR_High              = 0;
+double        g_TR_Low               = 0;
 
-//+------------------------------------------------------------------+
-//| 20 Gap Bar 法则 (Al Brooks: 过度延伸保护)                          |
-//| 当 GapCount > 20 时，趋势已过度延伸，第一次回测 EMA 通常是陷阱       |
-//+------------------------------------------------------------------+
-bool          g_IsOverextended       = false;  // 是否过度延伸
-bool          g_FirstPullbackBlocked = false;  // 第一次回测是否被屏蔽
-string        g_OverextendDirection  = "";     // 过度延伸方向 "up" / "down"
-datetime      g_OverextendStartTime  = 0;      // 过度延伸开始时间
-bool          g_WaitingForRecovery   = false;  // 等待恢复（横盘整理/双底双顶）
-int           g_ConsolidationCount   = 0;      // 横盘整理计数
-double        g_PullbackExtreme      = 0;      // 第一次回测的极值（用于双底双顶检测）
-bool          g_FirstPullbackComplete= false;  // 第一次回测是否已完成
+// GapCount
+int           g_GapCount             = 0;
+double        g_GapCountExtreme      = 0.0;
+
+// 20 Gap Bar 法则
+bool          g_IsOverextended       = false;
+bool          g_FirstPullbackBlocked = false;
+string        g_OverextendDirection  = "";
+datetime      g_OverextendStartTime  = 0;
+bool          g_WaitingForRecovery   = false;
+int           g_ConsolidationCount   = 0;
+double        g_PullbackExtreme      = 0;
+bool          g_FirstPullbackComplete= false;
 
 // 状态惯性
 ENUM_MARKET_STATE g_CurrentLockedState = MARKET_STATE_CHANNEL;
 int           g_StateHoldBars        = 0;
-int           g_LastProcessedBar     = -1;
 
-// K线计数器（用于日志）
 int           g_BarCount             = 0;
+datetime      g_LastBarTime          = 0;   // NewBar 判断用，避免 Tick 内重复计算与信号闪烁
+datetime      g_LastRefreshRealTimeATR = 0;  // RefreshRealTimeATR 节流，避免 Tick 内频繁 CopyBuffer
 
-// 点差追踪（黄金保护）
-double        g_SpreadHistory[];      // 点差历史
+// 点差追踪
+double        g_SpreadHistory[];
 int           g_SpreadIndex          = 0;
 double        g_AverageSpread        = 0;
 double        g_CurrentSpread        = 0;
 bool          g_SpreadFilterActive   = false;
+double        g_SpreadRunningSum     = 0;
+int           g_SpreadValidCount     = 0;
 
 // 时段检测
-string        g_CurrentSession       = "";    // "US" / "Asia" / "EU" / "Other"
-bool          g_IsSpikePreferred     = false; // Spike 信号优先
-bool          g_IsRangePreferred     = false; // TradingRange 信号优先
+bool          g_IsWeekend             = false;  // 六日或周五尾盘: 禁止开新仓
+bool          g_IsFridayClose        = false;  // 周五尾盘: 执行持仓管理
+datetime      g_MondayGapResetDone    = 0;      // 本周一已做跳空重置的日期(避免重复)
+
+// Barb Wire 追踪 - Brooks: 连续doji/小K线区域
+bool          g_InBarbWire           = false;
+int           g_BarbWireBarCount     = 0;
+double        g_BarbWireHigh         = 0;
+double        g_BarbWireLow          = 0;
+
+// Measuring Gap 追踪 - Brooks: 突破缺口标记趋势中点
+struct MeasuringGapInfo
+{
+    double gapHigh;
+    double gapLow;
+    string direction;  // "up" or "down"
+    int    barIndex;
+    bool   isValid;
+};
+MeasuringGapInfo g_MeasuringGap;
+bool          g_HasMeasuringGap      = false;
+
+// Breakout Mode 追踪 - Brooks: 突破后特殊交易模式
+bool          g_InBreakoutMode       = false;
+string        g_BreakoutModeDir      = "";
+int           g_BreakoutModeBarCount = 0;
+double        g_BreakoutModeEntry    = 0;
+double        g_BreakoutModeExtreme  = 0;
 
 // 品种信息
-int           g_SymbolDigits         = 0;     // 小数位数
-double        g_SymbolPoint          = 0;     // 最小价格单位
-double        g_SymbolTickSize       = 0;     // Tick 大小
-double        g_SymbolTickValue      = 0;     // Tick 价值
+int           g_SymbolDigits         = 0;
+double        g_SymbolPoint          = 0;
+double        g_SymbolTickSize       = 0;
 
-//=================================================================
-// 混合止损机制：存储原始技术止损位
-// 硬止损是放宽后的灾难保护线，软止损检查原始技术位
-//=================================================================
+// 混合止损
 struct SoftStopInfo
 {
-    ulong  ticket;           // 订单号
-    double technicalSL;      // 原始技术止损位
-    string side;             // "buy" or "sell"
+    ulong  ticket;
+    double technicalSL;
+    string side;
+    double tp1Price;   // Runner用: TP1触及后移保本; 0=Scalp/不启用
 };
+SoftStopInfo g_SoftStopList[];
+int          g_SoftStopCount = 0;
 
-SoftStopInfo g_SoftStopList[];     // 软止损列表
-int          g_SoftStopCount = 0;  // 当前列表数量
-
-// TP1 价格追踪（动态止盈触发用）
+// TP1 追踪
 struct TP1Info
 {
     ulong  ticket;
     double tp1Price;
-    string side;   // "buy" / "sell"
+    string side;
 };
 TP1Info g_TP1List[];
 int     g_TP1Count = 0;
 #define MAX_TP1_RECORDS 32
 
-//+------------------------------------------------------------------+
-//| 反转尝试跟踪 (Al Brooks: 强趋势中第一次反转80%失败)                  |
-//+------------------------------------------------------------------+
+// 反转尝试跟踪
 struct ReversalAttempt
 {
-    datetime time;           // 反转尝试时间
-    double   price;          // 反转尝试的极值价格
-    string   direction;      // "bullish" or "bearish"
-    bool     failed;         // 是否已失败（价格突破了反转尝试的极值）
+    datetime time;
+    double   price;
+    string   direction;
+    bool     failed;
 };
+ReversalAttempt g_LastReversalAttempt;
+bool            g_HasPendingReversal = false;
+int             g_ReversalAttemptCount = 0;
 
-ReversalAttempt g_LastReversalAttempt;   // 最近一次反转尝试
-bool            g_HasPendingReversal = false;  // 是否有待确认的反转尝试
-int             g_ReversalAttemptCount = 0;    // 反转尝试次数（同方向）
+// 趋势线追踪 (MTR用)
+double        g_TrendLineStart     = 0;
+double        g_TrendLineEnd       = 0;
+int           g_TrendLineStartBar  = 0;
+int           g_TrendLineEndBar    = 0;
+bool          g_TrendLineBroken    = false;
+double        g_TrendLineBreakPrice= 0;
+
+// Breakout Pullback追踪
+bool          g_RecentBreakout     = false;
+string        g_BreakoutDir        = "";
+double        g_BreakoutLevel      = 0;
+int           g_BreakoutBarAge     = 0;
 
 // 缓存数组
 double        g_EMABuffer[];
@@ -320,30 +419,50 @@ double        g_CloseBuffer[];
 double        g_OpenBuffer[];
 double        g_HighBuffer[];
 double        g_LowBuffer[];
-long          g_VolumeBuffer[];  // CopyTickVolume 需要 long 类型
+long          g_VolumeBuffer[];
+int           g_BufferSize = 0;
+double        g_AtrValue   = 0;   // 实时波动率参考(异常波幅时刷新,供 CheckSoftStopExit 防扫单)
+
+// STOP单待处理信息（orderComment 两笔单时为 Brooks_Scalp / Brooks_Runner）
+struct PendingStopOrderInfo
+{
+    ulong  orderTicket;
+    double technicalSL;
+    double tp1Price;
+    string side;
+    string signalName;
+    string orderComment;
+};
+PendingStopOrderInfo g_PendingStopOrders[];
+int g_PendingStopOrderCount = 0;
+#define MAX_PENDING_STOP_ORDERS 16
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                    |
 //+------------------------------------------------------------------+
 int OnInit()
 {
-    // 设置交易参数
     trade.SetExpertMagicNumber(InpMagicNumber);
-    trade.SetDeviationInPoints(10);
-    trade.SetTypeFilling(ORDER_FILLING_IOC);
+    trade.SetDeviationInPoints((ulong)MathMax(1, InpMaxSlippage));
     
-    // 创建指标句柄
+    long fillMode = SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE);
+    if((fillMode & SYMBOL_FILLING_IOC) != 0)
+        trade.SetTypeFilling(ORDER_FILLING_IOC);
+    else if((fillMode & SYMBOL_FILLING_FOK) != 0)
+        trade.SetTypeFilling(ORDER_FILLING_FOK);
+    else
+        trade.SetTypeFilling(ORDER_FILLING_RETURN);
+    
     handleEMA = iMA(_Symbol, PERIOD_CURRENT, InpEMAPeriod, 0, MODE_EMA, PRICE_CLOSE);
     handleATR = iATR(_Symbol, PERIOD_CURRENT, InpATRPeriod);
     handleHTFEMA = iMA(_Symbol, InpHTFTimeframe, InpHTFEMAPeriod, 0, MODE_EMA, PRICE_CLOSE);
     
     if(handleEMA == INVALID_HANDLE || handleATR == INVALID_HANDLE || handleHTFEMA == INVALID_HANDLE)
     {
-        Print("❌ 指标初始化失败！");
+        if(InpDebugMode) Print("指标初始化失败");
         return INIT_FAILED;
     }
     
-    // 设置数组为序列
     ArraySetAsSeries(g_EMABuffer, true);
     ArraySetAsSeries(g_ATRBuffer, true);
     ArraySetAsSeries(g_HTFEMABuffer, true);
@@ -353,42 +472,46 @@ int OnInit()
     ArraySetAsSeries(g_LowBuffer, true);
     ArraySetAsSeries(g_VolumeBuffer, true);
     
-    //=================================================================
-    // 初始化品种信息（黄金适配）
-    //=================================================================
-    g_SymbolDigits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
-    g_SymbolPoint = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+    g_SymbolDigits   = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+    g_SymbolPoint    = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
     g_SymbolTickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
-    g_SymbolTickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
     
-    Print("📊 品种信息: ", _Symbol);
-    Print("   小数位数: ", g_SymbolDigits);
-    Print("   Point: ", DoubleToString(g_SymbolPoint, g_SymbolDigits + 2));
-    Print("   TickSize: ", DoubleToString(g_SymbolTickSize, g_SymbolDigits + 2));
-    Print("   TickValue: ", DoubleToString(g_SymbolTickValue, 4));
-    
-    //=================================================================
-    // 初始化点差历史数组
-    //=================================================================
     ArrayResize(g_SpreadHistory, InpSpreadLookback);
     ArrayInitialize(g_SpreadHistory, 0);
-    g_SpreadIndex = 0;
-    g_AverageSpread = 0;
+    ArrayResize(g_SwingPoints, MAX_SWING_POINTS);
     
-    // 初始化状态机
-    ResetH2StateMachine();
-    ResetL2StateMachine();
+    // 初始化新增Brooks概念的全局变量
+    g_InBarbWire = false;
+    g_BarbWireBarCount = 0;
+    g_BarbWireHigh = 0;
+    g_BarbWireLow = 0;
     
-    // 检测是否为黄金品种
-    bool isGold = (StringFind(_Symbol, "XAU") >= 0 || StringFind(_Symbol, "GOLD") >= 0);
+    g_HasMeasuringGap = false;
+    g_MeasuringGap.gapHigh = 0;
+    g_MeasuringGap.gapLow = 0;
+    g_MeasuringGap.direction = "";
+    g_MeasuringGap.barIndex = 0;
+    g_MeasuringGap.isValid = false;
     
-    Print("✅ BrooksQuant EA 初始化成功");
-    Print("   品种: ", _Symbol, isGold ? " (黄金模式)" : "");
-    Print("   周期: ", EnumToString(Period()));
-    Print("   EMA: ", InpEMAPeriod, " | ATR: ", InpATRPeriod);
-    Print("   点差过滤: ", InpEnableSpreadFilter ? "启用" : "禁用");
-    Print("   时段权重: ", InpEnableSessionWeight ? "启用" : "禁用");
+    g_InBreakoutMode = false;
+    g_BreakoutModeDir = "";
+    g_BreakoutModeBarCount = 0;
+    g_BreakoutModeEntry = 0;
+    g_BreakoutModeExtreme = 0;
     
+    // 初始化缓存的swing point值及临时高低点
+    g_CachedSH1 = 0; g_CachedSH2 = 0;
+    g_CachedSL1 = 0; g_CachedSL2 = 0;
+    g_TempSwingHigh = 0; g_TempSwingLow = 0;
+    g_TempSwingHighBar = -1; g_TempSwingLowBar = -1;
+    
+    // 检查本 EA 已有仓位（Scalp + Runner 双 Magic）
+    int existingCount = CountPositions();
+    if(existingCount > 0 && InpDebugMode)
+        Print("已有仓位: ", existingCount, " (Magic ", InpMagicNumber, " Scalp / ", InpMagicNumber + 1, " Runner)");
+    
+    Print("AlBrooks_v4 启动 | 当前时间:", TimeToString(TimeCurrent(), TIME_DATE|TIME_MINUTES|TIME_SECONDS), " | 编译:", TimeToString(__DATETIME__, TIME_DATE|TIME_MINUTES), " | ", _Symbol, " ", EnumToString(Period()));
+    if(InpDebugMode) Print("AlBrooks_v4 初始化成功 | Magic ", InpMagicNumber);
     return INIT_SUCCEEDED;
 }
 
@@ -397,1001 +520,2097 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
-    // 释放指标句柄
-    if(handleEMA != INVALID_HANDLE) IndicatorRelease(handleEMA);
-    if(handleATR != INVALID_HANDLE) IndicatorRelease(handleATR);
+    if(handleEMA != INVALID_HANDLE)    IndicatorRelease(handleEMA);
+    if(handleATR != INVALID_HANDLE)    IndicatorRelease(handleATR);
     if(handleHTFEMA != INVALID_HANDLE) IndicatorRelease(handleHTFEMA);
-    
-    // 删除图表对象
     ObjectsDeleteAll(0, "BQ_");
-    
-    Print("BrooksQuant EA 已停止");
 }
 
 //+------------------------------------------------------------------+
-//| Expert tick function                                              |
-//| 仅在新 K 线生成时执行核心逻辑扫描                                   |
+//| NewBar 判断 - 仅在新 K 线收盘后执行重逻辑，避免 Tick 内重复计算与信号闪烁   |
 //+------------------------------------------------------------------+
-void OnTick()
+bool IsNewBar()
 {
-    //=================================================================
-    // 新 K 线检测 - 仅在新 K 线生成时执行核心逻辑
-    //=================================================================
-    static datetime lastBarTime = 0;
-    datetime currentBarTime = iTime(_Symbol, PERIOD_CURRENT, 0);
-    
-    if(currentBarTime == lastBarTime)
-        return; // 不是新K线，跳过核心逻辑
-    
-    lastBarTime = currentBarTime;
-    g_BarCount++; // 递增 K 线计数器
-    
-    //=================================================================
-    // 获取市场数据
-    //=================================================================
-    if(!GetMarketData())
-        return;
-    
-    double ema = g_EMABuffer[1];  // 使用已完成的K线
-    double atr = g_ATRBuffer[1];
-    
-    if(ema == 0 || atr == 0)
-        return;
-    
-    //=================================================================
-    // 【混合止损】检查软止损（收盘价逻辑止损）
-    // 在新 K 线生成时立即检查，优先于其他逻辑
-    //=================================================================
-    CheckSoftStopExit();
-    
-    //=================================================================
-    // 点差检测与更新（黄金保护）
-    //=================================================================
-    UpdateSpreadTracking();
-    
-    //=================================================================
-    // 时段检测（黄金时段权重）
-    //=================================================================
-    UpdateSessionDetection();
-    
-    //=================================================================
-    // 市场状态检测
-    //=================================================================
-    DetectMarketState(ema, atr);
-    g_MarketCycle = GetMarketCycle(g_MarketState);
-    int gapCount = CalculateGapCount(ema);
-    
-    // 20 Gap Bar 法则检测（Al Brooks: 过度延伸后第一次回测是陷阱）
-    Update20GapBarRule(ema, atr);
-    
-    // 更新反转尝试跟踪（Al Brooks: 强趋势第一次反转 80% 失败）
-    UpdateReversalAttemptTracking();
-    
-    //=================================================================
-    // 构建上下文信息（用于日志）
-    //=================================================================
-    string contextBypassInfo = "";
-    bool isSpikeBypass = (g_MarketCycle == MARKET_CYCLE_SPIKE && InpEnableSpikeMarket);
-    bool isMicroChBypass = (g_MarketState == MARKET_STATE_TIGHT_CHANNEL && 
-                            gapCount >= InpGapCountThreshold && InpEnableMicroChH1);
-    bool isHTFBypass = (g_MarketState == MARKET_STATE_STRONG_TREND && 
-                        gapCount >= InpHTFBypassGapCount);
-    
-    // 点差过滤检查（Spike_Market_Entry）
-    bool spreadBlocked = false;
-    if(isSpikeBypass && InpEnableSpreadFilter && g_SpreadFilterActive)
+    datetime currTime = iTime(_Symbol, PERIOD_CURRENT, 0);
+    if(currTime != g_LastBarTime)
     {
-        spreadBlocked = true;
-        isSpikeBypass = false; // 禁用 Spike_Market_Entry
-        contextBypassInfo = "⛔ Spike被点差过滤阻止(当前:" + 
-                           DoubleToString(g_CurrentSpread, 1) + " > 平均×" + 
-                           DoubleToString(InpMaxSpreadMult, 1) + ")";
+        g_LastBarTime = currTime;
+        return true;
     }
-    else if(isSpikeBypass)
-    {
-        contextBypassInfo = "🚀 Spike_Market_Entry激活";
-        // 时段权重调整
-        if(InpEnableSessionWeight && g_IsSpikePreferred)
-            contextBypassInfo += "(美盘加权)";
-    }
-    else if(isMicroChBypass)
-    {
-        contextBypassInfo = "🚀 Micro_Channel_H1激活(Gap=" + IntegerToString(gapCount) + ")";
-    }
-    else if(isHTFBypass)
-    {
-        contextBypassInfo = "⚡ HTF过滤失效(Gap=" + IntegerToString(gapCount) + ")";
-    }
-    
-    // 时段权重信息
-    if(InpEnableSessionWeight && g_IsRangePreferred && 
-       (g_MarketState == MARKET_STATE_TRADING_RANGE))
-    {
-        contextBypassInfo += " | 📊 亚盘区间模式";
-    }
-    
-    //=================================================================
-    // 输出 K 线日志（与 Python 格式一致）
-    //=================================================================
-    PrintBarLog(gapCount, contextBypassInfo);
-    
-    //=================================================================
-    // 信号检测（应用时段权重调整优先级）
-    //=================================================================
-    ENUM_SIGNAL_TYPE signal = SIGNAL_NONE;
-    double stopLoss = 0;
-    double baseHeight = 0;
-    
-    // 美盘时段：优先检测 Spike 信号
-    if(InpEnableSessionWeight && g_IsSpikePreferred)
-    {
-        // 优先级 0: Emergency_Spike（极值棒 >3×ATR + 极强收盘，下一根开盘市价）
-        if(signal == SIGNAL_NONE && InpEnableEmergencySpike)
-        {
-            signal = CheckEmergencySpike(ema, atr, stopLoss, baseHeight);
-        }
-        // 优先级 1A: SPIKE 周期 - Spike_Market_Entry（应急入场）
-        if(signal == SIGNAL_NONE && isSpikeBypass && !spreadBlocked)
-        {
-            signal = CheckSpikeMarketEntry(ema, atr, stopLoss, baseHeight);
-        }
-        
-        // 优先级 2: 标准 Spike
-        if(signal == SIGNAL_NONE && InpEnableSpike && g_MarketCycle != MARKET_CYCLE_SPIKE)
-        {
-            signal = CheckSpike(ema, atr, stopLoss, baseHeight);
-        }
-        
-        // 优先级 1B: TIGHT_CHANNEL - Micro_Channel_H1
-        if(signal == SIGNAL_NONE && isMicroChBypass)
-        {
-            signal = CheckMicroChannelH1(ema, atr, gapCount, stopLoss, baseHeight);
-        }
-        
-        // 优先级 3: H2/L2 状态机
-        if(signal == SIGNAL_NONE && InpEnableH2L2 && g_MarketCycle != MARKET_CYCLE_SPIKE)
-        {
-            signal = CheckH2L2WithHTF(ema, atr, isHTFBypass, stopLoss, baseHeight);
-        }
-    }
-    // 亚盘时段：优先检测 TradingRange 和 FailedBreakout 信号
-    else if(InpEnableSessionWeight && g_IsRangePreferred)
-    {
-        // 优先：Failed Breakout 检测
-        if(signal == SIGNAL_NONE && InpEnableFailedBO && g_MarketState == MARKET_STATE_TRADING_RANGE)
-            signal = CheckFailedBreakout(ema, atr, stopLoss, baseHeight);
-        
-        // 优先：Wedge（区间内楔形）
-        bool allowReversal = (g_MarketState == MARKET_STATE_TRADING_RANGE || 
-                              g_MarketState == MARKET_STATE_FINAL_FLAG);
-        if(signal == SIGNAL_NONE && InpEnableWedge && allowReversal)
-            signal = CheckWedge(ema, atr, stopLoss, baseHeight);
-        
-        // H2/L2 状态机
-        if(signal == SIGNAL_NONE && InpEnableH2L2 && g_MarketCycle != MARKET_CYCLE_SPIKE)
-        {
-            signal = CheckH2L2WithHTF(ema, atr, isHTFBypass, stopLoss, baseHeight);
-        }
-        
-        // Emergency_Spike（极值棒）
-        if(signal == SIGNAL_NONE && InpEnableEmergencySpike)
-        {
-            signal = CheckEmergencySpike(ema, atr, stopLoss, baseHeight);
-        }
-        // 然后是 Spike 相关
-        if(signal == SIGNAL_NONE && isSpikeBypass && !spreadBlocked)
-        {
-            signal = CheckSpikeMarketEntry(ema, atr, stopLoss, baseHeight);
-        }
-        
-        if(signal == SIGNAL_NONE && InpEnableSpike && g_MarketCycle != MARKET_CYCLE_SPIKE)
-        {
-            signal = CheckSpike(ema, atr, stopLoss, baseHeight);
-        }
-    }
-    // 默认优先级（无时段权重或其他时段）
-    else
-    {
-        // 优先级 0: Emergency_Spike（极值棒，下一根开盘市价）
-        if(signal == SIGNAL_NONE && InpEnableEmergencySpike)
-        {
-            signal = CheckEmergencySpike(ema, atr, stopLoss, baseHeight);
-        }
-        // 优先级 1A: SPIKE 周期 - Spike_Market_Entry（应急入场）
-        if(signal == SIGNAL_NONE && isSpikeBypass && !spreadBlocked)
-        {
-            signal = CheckSpikeMarketEntry(ema, atr, stopLoss, baseHeight);
-        }
-        
-        // 优先级 1B: TIGHT_CHANNEL - Micro_Channel_H1（应急入场）
-        if(signal == SIGNAL_NONE && isMicroChBypass)
-        {
-            signal = CheckMicroChannelH1(ema, atr, gapCount, stopLoss, baseHeight);
-        }
-        
-        // 优先级 2: 标准 Spike（非 SPIKE 周期）
-        if(signal == SIGNAL_NONE && InpEnableSpike && g_MarketCycle != MARKET_CYCLE_SPIKE)
-        {
-            signal = CheckSpike(ema, atr, stopLoss, baseHeight);
-        }
-        
-        // 优先级 3: H2/L2 状态机
-        if(signal == SIGNAL_NONE && InpEnableH2L2 && g_MarketCycle != MARKET_CYCLE_SPIKE)
-        {
-            signal = CheckH2L2WithHTF(ema, atr, isHTFBypass, stopLoss, baseHeight);
-        }
-    }
-    
-    //=================================================================
-    // 反转信号
-    //=================================================================
-    bool allowReversal = (g_MarketState == MARKET_STATE_TRADING_RANGE || 
-                          g_MarketState == MARKET_STATE_FINAL_FLAG);
-    bool isInSpike = (g_MarketCycle == MARKET_CYCLE_SPIKE);
-    
-    //=================================================================
-    // Climax 反转信号
-    // Al Brooks 原则：
-    // - Spike 阶段默认屏蔽逆势（保护新手）
-    // - V 型反转是高级信号，需通过 5 道门槛才能在 Spike 触发
-    //   1. Spike 持续时间 >= InpMinSpikeBars
-    //   2. Climax 棒长度 >= InpSpikeClimaxATRMult × ATR
-    //   3. 反转棒覆盖率 >= InpReversalCoverage
-    //   4. 反转棒穿透率 >= InpReversalPenetration
-    //   5. 反转棒收盘位置在强势区域
-    //=================================================================
-    if(signal == SIGNAL_NONE && InpEnableClimax)
-    {
-        if(isInSpike)
-        {
-            // Spike V 型反转：严格模式（5 道门槛）
-            signal = CheckClimax(ema, atr, stopLoss, baseHeight, true);
-        }
-        else if(allowReversal)
-        {
-            // 正常模式：TradingRange 或 FinalFlag
-            signal = CheckClimax(ema, atr, stopLoss, baseHeight, false);
-        }
-    }
-    
-    if(signal == SIGNAL_NONE && InpEnableWedge && allowReversal)
-        signal = CheckWedge(ema, atr, stopLoss, baseHeight);
-    
-    if(signal == SIGNAL_NONE && InpEnableMTR && allowReversal)
-        signal = CheckMTR(ema, atr, stopLoss, baseHeight);
-    
-    if(signal == SIGNAL_NONE && InpEnableFailedBO && g_MarketState == MARKET_STATE_TRADING_RANGE)
-        signal = CheckFailedBreakout(ema, atr, stopLoss, baseHeight);
-    
-    if(signal == SIGNAL_NONE && g_MarketState == MARKET_STATE_FINAL_FLAG)
-        signal = CheckFinalFlag(ema, atr, stopLoss, baseHeight);
-    
-    //=================================================================
-    // 信号触发日志
-    //=================================================================
-    if(signal != SIGNAL_NONE)
-    {
-        PrintSignalLog(signal, stopLoss, atr);
-    }
-    
-    //=================================================================
-    // 处理信号
-    //=================================================================
-    if(signal != SIGNAL_NONE && stopLoss > 0)
-    {
-        ProcessSignal(signal, stopLoss, baseHeight);
-    }
-    
-    //=================================================================
-    // 仓位管理
-    //=================================================================
-    ManagePositions(ema, atr);
-}
-
-//+------------------------------------------------------------------+
-//| Update Spread Tracking (点差追踪 - 黄金保护)                       |
-//+------------------------------------------------------------------+
-void UpdateSpreadTracking()
-{
-    // 获取当前点差（以点为单位）
-    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-    g_CurrentSpread = (ask - bid) / g_SymbolPoint;
-    
-    // 更新点差历史
-    if(ArraySize(g_SpreadHistory) > 0)
-    {
-        g_SpreadHistory[g_SpreadIndex] = g_CurrentSpread;
-        g_SpreadIndex = (g_SpreadIndex + 1) % InpSpreadLookback;
-        
-        // 计算平均点差
-        double sum = 0;
-        int count = 0;
-        for(int i = 0; i < InpSpreadLookback; i++)
-        {
-            if(g_SpreadHistory[i] > 0)
-            {
-                sum += g_SpreadHistory[i];
-                count++;
-            }
-        }
-        
-        if(count > 0)
-            g_AverageSpread = sum / count;
-        else
-            g_AverageSpread = g_CurrentSpread;
-    }
-    
-    // 检查是否超过阈值
-    if(g_AverageSpread > 0 && g_CurrentSpread > g_AverageSpread * InpMaxSpreadMult)
-    {
-        if(!g_SpreadFilterActive)
-        {
-            g_SpreadFilterActive = true;
-            Print("⚠️ 点差过滤激活: 当前点差 ", DoubleToString(g_CurrentSpread, 1), 
-                  " > 平均 ", DoubleToString(g_AverageSpread, 1), 
-                  " × ", DoubleToString(InpMaxSpreadMult, 1));
-        }
-    }
-    else
-    {
-        if(g_SpreadFilterActive)
-        {
-            g_SpreadFilterActive = false;
-            Print("✅ 点差过滤解除: 当前点差 ", DoubleToString(g_CurrentSpread, 1), 
-                  " <= 平均 ", DoubleToString(g_AverageSpread, 1), 
-                  " × ", DoubleToString(InpMaxSpreadMult, 1));
-        }
-    }
-}
-
-//+------------------------------------------------------------------+
-//| Update Session Detection (时段检测 - 黄金时段权重)                  |
-//+------------------------------------------------------------------+
-void UpdateSessionDetection()
-{
-    // 获取当前 GMT 时间
-    datetime serverTime = TimeCurrent();
-    MqlDateTime dt;
-    TimeToStruct(serverTime, dt);
-    
-    // 获取 GMT 偏移（假设服务器时间为 GMT+0，可根据实际调整）
-    // 注意：不同 broker 服务器时区可能不同，需要根据实际情况调整
-    int gmtHour = dt.hour;
-    
-    // 检测时段
-    g_CurrentSession = "";
-    g_IsSpikePreferred = false;
-    g_IsRangePreferred = false;
-    
-    // 美盘时段（14:00 - 22:00 GMT）- Spike 优先
-    if(gmtHour >= InpUSSessionStart && gmtHour < InpUSSessionEnd)
-    {
-        g_CurrentSession = "US";
-        g_IsSpikePreferred = true;
-    }
-    // 亚盘时段（00:00 - 08:00 GMT）- TradingRange 优先
-    else if(gmtHour >= InpAsiaSessionStart && gmtHour < InpAsiaSessionEnd)
-    {
-        g_CurrentSession = "Asia";
-        g_IsRangePreferred = true;
-    }
-    // 欧盘时段（08:00 - 14:00 GMT）
-    else if(gmtHour >= 8 && gmtHour < 14)
-    {
-        g_CurrentSession = "EU";
-        // 欧盘可以两者兼顾
-    }
-    else
-    {
-        g_CurrentSession = "Other";
-    }
-}
-
-//+------------------------------------------------------------------+
-//| Get Current Spread in Price (获取当前点差 - 以价格为单位)           |
-//+------------------------------------------------------------------+
-double GetCurrentSpreadPrice()
-{
-    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-    return ask - bid;
-}
-
-//+------------------------------------------------------------------+
-//| Print Bar Log (输出 K 线日志 - 与 Python 格式一致)                  |
-//+------------------------------------------------------------------+
-void PrintBarLog(int gapCount, string contextBypass)
-{
-    // 获取 K 线数据
-    double close = g_CloseBuffer[1];
-    double open = g_OpenBuffer[1];
-    double high = g_HighBuffer[1];
-    double low = g_LowBuffer[1];
-    
-    // 市场状态字符串
-    string stateStr = GetMarketStateString(g_MarketState);
-    
-    // 市场周期字符串
-    string cycleStr = GetMarketCycleString(g_MarketCycle);
-    
-    // H2 状态字符串
-    string h2Str = GetH2StateString(g_H2State);
-    
-    // L2 状态字符串
-    string l2Str = GetL2StateString(g_L2State);
-    
-    // 趋势方向
-    string trendStr = g_TrendDirection == "" ? "无" : (g_TrendDirection == "up" ? "↑" : "↓");
-    
-    // K 线类型
-    string barType = "";
-    if(close > open)
-        barType = "阳";
-    else if(close < open)
-        barType = "阴";
-    else
-        barType = "十字";
-    
-    // 构建日志
-    string logLine = StringFormat(
-        "📊 K线#%d收盘 | %s | 状态:%s | 周期:%s | H2:%s | L2:%s | Gap:%d | 趋势:%s",
-        g_BarCount,
-        barType,
-        stateStr,
-        cycleStr,
-        h2Str,
-        l2Str,
-        gapCount,
-        trendStr
-    );
-    
-    // 添加 20 Gap Bar 法则状态
-    if(g_IsOverextended)
-    {
-        string gapBarStatus = "";
-        if(g_WaitingForRecovery)
-            gapBarStatus = "⛔ 20Gap(" + g_OverextendDirection + "):等待恢复";
-        else if(g_FirstPullbackComplete)
-            gapBarStatus = "✅ 20Gap:已恢复";
-        else
-            gapBarStatus = "⚠️ 20Gap(" + g_OverextendDirection + "):过度延伸";
-        
-        logLine = logLine + " | " + gapBarStatus;
-    }
-    
-    // 添加应急逻辑信息
-    if(contextBypass != "")
-        logLine = logLine + " | " + contextBypass;
-    
-    Print(logLine);
-}
-
-//+------------------------------------------------------------------+
-//| Print Signal Log (输出信号日志)                                    |
-//+------------------------------------------------------------------+
-void PrintSignalLog(ENUM_SIGNAL_TYPE signal, double stopLoss, double atr)
-{
-    string signalName = SignalTypeToString(signal);
-    string side = GetSignalSide(signal);
-    double entryPrice = side == "buy" ? 
-                        SymbolInfoDouble(_Symbol, SYMBOL_ASK) : 
-                        SymbolInfoDouble(_Symbol, SYMBOL_BID);
-    double risk = side == "buy" ? (entryPrice - stopLoss) : (stopLoss - entryPrice);
-    double riskATR = atr > 0 ? risk / atr : 0;
-    
-    string emoji = side == "buy" ? "📈" : "📉";
-    
-    Print(StringFormat(
-        "%s 信号触发: %s | 入场:%.5f | 止损:%.5f | 风险:%.1fATR",
-        emoji,
-        signalName,
-        entryPrice,
-        stopLoss,
-        riskATR
-    ));
-}
-
-//+------------------------------------------------------------------+
-//| Get Market State String (获取市场状态字符串)                        |
-//+------------------------------------------------------------------+
-string GetMarketStateString(ENUM_MARKET_STATE state)
-{
-    switch(state)
-    {
-        case MARKET_STATE_STRONG_TREND:  return "StrongTrend";
-        case MARKET_STATE_BREAKOUT:      return "Breakout";
-        case MARKET_STATE_CHANNEL:       return "Channel";
-        case MARKET_STATE_TRADING_RANGE: return "TradingRange";
-        case MARKET_STATE_TIGHT_CHANNEL: return "TightChannel";
-        case MARKET_STATE_FINAL_FLAG:    return "FinalFlag";
-        default:                         return "Unknown";
-    }
-}
-
-//+------------------------------------------------------------------+
-//| Get Market Cycle String (获取市场周期字符串)                        |
-//+------------------------------------------------------------------+
-string GetMarketCycleString(ENUM_MARKET_CYCLE cycle)
-{
-    switch(cycle)
-    {
-        case MARKET_CYCLE_SPIKE:         return "Spike";
-        case MARKET_CYCLE_CHANNEL:       return "Channel";
-        case MARKET_CYCLE_TRADING_RANGE: return "TR";
-        default:                         return "Unknown";
-    }
-}
-
-//+------------------------------------------------------------------+
-//| Get H2 State String (获取 H2 状态字符串)                            |
-//+------------------------------------------------------------------+
-string GetH2StateString(ENUM_H2_STATE state)
-{
-    switch(state)
-    {
-        case H2_WAITING_FOR_PULLBACK: return "等待回调";
-        case H2_IN_PULLBACK:          return "回调中";
-        case H2_H1_DETECTED:          return "H1检测";
-        case H2_WAITING_FOR_H2:       return "等待H2";
-        default:                      return "未知";
-    }
-}
-
-//+------------------------------------------------------------------+
-//| Get L2 State String (获取 L2 状态字符串)                            |
-//+------------------------------------------------------------------+
-string GetL2StateString(ENUM_L2_STATE state)
-{
-    switch(state)
-    {
-        case L2_WAITING_FOR_BOUNCE: return "等待反弹";
-        case L2_IN_BOUNCE:          return "反弹中";
-        case L2_L1_DETECTED:        return "L1检测";
-        case L2_WAITING_FOR_L2:     return "等待L2";
-        default:                    return "未知";
-    }
-}
-
-//+------------------------------------------------------------------+
-//| Get Market Data                                                   |
-//+------------------------------------------------------------------+
-bool GetMarketData()
-{
-    int required = InpLookbackPeriod + 50;
-    
-    // 复制指标数据
-    if(CopyBuffer(handleEMA, 0, 0, required, g_EMABuffer) < required) return false;
-    if(CopyBuffer(handleATR, 0, 0, required, g_ATRBuffer) < required) return false;
-    
-    // 复制 HTF EMA 数据
-    if(CopyBuffer(handleHTFEMA, 0, 0, 10, g_HTFEMABuffer) < 5) return false;
-    
-    // 复制价格数据
-    if(CopyClose(_Symbol, PERIOD_CURRENT, 0, required, g_CloseBuffer) < required) return false;
-    if(CopyOpen(_Symbol, PERIOD_CURRENT, 0, required, g_OpenBuffer) < required) return false;
-    if(CopyHigh(_Symbol, PERIOD_CURRENT, 0, required, g_HighBuffer) < required) return false;
-    if(CopyLow(_Symbol, PERIOD_CURRENT, 0, required, g_LowBuffer) < required) return false;
-    if(CopyTickVolume(_Symbol, PERIOD_CURRENT, 0, required, g_VolumeBuffer) < required) return false;
-    
-    // 更新 HTF 趋势方向
-    UpdateHTFTrend();
-    
-    return true;
-}
-
-//+------------------------------------------------------------------+
-//| Update HTF Trend Direction                                        |
-//+------------------------------------------------------------------+
-void UpdateHTFTrend()
-{
-    if(ArraySize(g_HTFEMABuffer) < 3) return;
-    
-    double htfEMA = g_HTFEMABuffer[1];
-    double currentClose = g_CloseBuffer[1];
-    
-    if(currentClose > htfEMA * 1.002)
-        g_HTFTrendDir = "up";
-    else if(currentClose < htfEMA * 0.998)
-        g_HTFTrendDir = "down";
-    else
-        g_HTFTrendDir = "";
-}
-
-//+------------------------------------------------------------------+
-//| Calculate GapCount (连续远离EMA的K线数)                            |
-//| 扩展到 50 根以支持 20 Gap Bar 法则检测                              |
-//+------------------------------------------------------------------+
-int CalculateGapCount(double ema)
-{
-    int count = 0;
-    double threshold = ema * 0.002; // 0.2% 距离阈值
-    
-    // 检测向上 Gap
-    bool checkingUp = g_CloseBuffer[1] > ema + threshold;
-    bool checkingDown = g_CloseBuffer[1] < ema - threshold;
-    
-    if(!checkingUp && !checkingDown)
-    {
-        g_GapCount = 0;
-        g_GapCountExtreme = 0;
-        return 0;
-    }
-    
-    // 扩展到 50 根以支持 20 Gap Bar 法则
-    int maxLookback = MathMin(50, ArraySize(g_LowBuffer) - 1);
-    
-    for(int i = 1; i <= maxLookback; i++)
-    {
-        if(checkingUp)
-        {
-            // 整根K线都在EMA上方（低点也在EMA上方）
-            if(g_LowBuffer[i] > ema)
-            {
-                count++;
-                if(g_GapCountExtreme == 0 || g_HighBuffer[i] > g_GapCountExtreme)
-                    g_GapCountExtreme = g_HighBuffer[i];
-            }
-            else
-                break;
-        }
-        else if(checkingDown)
-        {
-            // 整根K线都在EMA下方（高点也在EMA下方）
-            if(g_HighBuffer[i] < ema)
-            {
-                count++;
-                if(g_GapCountExtreme == 0 || g_LowBuffer[i] < g_GapCountExtreme)
-                    g_GapCountExtreme = g_LowBuffer[i];
-            }
-            else
-                break;
-        }
-    }
-    
-    g_GapCount = count;
-    return count;
-}
-
-//+------------------------------------------------------------------+
-//| Update 20 Gap Bar Rule (Al Brooks 过度延伸保护)                    |
-//| 核心原则：GapCount > 20 时，第一次回测 EMA 通常是陷阱               |
-//+------------------------------------------------------------------+
-void Update20GapBarRule(double ema, double atr)
-{
-    if(!InpEnable20GapRule) return;
-    
-    double threshold = ema * 0.002;
-    bool priceAboveEMA = g_CloseBuffer[1] > ema + threshold;
-    bool priceBelowEMA = g_CloseBuffer[1] < ema - threshold;
-    bool priceTouchingEMA = !priceAboveEMA && !priceBelowEMA;
-    
-    //=================================================================
-    // 检测过度延伸状态
-    //=================================================================
-    if(!g_IsOverextended && g_GapCount >= InpGapBarThreshold)
-    {
-        // 进入过度延伸状态
-        g_IsOverextended = true;
-        g_OverextendDirection = priceAboveEMA ? "up" : "down";
-        g_OverextendStartTime = TimeCurrent();
-        g_FirstPullbackBlocked = false;
-        g_WaitingForRecovery = false;
-        g_FirstPullbackComplete = false;
-        g_ConsolidationCount = 0;
-        g_PullbackExtreme = 0;
-        
-        Print("━━━━━━━━ 20 Gap Bar 法则触发 ━━━━━━━━");
-        Print("   ⚠️ 趋势过度延伸: GapCount = ", g_GapCount, " >= ", InpGapBarThreshold);
-        Print("   方向: ", g_OverextendDirection);
-        Print("   Al Brooks: 第一次回测 EMA 通常是陷阱，屏蔽 H1/L1 入场");
-    }
-    
-    //=================================================================
-    // 过度延伸状态下的处理
-    //=================================================================
-    if(g_IsOverextended)
-    {
-        // 检测价格是否开始回测 EMA（第一次触碰）
-        if(!g_FirstPullbackComplete && priceTouchingEMA)
-        {
-            if(!g_FirstPullbackBlocked)
-            {
-                g_FirstPullbackBlocked = true;
-                g_WaitingForRecovery = true;
-                
-                // 记录回测极值（用于双底双顶检测）
-                if(g_OverextendDirection == "up")
-                    g_PullbackExtreme = g_LowBuffer[1];  // 上涨趋势回调的低点
-                else
-                    g_PullbackExtreme = g_HighBuffer[1]; // 下跌趋势反弹的高点
-                
-                Print("━━━━━━━━ 第一次回测 EMA 检测到 ━━━━━━━━");
-                Print("   ⛔ 屏蔽第一次顺势入场 (H1/L1)");
-                Print("   回测极值: ", DoubleToString(g_PullbackExtreme, g_SymbolDigits));
-                Print("   等待: 横盘整理或双底/双顶形成后恢复");
-            }
-            
-            g_ConsolidationCount++;
-        }
-        
-        //=============================================================
-        // 检测恢复条件
-        //=============================================================
-        if(g_WaitingForRecovery)
-        {
-            bool recovered = false;
-            string recoveryReason = "";
-            
-            // 条件 1: 横盘整理（连续 N 根 K 线在窄幅区间内）
-            if(g_ConsolidationCount >= InpConsolidationBars)
-            {
-                double rangeHigh = g_HighBuffer[1];
-                double rangeLow = g_LowBuffer[1];
-                
-                for(int i = 2; i <= InpConsolidationBars; i++)
-                {
-                    if(g_HighBuffer[i] > rangeHigh) rangeHigh = g_HighBuffer[i];
-                    if(g_LowBuffer[i] < rangeLow) rangeLow = g_LowBuffer[i];
-                }
-                
-                double consolidationRange = rangeHigh - rangeLow;
-                
-                if(atr > 0 && consolidationRange <= atr * InpConsolidationRange)
-                {
-                    recovered = true;
-                    recoveryReason = "横盘整理完成 (" + IntegerToString(g_ConsolidationCount) + 
-                                     " 根K线, 区间=" + DoubleToString(consolidationRange / atr, 2) + "×ATR)";
-                }
-            }
-            
-            // 条件 2: 双底/双顶（价格再次测试第一次回测的极值附近）
-            if(!recovered && g_PullbackExtreme > 0)
-            {
-                double tolerance = atr * 0.3;  // 30% ATR 容差
-                
-                if(g_OverextendDirection == "up")
-                {
-                    // 上涨趋势回调：检测双底（价格再次接近第一次回调低点）
-                    if(g_LowBuffer[1] <= g_PullbackExtreme + tolerance && 
-                       g_LowBuffer[1] >= g_PullbackExtreme - tolerance)
-                    {
-                        // 并且当前棒是阳线（多头尝试夺回）
-                        if(g_CloseBuffer[1] > g_OpenBuffer[1])
-                        {
-                            recovered = true;
-                            recoveryReason = "双底形成 (Low=" + DoubleToString(g_LowBuffer[1], g_SymbolDigits) + 
-                                            " ≈ 第一次回测Low=" + DoubleToString(g_PullbackExtreme, g_SymbolDigits) + ")";
-                        }
-                    }
-                }
-                else
-                {
-                    // 下跌趋势反弹：检测双顶（价格再次接近第一次反弹高点）
-                    if(g_HighBuffer[1] >= g_PullbackExtreme - tolerance && 
-                       g_HighBuffer[1] <= g_PullbackExtreme + tolerance)
-                    {
-                        // 并且当前棒是阴线（空头尝试夺回）
-                        if(g_CloseBuffer[1] < g_OpenBuffer[1])
-                        {
-                            recovered = true;
-                            recoveryReason = "双顶形成 (High=" + DoubleToString(g_HighBuffer[1], g_SymbolDigits) + 
-                                            " ≈ 第一次反弹High=" + DoubleToString(g_PullbackExtreme, g_SymbolDigits) + ")";
-                        }
-                    }
-                }
-            }
-            
-            // 条件 3: 价格完全反穿 EMA（趋势可能已反转）
-            if(!recovered)
-            {
-                if((g_OverextendDirection == "up" && priceBelowEMA) ||
-                   (g_OverextendDirection == "down" && priceAboveEMA))
-                {
-                    recovered = true;
-                    recoveryReason = "价格穿越 EMA，趋势可能反转";
-                }
-            }
-            
-            // 执行恢复
-            if(recovered)
-            {
-                g_FirstPullbackComplete = true;
-                g_WaitingForRecovery = false;
-                
-                Print("━━━━━━━━ 20 Gap Bar 保护解除 ━━━━━━━━");
-                Print("   ✅ 恢复原因: ", recoveryReason);
-                Print("   Al Brooks: 现在可以考虑第二入场 (H2/L2)");
-            }
-        }
-        
-        //=============================================================
-        // 检测过度延伸状态结束
-        //=============================================================
-        // GapCount 归零或方向改变，重置所有状态
-        if(g_GapCount == 0 || 
-           (g_OverextendDirection == "up" && priceBelowEMA) ||
-           (g_OverextendDirection == "down" && priceAboveEMA))
-        {
-            Reset20GapBarState();
-        }
-    }
-}
-
-//+------------------------------------------------------------------+
-//| Reset 20 Gap Bar State (重置状态)                                  |
-//+------------------------------------------------------------------+
-void Reset20GapBarState()
-{
-    if(g_IsOverextended)
-    {
-        Print("📊 20 Gap Bar 状态重置: 趋势延伸结束");
-    }
-    
-    g_IsOverextended = false;
-    g_FirstPullbackBlocked = false;
-    g_OverextendDirection = "";
-    g_OverextendStartTime = 0;
-    g_WaitingForRecovery = false;
-    g_ConsolidationCount = 0;
-    g_PullbackExtreme = 0;
-    g_FirstPullbackComplete = false;
-}
-
-//+------------------------------------------------------------------+
-//| Check 20 Gap Bar Block (检查是否应屏蔽 H1/L1 信号)                  |
-//| 返回 true 表示应该屏蔽                                              |
-//+------------------------------------------------------------------+
-bool Check20GapBarBlock(string signalType)
-{
-    if(!InpEnable20GapRule || !InpBlockFirstPullback)
-        return false;
-    
-    // 只有在过度延伸且第一次回测被屏蔽、等待恢复时才屏蔽
-    if(!g_IsOverextended || !g_FirstPullbackBlocked || !g_WaitingForRecovery)
-        return false;
-    
-    // 只屏蔽 H1/L1（第一入场），不屏蔽 H2/L2（第二入场）
-    if(signalType == "H1" || signalType == "L1")
-    {
-        // 检查信号方向是否与过度延伸方向一致（顺势）
-        if((signalType == "H1" && g_OverextendDirection == "up") ||
-           (signalType == "L1" && g_OverextendDirection == "down"))
-        {
-            Print("⛔ 20 Gap Bar 法则: 屏蔽 ", signalType, " 信号 (第一次回测陷阱)");
-            Print("   等待横盘整理或双底/双顶形成后的 H2/L2");
-            return true;
-        }
-    }
-    
     return false;
 }
 
 //+------------------------------------------------------------------+
-//| Detect Market State (Al Brooks 市场状态检测)                       |
+//| 非 NewBar 时仅用当前价触发平仓，不拷贝历史/不重算指标                  |
 //+------------------------------------------------------------------+
-void DetectMarketState(double ema, double atr)
+void OnTickExitOnly(double bid, double ask)
 {
-    // 检测强趋势
-    ENUM_MARKET_STATE detectedState = MARKET_STATE_CHANNEL;
-    
-    // 1. 检测 Strong Trend
-    if(DetectStrongTrend(ema))
+    if(!InpEnableSoftStop || g_SoftStopCount == 0) { CheckPendingStopOrderFills(); return; }
+    ValidateSoftStopArray();
+    if(g_SoftStopCount == 0) { CheckPendingStopOrderFills(); return; }
+    static int syncCounter = 0;
+    if(++syncCounter >= 10) { SyncSoftStopList(); syncCounter = 0; }
+    ValidateSoftStopArray();
+    if(g_SoftStopCount == 0) { CheckPendingStopOrderFills(); return; }
+    for(int i = g_SoftStopCount - 1; i >= 0; i--)
     {
-        detectedState = MARKET_STATE_STRONG_TREND;
+        if(i < 0 || i >= g_SoftStopCount || i >= ArraySize(g_SoftStopList)) break;
+        ulong ticket = g_SoftStopList[i].ticket;
+        double techSL = g_SoftStopList[i].technicalSL;
+        string side   = g_SoftStopList[i].side;
+        if(!PositionSelectByTicket(ticket)) { RemoveSoftStopInfo(ticket); continue; }
+        long posMagic = PositionGetInteger(POSITION_MAGIC);
+        if(posMagic != InpMagicNumber && posMagic != InpMagicNumber + 1) { RemoveSoftStopInfo(ticket); continue; }
+        bool shouldClose = (side == "buy" && bid < techSL) || (side == "sell" && ask > techSL);
+        if(shouldClose && PositionCloseWithRetry(ticket))
+        {
+            if(InpDebugMode) Print("逻辑止损触发(Tick) #", ticket, " 技术SL:", DoubleToString(techSL, g_SymbolDigits));
+            RemoveSoftStopInfo(ticket);
+        }
     }
-    // 2. 检测 Tight Channel
-    else if(DetectTightChannel(ema))
-    {
-        detectedState = MARKET_STATE_TIGHT_CHANNEL;
-        // 更新 Tight Channel 追踪
-        g_TightChannelBars++;
-        UpdateTightChannelTracking();
-    }
-    // 3. 检测 Final Flag
-    else if(DetectFinalFlag(ema, atr))
-    {
-        detectedState = MARKET_STATE_FINAL_FLAG;
-        if(g_TightChannelBars > 0)
-            g_LastTightChannelEndBar = 1;
-    }
-    // 4. 检测 Trading Range
-    else if(DetectTradingRange(ema))
-    {
-        detectedState = MARKET_STATE_TRADING_RANGE;
-        if(g_TightChannelBars > 0)
-            g_LastTightChannelEndBar = 1;
-        g_TightChannelBars = 0;
-    }
-    // 5. 检测 Breakout
-    else if(DetectBreakout(ema, atr))
-    {
-        detectedState = MARKET_STATE_BREAKOUT;
-    }
-    else
-    {
-        // 默认 Channel
-        if(g_TightChannelBars > 0)
-            g_LastTightChannelEndBar = 1;
-        g_TightChannelBars = 0;
-    }
-    
-    // 应用状态惯性
-    ApplyStateInertia(detectedState);
+    CheckPendingStopOrderFills();
 }
 
 //+------------------------------------------------------------------+
-//| Detect Strong Trend (强趋势检测)                                   |
+//| 合并方向逻辑：按 direction 扫描市场，返回该方向的第一个有效信号           |
+//| direction: DIR_LONG=多 DIR_SHORT=空；除 BreakoutMode 外所有信号经此入口   |
 //+------------------------------------------------------------------+
-bool DetectStrongTrend(double ema)
+ENUM_SIGNAL_TYPE ScanMarket(int direction, double ema, double atr, double &stopLoss, double &baseHeight)
 {
+    const string wantSide = (direction == DIR_LONG) ? "buy" : "sell";
+    ENUM_SIGNAL_TYPE s = SIGNAL_NONE;
+    bool inTTR = IsTightTradingRange(atr);  // TTR时过滤趋势类信号,避免震荡市吃耳光
+
+    if(!inTTR && InpEnableSpike) { s = CheckSpike(ema, atr, stopLoss, baseHeight); if(s != SIGNAL_NONE && GetSignalSide(s) == wantSide) return s; }
+    if(!inTTR) { s = CheckMicroChannel(ema, atr, stopLoss, baseHeight); if(s != SIGNAL_NONE && GetSignalSide(s) == wantSide) return s; }
+    if(InpEnableH2L2) { s = CheckHLCountSignal(direction, atr, stopLoss, baseHeight); if(s != SIGNAL_NONE) return s; }
+    if(!inTTR && InpEnableBOPullback) { s = CheckBreakoutPullback(ema, atr, stopLoss, baseHeight); if(s != SIGNAL_NONE && GetSignalSide(s) == wantSide) return s; }
+    if(!inTTR && InpEnableTrendBar) { s = CheckTrendBarEntry(ema, atr, stopLoss, baseHeight); if(s != SIGNAL_NONE && GetSignalSide(s) == wantSide) return s; }
+    if(!inTTR && InpEnableGapBar) { s = CheckGapBar(ema, atr, stopLoss, baseHeight); if(s != SIGNAL_NONE && GetSignalSide(s) == wantSide) return s; }
+    if(InpEnableTRBreakout && g_MarketState == MARKET_STATE_TRADING_RANGE) { s = CheckTRBreakout(ema, atr, stopLoss, baseHeight); if(s != SIGNAL_NONE && GetSignalSide(s) == wantSide) return s; }
+
+    bool allowReversal = (g_MarketState == MARKET_STATE_TRADING_RANGE || g_MarketState == MARKET_STATE_FINAL_FLAG || g_MarketCycle == MARKET_CYCLE_SPIKE);
+    if(InpEnableClimax) { s = CheckClimax(ema, atr, stopLoss, baseHeight); if(s != SIGNAL_NONE && GetSignalSide(s) == wantSide) return s; }
+    if(InpEnableWedge && allowReversal) { s = CheckWedgeDirection(direction, atr, stopLoss, baseHeight); if(s != SIGNAL_NONE) return s; }
+    if(InpEnableMTR && allowReversal) { s = CheckMTR(ema, atr, stopLoss, baseHeight); if(s != SIGNAL_NONE && GetSignalSide(s) == wantSide) return s; }
+    if(InpEnableFailedBO && g_MarketState == MARKET_STATE_TRADING_RANGE) { s = CheckFailedBreakout(ema, atr, stopLoss, baseHeight); if(s != SIGNAL_NONE && GetSignalSide(s) == wantSide) return s; }
+    if(InpEnableDTDB && allowReversal) { s = CheckDoubleTopBottomDirection(direction, atr, stopLoss, baseHeight); if(s != SIGNAL_NONE) return s; }
+    if(InpEnableOutsideBar && allowReversal) { s = CheckOutsideBarReversal(ema, atr, stopLoss, baseHeight); if(s != SIGNAL_NONE && GetSignalSide(s) == wantSide) return s; }
+    if(InpEnableRevBar && allowReversal) { s = CheckReversalBarEntry(ema, atr, stopLoss, baseHeight); if(s != SIGNAL_NONE && GetSignalSide(s) == wantSide) return s; }
+    if(InpEnableIIPattern && allowReversal) { s = CheckIIPattern(ema, atr, stopLoss, baseHeight); if(s != SIGNAL_NONE && GetSignalSide(s) == wantSide) return s; }
+    if(InpEnableMeasuredMove) { s = CheckMeasuredMove(ema, atr, stopLoss, baseHeight); if(s != SIGNAL_NONE && GetSignalSide(s) == wantSide) return s; }
+    if(g_MarketState == MARKET_STATE_FINAL_FLAG) { s = CheckFinalFlag(ema, atr, stopLoss, baseHeight); if(s != SIGNAL_NONE && GetSignalSide(s) == wantSide) return s; }
+
+    return SIGNAL_NONE;
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                              |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+    bool isNewBar = IsNewBar();
+
+    int posCount = CountPositions();
+
+    if(!isNewBar)
+    {
+        if(posCount > 0 && g_AtrValue > 0)
+        {
+            double currentRange = iHigh(_Symbol, PERIOD_CURRENT, 0) - iLow(_Symbol, PERIOD_CURRENT, 0);
+            if(currentRange > g_AtrValue * 1.5)
+                RefreshRealTimeATR();
+        }
+        double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+        double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+        OnTickExitOnly(bid, ask);
+        return;
+    }
+
+    if(!GetMarketData())
+        return;
+
+    g_BarCount++;
+    double ema = g_EMABuffer[1];
+    double atr = g_ATRBuffer[1];
+    if(ema == 0 || atr == 0)
+        return;
+
+    g_AtrValue = atr;
+    if(posCount > 0 && g_BufferSize >= 2)
+    {
+        double bar1Range = g_HighBuffer[1] - g_LowBuffer[1];
+        if(bar1Range > atr * 1.5)
+            RefreshRealTimeATR();
+    }
+
+    double atrForSL = (g_AtrValue > 0) ? g_AtrValue : atr;
+    AdoptExistingPositionsIfNeeded(atrForSL);
+
+    if(posCount > 0) UpdateM5SwingPoints();
+    CheckSoftStopExit();
+    CheckPendingStopOrderFills();
+    CheckAndCancelExpiredOrders();  // Brooks 信号棒-入场棒 时效: 清理未触发的挂单
+    UpdateSpreadTracking();
+    UpdateSessionDetection();
+
+    // Swing 点、市场状态、H/L 计数、周一跳空 — 仅在收盘后更新
+    UpdateSwingPoints(atr);
+    if(InpEnableWeekendFilter)
+        CheckMondayGapReset(atr);
+    UpdateAlwaysInDirection(ema, atr);
+    if(g_LastTightChannelEndBar >= 0)
+        g_LastTightChannelEndBar++;
+    DetectMarketState(ema, atr);
+    g_MarketCycle = GetMarketCycle(g_MarketState);
+    UpdateHLCount(atr);
+    int gapCount = CalculateGapCount(ema, atr);
+    Update20GapBarRule(ema, atr);
+    UpdateReversalAttemptTracking();
+    UpdateTrendLine(atr);
+    UpdateBarbWireDetection(atr);
+    UpdateMeasuringGap(ema, atr);
+    UpdateBreakoutMode(ema, atr);
+    PrintBarLog(gapCount, "");
+
+    // Barb Wire 过滤
+    if(InpEnableBarbWireFilter && g_InBarbWire)
+    {
+        if(InpEnableVerboseLog)
+            if(InpDebugMode) Print("Barb Wire活跃,跳过信号检测");
+        ManagePositions(ema, atr);
+        return;
+    }
+
+    // 3. 信号检测 (Al Brooks 风格：K 线收盘决断，使用上面 NewBar 计算出的缓存值；除移动止损与价格监控外均仅在 NewBar 内)
+    ENUM_SIGNAL_TYPE signal = SIGNAL_NONE;
+    double stopLoss = 0;
+    double baseHeight = 0;
+    UpdateBreakoutPullbackTracking(ema, atr);
+
+    if(g_InBreakoutMode)
+    {
+        signal = CheckBreakoutModeSignal(ema, atr, stopLoss, baseHeight);
+        if(signal != SIGNAL_NONE)
+        {
+            if(stopLoss > 0)
+                ProcessSignal(signal, stopLoss, baseHeight);
+            ManagePositions(ema, atr);
+            return;
+        }
+    }
+
+    signal = ScanMarket(DIR_LONG, ema, atr, stopLoss, baseHeight);
+    if(signal == SIGNAL_NONE)
+        signal = ScanMarket(DIR_SHORT, ema, atr, stopLoss, baseHeight);
+
+    if(signal != SIGNAL_NONE)
+        PrintSignalLog(signal, stopLoss, atr);
+    if(signal != SIGNAL_NONE && stopLoss > 0 && (!InpEnableWeekendFilter || !g_IsWeekend))
+        ProcessSignal(signal, stopLoss, baseHeight);
+
+    // 4. 订单/持仓管理 (移动止损等，新 K 线做一次，减少 broker 交互)
+    ManagePositions(ema, atr);
+}
+
+
+//+------------------------------------------------------------------+
+//| Always In Direction - Brooks核心: 任何时刻市场有一个AI方向          |
+//| 优先级: 两棒突破通道 > 极强趋势棒突破结构 > 强力反转 > 评分(收盘靠极值+)  |
+//+------------------------------------------------------------------+
+void UpdateAlwaysInDirection(double ema, double atr)
+{
+    if(g_BufferSize < 20 || atr <= 0) { g_AlwaysIn = AI_NEUTRAL; return; }
+    
+    double lastBody = g_CloseBuffer[1] - g_OpenBuffer[1];
+    double lastRange = g_HighBuffer[1] - g_LowBuffer[1];
+    double closePos = (lastRange > 0) ? (g_CloseBuffer[1] - g_LowBuffer[1]) / lastRange : 0.5;
+    double bodyRatio = (lastRange > 0) ? MathAbs(lastBody) / lastRange : 0;
+    
+    // --- 最高优先级: 两棒确认 - 连续两根反向趋势棒突破通道线(EMA) ---
+    if(g_BufferSize >= 4)
+    {
+        double body1 = g_CloseBuffer[1] - g_OpenBuffer[1];
+        double body2 = g_CloseBuffer[2] - g_OpenBuffer[2];
+        double range1 = g_HighBuffer[1] - g_LowBuffer[1];
+        double range2 = g_HighBuffer[2] - g_LowBuffer[2];
+        double ema2 = (ArraySize(g_EMABuffer) > 2) ? g_EMABuffer[2] : ema;
+        bool bar1Bull = (range1 > 0 && body1 / range1 > 0.55);
+        bool bar1Bear = (range1 > 0 && body1 / range1 < -0.55);
+        bool bar2Bull = (range2 > 0 && body2 / range2 > 0.55);
+        bool bar2Bear = (range2 > 0 && body2 / range2 < -0.55);
+        if(bar1Bull && bar2Bull && g_CloseBuffer[1] > ema && g_CloseBuffer[2] > ema2)
+            { g_AlwaysIn = AI_LONG; return; }
+        if(bar1Bear && bar2Bear && g_CloseBuffer[1] < ema && g_CloseBuffer[2] < ema2)
+            { g_AlwaysIn = AI_SHORT; return; }
+    }
+    
+    // --- 强力反转优先: 极强趋势棒(实体>前3根均长2倍)+突破EMA/结构位+收盘靠极值 ---
+    if(g_BufferSize >= 5 && lastRange > atr * 1.0)
+    {
+        double avgBody3 = 0;
+        for(int k = 2; k <= 4 && k < g_BufferSize; k++)
+            avgBody3 += MathAbs(g_CloseBuffer[k] - g_OpenBuffer[k]);
+        avgBody3 /= 3.0;
+        double bodyLen = MathAbs(lastBody);
+        bool breakEMA = (lastBody > 0 && g_CloseBuffer[1] > ema) || (lastBody < 0 && g_CloseBuffer[1] < ema);
+        bool breakStruct = false;
+        if(g_SwingPointCount >= 2)
+        {
+            double sh1 = GetRecentSwingHigh(1), sl1 = GetRecentSwingLow(1);
+            if(lastBody > 0 && sh1 > 0 && g_CloseBuffer[1] > sh1) breakStruct = true;
+            if(lastBody < 0 && sl1 > 0 && g_CloseBuffer[1] < sl1) breakStruct = true;
+        }
+        if(avgBody3 > 0 && bodyLen > avgBody3 * 2.0 && bodyRatio > 0.6 && (breakEMA || breakStruct))
+        {
+            if(lastBody > 0 && closePos > 0.75) { g_AlwaysIn = AI_LONG; return; }
+            if(lastBody < 0 && closePos < 0.25) { g_AlwaysIn = AI_SHORT; return; }
+        }
+    }
+    
+    // --- 直接翻转: 强力反转K线(大实体+收盘靠极值) ---
+    if(lastRange > atr * 1.2 && bodyRatio > 0.65)
+    {
+        if(lastBody > 0 && closePos > 0.75) { g_AlwaysIn = AI_LONG; return; }
+        if(lastBody < 0 && closePos < 0.25) { g_AlwaysIn = AI_SHORT; return; }
+    }
+    
+    // --- 评分制: 降低微小Overlap权重, 提升收盘靠极值权重 ---
+    int bullCount = 0, bearCount = 0;
+    int overlapPenalty = 0;
+    for(int i = 1; i <= 5 && i < g_BufferSize; i++)
+    {
+        double body = g_CloseBuffer[i] - g_OpenBuffer[i];
+        double range = g_HighBuffer[i] - g_LowBuffer[i];
+        if(range <= 0) continue;
+        double br = MathAbs(body) / range;
+        bool hasOverlap = false;
+        if(i < g_BufferSize - 1)
+        {
+            double ovHigh = MathMin(g_HighBuffer[i], g_HighBuffer[i+1]);
+            double ovLow  = MathMax(g_LowBuffer[i], g_LowBuffer[i+1]);
+            if(ovHigh > ovLow && range > 0 && (ovHigh - ovLow) / range > 0.6) hasOverlap = true;
+        }
+        if(body > 0 && br > 0.5) { bullCount++; if(hasOverlap) overlapPenalty++; }
+        if(body < 0 && br > 0.5) { bearCount++; if(hasOverlap) overlapPenalty++; }
+    }
+    
+    int hh = 0, hl = 0, lh = 0, ll = 0;
+    for(int i = 1; i < g_SwingPointCount - 1 && i < 4; i++)
+    {
+        int j = i + 1;
+        if(j >= g_SwingPointCount) break;
+        if(g_SwingPoints[i].isHigh && g_SwingPoints[j].isHigh)
+        {
+            if(g_SwingPoints[i].price > g_SwingPoints[j].price) hh++;
+            else lh++;
+        }
+        if(!g_SwingPoints[i].isHigh && !g_SwingPoints[j].isHigh)
+        {
+            if(g_SwingPoints[i].price > g_SwingPoints[j].price) hl++;
+            else ll++;
+        }
+    }
+    
+    bool aboveEMA = g_CloseBuffer[1] > ema;
+    double bullScore = 0, bearScore = 0;
+    
+    double countWeight = (overlapPenalty >= 2) ? 0.25 : ((overlapPenalty >= 1) ? 0.35 : 0.4);
+    if(bullCount >= 3) bullScore += countWeight;
+    else if(bullCount >= 2) bullScore += countWeight * 0.5;
+    if(bearCount >= 3) bearScore += countWeight;
+    else if(bearCount >= 2) bearScore += countWeight * 0.5;
+    
+    if(hh > 0 && hl > 0) bullScore += 0.30;
+    if(lh > 0 && ll > 0) bearScore += 0.30;
+    
+    if(aboveEMA) bullScore += 0.12;
+    else bearScore += 0.12;
+    
+    if(lastRange > 0 && lastRange > atr * 1.5)
+    {
+        if(lastBody > 0) bullScore += (bodyRatio > 0.7 ? 0.35 : 0.25);
+        else bearScore += (bodyRatio > 0.7 ? 0.35 : 0.25);
+    }
+    
+    if(closePos > 0.8) bullScore += 0.20;
+    if(closePos < 0.2) bearScore += 0.20;
+    
+    if(bullScore >= 0.5 && bullScore > bearScore + 0.1)
+        g_AlwaysIn = AI_LONG;
+    else if(bearScore >= 0.5 && bearScore > bullScore + 0.1)
+        g_AlwaysIn = AI_SHORT;
+    else
+        g_AlwaysIn = AI_NEUTRAL;
+}
+
+//+------------------------------------------------------------------+
+//| Swing Point Detection - Brooks H/L计数的基础                      |
+//| 确认波段(depth=3): 用于H/L计数、形态识别; 临时波段(depth=1): 用于止损,降低延迟 |
+//+------------------------------------------------------------------+
+void UpdateSwingPoints(double atr)
+{
+    // atr 保留以与调用方签名一致,当前逻辑未使用
+    // 先递增所有现有swing的bar索引(因为新K线产生了)
+    for(int i = 0; i < g_SwingPointCount; i++)
+        g_SwingPoints[i].barIndex++;
+    
+    // 清理过老的swing points (超过40根K线)
+    while(g_SwingPointCount > 0 && g_SwingPoints[g_SwingPointCount - 1].barIndex > 40)
+        g_SwingPointCount--;
+    
+    int depth = InpSwingConfirmDepth;
+    int checkBar = depth + 1;
+    
+    // --- 临时高低点(depth=1): 仅需前后各1根确认,用于止损,约1根K线延迟 ---
+    if(g_BufferSize >= 4)
+    {
+        int tempBar = 2;  // bar[2]=1根前,左右各1根
+        if(g_HighBuffer[1] < g_HighBuffer[tempBar] && g_HighBuffer[3] < g_HighBuffer[tempBar])
+        {
+            g_TempSwingHigh = g_HighBuffer[tempBar];
+            g_TempSwingHighBar = tempBar;
+        }
+        if(g_LowBuffer[1] > g_LowBuffer[tempBar] && g_LowBuffer[3] > g_LowBuffer[tempBar])
+        {
+            g_TempSwingLow = g_LowBuffer[tempBar];
+            g_TempSwingLowBar = tempBar;
+        }
+    }
+    
+    // --- 确认波段(depth=3): 用于H/L计数、形态、趋势线 ---
+    if(g_BufferSize < checkBar + depth + 1) return;
+    
+    bool isSwingHigh = true;
+    double centerHigh = g_HighBuffer[checkBar];
+    for(int i = 1; i <= depth; i++)
+    {
+        int leftIdx = checkBar - i;
+        int rightIdx = checkBar + i;
+        if(leftIdx < 0 || rightIdx >= g_BufferSize) { isSwingHigh = false; break; }
+        if(g_HighBuffer[leftIdx] >= centerHigh) { isSwingHigh = false; break; }
+        if(g_HighBuffer[rightIdx] >= centerHigh) { isSwingHigh = false; break; }
+    }
+    
+    bool isSwingLow = true;
+    double centerLow = g_LowBuffer[checkBar];
+    for(int i = 1; i <= depth; i++)
+    {
+        int leftIdx = checkBar - i;
+        int rightIdx = checkBar + i;
+        if(leftIdx < 0 || rightIdx >= g_BufferSize) { isSwingLow = false; break; }
+        if(g_LowBuffer[leftIdx] <= centerLow) { isSwingLow = false; break; }
+        if(g_LowBuffer[rightIdx] <= centerLow) { isSwingLow = false; break; }
+    }
+    
+    if(isSwingHigh)
+        AddSwingPoint(centerHigh, checkBar, true);
+    if(isSwingLow)
+        AddSwingPoint(centerLow, checkBar, false);
+}
+
+void AddSwingPoint(double price, int barIndex, bool isHigh)
+{
+    // 避免重复: 同一bar不重复添加同类型swing
+    for(int i = 0; i < g_SwingPointCount; i++)
+    {
+        if(g_SwingPoints[i].barIndex == barIndex && g_SwingPoints[i].isHigh == isHigh)
+            return;
+    }
+    
+    // 插入到最前面(最新的在前)
+    if(g_SwingPointCount >= MAX_SWING_POINTS)
+        g_SwingPointCount = MAX_SWING_POINTS - 1;
+    
+    for(int i = g_SwingPointCount; i > 0; i--)
+        g_SwingPoints[i] = g_SwingPoints[i-1];
+    
+    g_SwingPoints[0].price = price;
+    g_SwingPoints[0].barIndex = barIndex;
+    g_SwingPoints[0].isHigh = isHigh;
+    g_SwingPointCount++;
+    
+    // 更新缓存的swing point值
+    UpdateCachedSwingPoints();
+}
+
+// 更新缓存的swing point值(性能优化)
+void UpdateCachedSwingPoints()
+{
+    g_CachedSH1 = 0; g_CachedSH2 = 0;
+    g_CachedSL1 = 0; g_CachedSL2 = 0;
+    
+    int shCount = 0, slCount = 0;
+    for(int i = 0; i < g_SwingPointCount && (shCount < 2 || slCount < 2); i++)
+    {
+        if(g_SwingPoints[i].isHigh && shCount < 2)
+        {
+            if(shCount == 0) g_CachedSH1 = g_SwingPoints[i].price;
+            else g_CachedSH2 = g_SwingPoints[i].price;
+            shCount++;
+        }
+        else if(!g_SwingPoints[i].isHigh && slCount < 2)
+        {
+            if(slCount == 0) g_CachedSL1 = g_SwingPoints[i].price;
+            else g_CachedSL2 = g_SwingPoints[i].price;
+            slCount++;
+        }
+    }
+}
+
+// M5 波段点更新 - Runner 结构跟踪用; 仅在新 K 线时调用
+void UpdateM5SwingPoints()
+{
+    const int depth = 3, needBars = depth * 2 + 5;
+    double m5High[], m5Low[];
+    ArraySetAsSeries(m5High, true);
+    ArraySetAsSeries(m5Low, true);
+    if(CopyHigh(_Symbol, PERIOD_M5, 0, needBars, m5High) < needBars || CopyLow(_Symbol, PERIOD_M5, 0, needBars, m5Low) < needBars)
+        return;
+    
+    double tmpLows[MAX_M5_SWINGS], tmpHighs[MAX_M5_SWINGS];
+    int tmpLowBars[MAX_M5_SWINGS], tmpHighBars[MAX_M5_SWINGS];
+    int nLow = 0, nHigh = 0;
+    for(int checkBar = depth + 1; checkBar < needBars - depth - 1 && (nLow < MAX_M5_SWINGS || nHigh < MAX_M5_SWINGS); checkBar++)
+    {
+        bool isSL = true;
+        double centerLow = m5Low[checkBar];
+        for(int i = 1; i <= depth; i++)
+        {
+            if(m5Low[checkBar - i] <= centerLow || m5Low[checkBar + i] <= centerLow)
+            { isSL = false; break; }
+        }
+        if(isSL && nLow < MAX_M5_SWINGS)
+        { tmpLows[nLow] = centerLow; tmpLowBars[nLow] = checkBar; nLow++; }
+        
+        bool isSH = true;
+        double centerHigh = m5High[checkBar];
+        for(int i = 1; i <= depth; i++)
+        {
+            if(m5High[checkBar - i] >= centerHigh || m5High[checkBar + i] >= centerHigh)
+            { isSH = false; break; }
+        }
+        if(isSH && nHigh < MAX_M5_SWINGS)
+        { tmpHighs[nHigh] = centerHigh; tmpHighBars[nHigh] = checkBar; nHigh++; }
+    }
+    // 按 bar 索引升序(最 recent 在前)
+    for(int i = 0; i < nLow; i++)
+    {
+        int best = i;
+        for(int j = i + 1; j < nLow; j++)
+            if(tmpLowBars[j] < tmpLowBars[best]) best = j;
+        if(best != i)
+        {
+            double dp = tmpLows[i]; tmpLows[i] = tmpLows[best]; tmpLows[best] = dp;
+            int di = tmpLowBars[i]; tmpLowBars[i] = tmpLowBars[best]; tmpLowBars[best] = di;
+        }
+        g_M5SwingLows[i] = tmpLows[i];
+        g_M5SwingLowBars[i] = tmpLowBars[i];
+    }
+    g_M5SwingLowCount = nLow;
+    for(int i = 0; i < nHigh; i++)
+    {
+        int best = i;
+        for(int j = i + 1; j < nHigh; j++)
+            if(tmpHighBars[j] < tmpHighBars[best]) best = j;
+        if(best != i)
+        {
+            double dp = tmpHighs[i]; tmpHighs[i] = tmpHighs[best]; tmpHighs[best] = dp;
+            int di = tmpHighBars[i]; tmpHighBars[i] = tmpHighBars[best]; tmpHighBars[best] = di;
+        }
+        g_M5SwingHighs[i] = tmpHighs[i];
+        g_M5SwingHighBars[i] = tmpHighBars[i];
+    }
+    g_M5SwingHighCount = nHigh;
+}
+
+// 结构跟踪: 仅当 M5 形成新 Higher Low(买) 且高于开仓价时，返回新止损位；否则 0
+double GetM5StructuralStopForBuy(double entryPrice, double currentSL, double atr)
+{
+    if(g_M5SwingLowCount < 2 || atr <= 0) return 0;
+    double buf = atr * 0.2;
+    for(int i = 0; i < g_M5SwingLowCount - 1; i++)
+    {
+        double newLow = g_M5SwingLows[i];
+        double prevLow = g_M5SwingLows[i + 1];
+        if(newLow > entryPrice && newLow > prevLow && (currentSL <= 0 || newLow > currentSL + buf))
+            return NormalizeDouble(newLow - buf, g_SymbolDigits);
+    }
+    return 0;
+}
+
+// 结构跟踪: 仅当 M5 形成新 Lower High(卖) 且低于开仓价时，返回新止损位；否则 0
+double GetM5StructuralStopForSell(double entryPrice, double currentSL, double atr)
+{
+    if(g_M5SwingHighCount < 2 || atr <= 0) return 0;
+    double buf = atr * 0.2;
+    for(int i = 0; i < g_M5SwingHighCount - 1; i++)
+    {
+        double newHigh = g_M5SwingHighs[i];
+        double prevHigh = g_M5SwingHighs[i + 1];
+        if(newHigh < entryPrice && newHigh < prevHigh && (currentSL <= 0 || newHigh < currentSL - buf))
+            return NormalizeDouble(newHigh + buf, g_SymbolDigits);
+    }
+    return 0;
+}
+
+// 高潮退出: 检测 Climax Bar(实体>前5根均值3倍 且 触及通道轨)，市价全平 Runner
+void CheckClimaxExit()  
+{
+    if(g_BufferSize < 7 || g_MarketState != MARKET_STATE_TIGHT_CHANNEL || g_TightChannelExtreme <= 0) return;
+    
+    double currBody = MathAbs(g_CloseBuffer[1] - g_OpenBuffer[1]);
+    double avgBody = 0;
+    for(int i = 2; i <= 6 && i < g_BufferSize; i++)
+        avgBody += MathAbs(g_CloseBuffer[i] - g_OpenBuffer[i]);
+    avgBody /= 5.0;
+    if(avgBody <= 0 || currBody < avgBody * 3.0) return;
+    
+    double tol = g_SymbolPoint * 10;
+    bool buyClimax  = (g_CloseBuffer[1] > g_OpenBuffer[1]) && (g_TightChannelDir == "up") && (g_HighBuffer[1] >= g_TightChannelExtreme - tol);
+    bool sellClimax = (g_CloseBuffer[1] < g_OpenBuffer[1]) && (g_TightChannelDir == "down") && (g_LowBuffer[1] <= g_TightChannelExtreme + tol);
+    
+    if(!buyClimax && !sellClimax) return;
+    
+    long magicRunner = InpMagicNumber + 1;
+    for(int p = PositionsTotal() - 1; p >= 0; p--)
+    {
+        if(!positionInfo.SelectByIndex(p)) continue;
+        if(positionInfo.Symbol() != _Symbol || positionInfo.Magic() != magicRunner) continue;
+        
+        ulong ticket = positionInfo.Ticket();
+        bool isBuy = (positionInfo.PositionType() == POSITION_TYPE_BUY);
+        if((buyClimax && isBuy) || (sellClimax && !isBuy))
+        {
+            if(PositionCloseWithRetry(ticket))
+            {
+                RemoveSoftStopInfo(ticket);
+                if(InpDebugMode) Print("高潮退出: Climax Bar 检测 #", ticket, " 市价全平");
+            }
+        }
+    }
+}
+
+// Scalp TP1: 1:1 盈亏比. TP1 = Entry + (Entry - SL) = Entry + Risk
+double GetScalpTP1(const string &side, double entryPrice, double initialSL)
+{
+    double risk = (side == "buy") ? (entryPrice - initialSL) : (initialSL - entryPrice);
+    if(risk <= 0) return 0;
+    if(side == "buy") return NormalizeDouble(entryPrice + risk, g_SymbolDigits);
+    return NormalizeDouble(entryPrice - risk, g_SymbolDigits);
+}
+
+// Swing TP2: 测量移动(信号棒+前棒高度*200%) 或 强通道时用通道线; 保护: 不足1ATR则扩至1.5ATR
+double GetMeasuredMoveTP2(const string &side, double entryPrice, double atr)
+{
+    if(atr <= 0) return 0;
+    if(g_BufferSize < 3)
+    {
+        double fallback = atr * 2.0;
+        return NormalizeDouble(side == "buy" ? entryPrice + fallback : entryPrice - fallback, g_SymbolDigits);
+    }
+    
+    double tp2 = 0;
+    bool useChannel = (g_MarketState == MARKET_STATE_TIGHT_CHANNEL && g_TightChannelExtreme > 0);
+    
+    if(useChannel)
+    {
+        if(side == "buy" && g_TightChannelDir == "up" && g_TightChannelExtreme > entryPrice)
+            tp2 = g_TightChannelExtreme;
+        else if(side == "sell" && g_TightChannelDir == "down" && g_TightChannelExtreme < entryPrice)
+            tp2 = g_TightChannelExtreme;
+    }
+    
+    if(tp2 <= 0)
+    {
+        double high12 = MathMax(g_HighBuffer[1], g_HighBuffer[2]);
+        double low12  = MathMin(g_LowBuffer[1], g_LowBuffer[2]);
+        double height = high12 - low12;
+        if(height <= 0) height = atr * 0.5;
+        double mappedDist = height * 2.0;
+        if(side == "buy")  tp2 = entryPrice + mappedDist;
+        else               tp2 = entryPrice - mappedDist;
+    }
+    
+    double tp2Dist = (side == "buy") ? (tp2 - entryPrice) : (entryPrice - tp2);
+    if(tp2Dist < atr * 1.0)
+    {
+        double minDist = atr * 1.5;
+        if(side == "buy")  tp2 = entryPrice + minDist;
+        else               tp2 = entryPrice - minDist;
+    }
+    return NormalizeDouble(tp2, g_SymbolDigits);
+}
+
+// 获取最近的N个swing high (使用缓存优化)
+// allowTemp: 止损计算时可回退到临时波段点,降低结构更新延迟
+double GetRecentSwingHigh(int nth, bool allowTemp = false)
+{
+    if(nth == 1 && g_CachedSH1 > 0) return g_CachedSH1;
+    if(nth == 2 && g_CachedSH2 > 0) return g_CachedSH2;
+    if(nth == 1 && allowTemp && g_TempSwingHigh > 0) return g_TempSwingHigh;
+    
+    int count = 0;
+    for(int i = 0; i < g_SwingPointCount; i++)
+    {
+        if(g_SwingPoints[i].isHigh)
+        {
+            count++;
+            if(count == nth) return g_SwingPoints[i].price;
+        }
+    }
+    return 0;
+}
+
+// 获取最近的N个swing low (使用缓存优化)
+double GetRecentSwingLow(int nth, bool allowTemp = false)
+{
+    if(nth == 1 && g_CachedSL1 > 0) return g_CachedSL1;
+    if(nth == 2 && g_CachedSL2 > 0) return g_CachedSL2;
+    if(nth == 1 && allowTemp && g_TempSwingLow > 0) return g_TempSwingLow;
+    
+    int count = 0;
+    for(int i = 0; i < g_SwingPointCount; i++)
+    {
+        if(!g_SwingPoints[i].isHigh)
+        {
+            count++;
+            if(count == nth) return g_SwingPoints[i].price;
+        }
+    }
+    return 0;
+}
+
+
+//+------------------------------------------------------------------+
+//| H/L Count - Brooks: 基于swing point的Push(推升)计数                  |
+//| H1=第一次有效回调后突破前高, H2=第二次; L1/L2同理                   |
+//| 重置: 不仅跌破前低/突破前高, 显著新极值(ATR倍数)或强反转信号也重置     |
+//+------------------------------------------------------------------+
+void UpdateHLCount(double atr)
+{
+    if(g_SwingPointCount < 4 || atr <= 0) return;
+    
+    double sh1 = 0, sl1 = 0, sh2 = 0, sl2 = 0;
+    int shCount = 0, slCount = 0;
+    
+    for(int i = 0; i < g_SwingPointCount && (shCount < 2 || slCount < 2); i++)
+    {
+        if(g_SwingPoints[i].isHigh && shCount < 2)
+        {
+            if(shCount == 0) sh1 = g_SwingPoints[i].price;
+            else sh2 = g_SwingPoints[i].price;
+            shCount++;
+        }
+        else if(!g_SwingPoints[i].isHigh && slCount < 2)
+        {
+            if(slCount == 0) sl1 = g_SwingPoints[i].price;
+            else sl2 = g_SwingPoints[i].price;
+            slCount++;
+        }
+    }
+    
+    double resetExtremeATR = atr * InpHLResetNewExtremeATR;
+    double minPullbackATR = atr * InpHLMinPullbackATR;
+    
+    // 强反转信号: 大实体反向K线,收盘在极值附近(Brooks climax-like)
+    double currRange = g_HighBuffer[1] - g_LowBuffer[1];
+    bool strongReversalDown = (currRange > atr * 0.8 && g_CloseBuffer[1] < g_OpenBuffer[1] &&
+                              (g_HighBuffer[1] - g_CloseBuffer[1]) / MathMax(currRange, 1e-10) < 0.3);
+    bool strongReversalUp   = (currRange > atr * 0.8 && g_CloseBuffer[1] > g_OpenBuffer[1] &&
+                              (g_CloseBuffer[1] - g_LowBuffer[1]) / MathMax(currRange, 1e-10) < 0.3);
+    
+    // --- H计数(上升Push): 回调后突破前高 ---
+    if(shCount >= 2 && slCount >= 1)
+    {
+        if(g_HighBuffer[1] > sh1 && sl1 < sh2 && (g_H_LastSwingHigh < sh1))
+        {
+            double pullbackDepth = sh2 - sl1;
+            if(pullbackDepth >= minPullbackATR)
+            {
+                g_H_Count++;
+                g_H_LastSwingHigh = sh1;
+                g_H_LastPullbackLow = sl1;
+                g_H_LastPBLowBar = 1;
+            }
+        }
+        // 重置H计数: a)lower low b)显著新低(跌破前波段0.5ATR) c)强反转
+        if(sl1 > 0 && sl2 > 0 && g_LowBuffer[1] < sl1 && sl1 < sl2)
+            { g_H_Count = 0; g_H_LastSwingHigh = 0; g_H_LastPullbackLow = 0; }
+        else if(sl1 > 0 && g_LowBuffer[1] < sl1 - resetExtremeATR)
+            { g_H_Count = 0; g_H_LastSwingHigh = 0; g_H_LastPullbackLow = 0; }
+        else if(strongReversalDown)
+            { g_H_Count = 0; g_H_LastSwingHigh = 0; g_H_LastPullbackLow = 0; }
+    }
+    
+    // --- L计数(下降Push): 反弹后跌破前低 ---
+    if(slCount >= 2 && shCount >= 1)
+    {
+        if(g_LowBuffer[1] < sl1 && sh1 > sl2 && (g_L_LastSwingLow == 0 || sl1 < g_L_LastSwingLow))
+        {
+            double bounceDepth = sh1 - sl2;
+            if(bounceDepth >= minPullbackATR)
+            {
+                g_L_Count++;
+                g_L_LastSwingLow = sl1;
+                g_L_LastBounceHigh = sh1;
+                g_L_LastBounceBar = 1;
+            }
+        }
+        // 重置L计数: a)higher high b)显著新高(超越前波段0.5ATR) c)强反转
+        if(sh1 > 0 && sh2 > 0 && g_HighBuffer[1] > sh1 && sh1 > sh2)
+            { g_L_Count = 0; g_L_LastSwingLow = 0; g_L_LastBounceHigh = 0; }
+        else if(sh1 > 0 && g_HighBuffer[1] > sh1 + resetExtremeATR)
+            { g_L_Count = 0; g_L_LastSwingLow = 0; g_L_LastBounceHigh = 0; }
+        else if(strongReversalUp)
+            { g_L_Count = 0; g_L_LastSwingLow = 0; g_L_LastBounceHigh = 0; }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| H/L 计数信号 - 方向中性 (direction: DIR_LONG=1 多, DIR_SHORT=-1 空)  |
+//| 统一 H1/H2 与 L1/L2 逻辑，减少重复                                 |
+//+------------------------------------------------------------------+
+ENUM_SIGNAL_TYPE CheckHLCountSignal(int direction, double atr, double &stopLoss, double &baseHeight)
+{
+    if(atr <= 0) return SIGNAL_NONE;
+    int count = (direction == DIR_LONG) ? g_H_Count : g_L_Count;
+    ENUM_ALWAYS_IN needAI = (direction == DIR_LONG) ? AI_LONG : AI_SHORT;
+    if(g_AlwaysIn != needAI) return SIGNAL_NONE;
+
+    string sideStr = (direction == DIR_LONG) ? "buy" : "sell";
+    double extreme = (direction == DIR_LONG) ? g_H_LastPullbackLow : g_L_LastBounceHigh;
+    bool htfBlock = (direction == DIR_LONG && InpEnableHTFFilter && g_HTFTrendDir == "down") ||
+                    (direction == DIR_SHORT && InpEnableHTFFilter && g_HTFTrendDir == "up");
+    if(htfBlock) return SIGNAL_NONE;
+    if(g_MarketState == MARKET_STATE_TRADING_RANGE) return SIGNAL_NONE;
+
+    double close1 = g_CloseBuffer[1];
+    stopLoss = (direction == DIR_LONG) ? (extreme - atr * 0.3) : (extreme + atr * 0.3);
+    double risk = (direction == DIR_LONG) ? (close1 - stopLoss) : (stopLoss - close1);
+    if(risk > atr * InpMaxStopATRMult) return SIGNAL_NONE;
+
+    baseHeight = atr * 2.0;
+
+    // 第一次计数(H1/L1): 需极强趋势 + 最近5根中至少4根同向
+    if(count == 1)
+    {
+        bool isVeryStrong = (g_MarketState == MARKET_STATE_STRONG_TREND && g_TrendStrength >= 0.65) ||
+                            (g_MarketState == MARKET_STATE_TIGHT_CHANNEL);
+        int sameDirCount = 0;
+        for(int i = 1; i <= 5 && i < g_BufferSize; i++)
+        {
+            double body = g_CloseBuffer[i] - g_OpenBuffer[i];
+            if((direction == DIR_LONG && body > 0) || (direction == DIR_SHORT && body < 0))
+                sameDirCount++;
+        }
+        if(!isVeryStrong || sameDirCount < 4) return SIGNAL_NONE;
+        if(Check20GapBarBlock(direction == DIR_LONG ? "H1" : "L1")) return SIGNAL_NONE;
+    }
+
+    if(!CheckSignalCooldown(sideStr)) return SIGNAL_NONE;
+    if(!ValidateSignalBar(sideStr)) return SIGNAL_NONE;
+
+    if(direction == DIR_LONG) { g_H_Count = 0; UpdateSignalCooldown("buy"); return (count == 1) ? SIGNAL_H1_BUY : SIGNAL_H2_BUY; }
+    else                      { g_L_Count = 0; UpdateSignalCooldown("sell"); return (count == 1) ? SIGNAL_L1_SELL : SIGNAL_L2_SELL; }
+}
+
+//+------------------------------------------------------------------+
+//| Check Spike - Brooks: 连续3+根强趋势K线,几乎无重叠                 |
+//| 不是2根大K线,而是一组连续的、方向一致的、重叠极少的K线               |
+//+------------------------------------------------------------------+
+ENUM_SIGNAL_TYPE CheckSpike(double ema, double atr, double &stopLoss, double &baseHeight)
+{
+    if(atr <= 0) return SIGNAL_NONE;
+    
+    // 向上Spike检测: 连续N根阳线,低重叠,创新高
+    int bullSpike = CountSpikeBarsBull(atr);
+    if(bullSpike >= InpMinSpikeBars)
+    {
+        // Spike必须与AI方向一致,或足够强翻转AI
+        if(g_AlwaysIn == AI_SHORT && bullSpike < 5) return SIGNAL_NONE;
+        if(!ValidateSignalBar("buy") || !CheckSignalCooldown("buy")) return SIGNAL_NONE;
+        
+        // 入场: Spike后的第一根K线收盘确认
+        if(g_CloseBuffer[1] > g_OpenBuffer[1]) // 确认K线
+        {
+            // 止损在Spike起点下方
+            double spikeBottom = g_LowBuffer[1];
+            for(int i = 1; i <= bullSpike + 1 && i < g_BufferSize; i++)
+                if(g_LowBuffer[i] < spikeBottom) spikeBottom = g_LowBuffer[i];
+            
+            stopLoss = spikeBottom - atr * 0.3;
+            if((g_CloseBuffer[1] - stopLoss) > atr * InpMaxStopATRMult)
+            {
+                // Spike太大,用最近swing low
+                double recentSL = GetRecentSwingLow(1);
+                if(recentSL > 0) stopLoss = recentSL - atr * 0.3;
+                if((g_CloseBuffer[1] - stopLoss) > atr * InpMaxStopATRMult) return SIGNAL_NONE;
+            }
+            
+            baseHeight = atr * 2.0;
+            UpdateSignalCooldown("buy");
+            return SIGNAL_SPIKE_BUY;
+        }
+    }
+    
+    // 向下Spike检测
+    int bearSpike = CountSpikeBarsBear(atr);
+    if(bearSpike >= InpMinSpikeBars)
+    {
+        if(g_AlwaysIn == AI_LONG && bearSpike < 5) return SIGNAL_NONE;
+        if(!ValidateSignalBar("sell") || !CheckSignalCooldown("sell")) return SIGNAL_NONE;
+        
+        if(g_CloseBuffer[1] < g_OpenBuffer[1])
+        {
+            double spikeTop = g_HighBuffer[1];
+            for(int i = 1; i <= bearSpike + 1 && i < g_BufferSize; i++)
+                if(g_HighBuffer[i] > spikeTop) spikeTop = g_HighBuffer[i];
+            
+            stopLoss = spikeTop + atr * 0.3;
+            if((stopLoss - g_CloseBuffer[1]) > atr * InpMaxStopATRMult)
+            {
+                double recentSH = GetRecentSwingHigh(1);
+                if(recentSH > 0) stopLoss = recentSH + atr * 0.3;
+                if((stopLoss - g_CloseBuffer[1]) > atr * InpMaxStopATRMult) return SIGNAL_NONE;
+            }
+            
+            baseHeight = atr * 2.0;
+            UpdateSignalCooldown("sell");
+            return SIGNAL_SPIKE_SELL;
+        }
+    }
+    
+    return SIGNAL_NONE;
+}
+
+// 计算连续向上Spike K线数 - Brooks: 强趋势K线+低重叠
+int CountSpikeBarsBull(double atr)
+{
+    int count = 0;
+    int maxLookback = MathMin(20, g_BufferSize - 2);
+    
+    for(int i = 2; i <= maxLookback; i++)
+    {
+        double body = g_CloseBuffer[i] - g_OpenBuffer[i];
+        double range = g_HighBuffer[i] - g_LowBuffer[i];
+        if(range <= 0) break;
+        
+        // 趋势K线: 阳线且实体占比>50%
+        bool isTrendBar = (body > 0 && body / range > 0.50);
+        // 或者: 收盘在上半部分且range足够大
+        if(!isTrendBar)
+        {
+            double closePos = (g_CloseBuffer[i] - g_LowBuffer[i]) / range;
+            isTrendBar = (closePos > 0.6 && range > atr * 0.5);
+        }
+        if(!isTrendBar) break;
+        
+        // 重叠检查: 当前K线低点不应低于前一根K线中点太多
+        if(i > 2 && i - 1 >= 1)
+        {
+            double prevMid = (g_HighBuffer[i-1] + g_LowBuffer[i-1]) / 2.0;
+            double overlap = prevMid - g_LowBuffer[i];
+            double prevRange = g_HighBuffer[i-1] - g_LowBuffer[i-1];
+            if(prevRange > 0 && overlap / prevRange > InpSpikeOverlapMax) break;
+        }
+        
+        count++;
+    }
+    return count;
+}
+
+// 计算连续向下Spike K线数
+int CountSpikeBarsBear(double atr)
+{
+    int count = 0;
+    int maxLookback = MathMin(20, g_BufferSize - 2);
+    
+    for(int i = 2; i <= maxLookback; i++)
+    {
+        double body = g_OpenBuffer[i] - g_CloseBuffer[i];
+        double range = g_HighBuffer[i] - g_LowBuffer[i];
+        if(range <= 0) break;
+        
+        bool isTrendBar = (body > 0 && body / range > 0.50);
+        if(!isTrendBar)
+        {
+            double closePos = (g_HighBuffer[i] - g_CloseBuffer[i]) / range;
+            isTrendBar = (closePos > 0.6 && range > atr * 0.5);
+        }
+        if(!isTrendBar) break;
+        
+        if(i > 2 && i - 1 >= 1)
+        {
+            double prevMid = (g_HighBuffer[i-1] + g_LowBuffer[i-1]) / 2.0;
+            double overlap = g_HighBuffer[i] - prevMid;
+            double prevRange = g_HighBuffer[i-1] - g_LowBuffer[i-1];
+            if(prevRange > 0 && overlap / prevRange > InpSpikeOverlapMax) break;
+        }
+        
+        count++;
+    }
+    return count;
+}
+
+//+------------------------------------------------------------------+
+//| Check Micro Channel - Brooks: 极紧密通道,每根K线创新高/低           |
+//| 回调极浅(不超过前一根25%),连续5+根方向一致                          |
+//| 入场: Micro Channel中顺势突破前一根高/低点                          |
+//+------------------------------------------------------------------+
+ENUM_SIGNAL_TYPE CheckMicroChannel(double ema, double atr, double &stopLoss, double &baseHeight)
+{
+    if(atr <= 0 || g_BufferSize < 8) return SIGNAL_NONE;
+    
+    // 检测向上Micro Channel: 连续K线创新高,回调极浅
+    int upCount = 0;
+    for(int i = 2; i <= 10 && i + 1 < g_BufferSize; i++)
+    {
+        // 每根K线高点高于前一根
+        if(g_HighBuffer[i] <= g_HighBuffer[i+1]) break;
+        // 低点也递增(higher lows)
+        if(g_LowBuffer[i] < g_LowBuffer[i+1]) break;
+        // 回调不超过前一根range的25%(Brooks标准)
+        double prevRange = g_HighBuffer[i+1] - g_LowBuffer[i+1];
+        if(prevRange > 0)
+        {
+            double prevThreshold = g_LowBuffer[i+1] + prevRange * 0.75;
+            if(g_LowBuffer[i] < prevThreshold) break;
+        }
+        upCount++;
+    }
+    
+    if(upCount >= 5 && g_AlwaysIn == AI_LONG)
+    {
+        // 入场: 当前K线突破前一根高点,且为阳线
+        if(g_HighBuffer[1] > g_HighBuffer[2] && g_CloseBuffer[1] > g_OpenBuffer[1])
+        {
+            if(!ValidateSignalBar("buy") || !CheckSignalCooldown("buy")) return SIGNAL_NONE;
+            
+            // 止损在Micro Channel最低点下方
+            double mcLow = g_LowBuffer[2];
+            for(int i = 2; i <= upCount + 1 && i < g_BufferSize; i++)
+                if(g_LowBuffer[i] < mcLow) mcLow = g_LowBuffer[i];
+            
+            stopLoss = mcLow - atr * 0.3;
+            // MC止损可能很远,用最近2根低点作为替代
+            if((g_CloseBuffer[1] - stopLoss) > atr * InpMaxStopATRMult)
+                stopLoss = MathMin(g_LowBuffer[1], g_LowBuffer[2]) - atr * 0.3;
+            if((g_CloseBuffer[1] - stopLoss) > atr * InpMaxStopATRMult) return SIGNAL_NONE;
+            
+            baseHeight = atr * 2.0;
+            UpdateSignalCooldown("buy");
+            return SIGNAL_MICRO_CH_BUY;
+        }
+    }
+    
+    // 检测向下Micro Channel
+    int downCount = 0;
+    for(int i = 2; i <= 10 && i + 1 < g_BufferSize; i++)
+    {
+        if(g_LowBuffer[i] >= g_LowBuffer[i+1]) break;
+        if(g_HighBuffer[i] > g_HighBuffer[i+1]) break;
+        double prevRange = g_HighBuffer[i+1] - g_LowBuffer[i+1];
+        if(prevRange > 0)
+        {
+            // 回调不超过前一根range的25%
+            double prevThreshold = g_HighBuffer[i+1] - prevRange * 0.75;
+            if(g_HighBuffer[i] > prevThreshold) break;
+        }
+        downCount++;
+    }
+    
+    if(downCount >= 5 && g_AlwaysIn == AI_SHORT)
+    {
+        if(g_LowBuffer[1] < g_LowBuffer[2] && g_CloseBuffer[1] < g_OpenBuffer[1])
+        {
+            if(!ValidateSignalBar("sell") || !CheckSignalCooldown("sell")) return SIGNAL_NONE;
+            
+            double mcHigh = g_HighBuffer[2];
+            for(int i = 2; i <= downCount + 1 && i < g_BufferSize; i++)
+                if(g_HighBuffer[i] > mcHigh) mcHigh = g_HighBuffer[i];
+            
+            stopLoss = mcHigh + atr * 0.3;
+            if((stopLoss - g_CloseBuffer[1]) > atr * InpMaxStopATRMult)
+                stopLoss = MathMax(g_HighBuffer[1], g_HighBuffer[2]) + atr * 0.3;
+            if((stopLoss - g_CloseBuffer[1]) > atr * InpMaxStopATRMult) return SIGNAL_NONE;
+            
+            baseHeight = atr * 2.0;
+            UpdateSignalCooldown("sell");
+            return SIGNAL_MICRO_CH_SELL;
+        }
+    }
+    
+    return SIGNAL_NONE;
+}
+
+//+------------------------------------------------------------------+
+//| Check Wedge - Brooks: 三推形态,推动力度递减,需突破趋势线            |
+//| 三个递增高点(顶)或递减低点(底),每次推动动量减弱                     |
+//+------------------------------------------------------------------+
+//+------------------------------------------------------------------+
+//| Wedge 三推形态 - 方向中性 (direction: DIR_LONG=1 楔底多, DIR_SHORT=-1 楔顶空) |
+//| 统一 极值=extreme(i)、回撤、动量递减、当前K线 逻辑                     |
+//+------------------------------------------------------------------+
+ENUM_SIGNAL_TYPE CheckWedgeDirection(int direction, double atr, double &stopLoss, double &baseHeight)
+{
+    if(atr <= 0) return SIGNAL_NONE;
+    int lookback = 40;
+    int maxIdx = MathMin(lookback, g_BufferSize - 3);
+    // 极值: 多=low 找三底, 空=high 找三顶
+    double ext[3] = {0, 0, 0};
+    int extBars[3] = {-1, -1, -1};
+    double extBodies[3] = {0, 0, 0};
+    int extCount = 0;
+
+    for(int i = 3; i <= maxIdx && extCount < 3; i++)
+    {
+        if(i - 2 < 0 || i + 2 >= g_BufferSize) continue;
+        double ei = (direction == DIR_LONG) ? g_LowBuffer[i] : g_HighBuffer[i];
+        double e1 = (direction == DIR_LONG) ? g_LowBuffer[i-1] : g_HighBuffer[i-1];
+        double e2 = (direction == DIR_LONG) ? g_LowBuffer[i-2] : g_HighBuffer[i-2];
+        double e3 = (direction == DIR_LONG) ? g_LowBuffer[i+1] : g_HighBuffer[i+1];
+        double e4 = (direction == DIR_LONG) ? g_LowBuffer[i+2] : g_HighBuffer[i+2];
+        bool isLocal = (direction == DIR_LONG) ? (ei < e1 && ei < e2 && ei < e3 && ei < e4) : (ei > e1 && ei > e2 && ei > e3 && ei > e4);
+        if(!isLocal) continue;
+        bool sequential = (extCount == 0) || ((direction == DIR_LONG && ei < ext[extCount-1]) || (direction == DIR_SHORT && ei > ext[extCount-1]));
+        if(!sequential) continue;
+
+        bool hasRetrace = true;
+        if(extCount > 0)
+        {
+            int prevBar = extBars[extCount-1];
+            double oppBetween = (direction == DIR_LONG) ? g_HighBuffer[i] : g_LowBuffer[i];
+            for(int j = prevBar + 1; j < i && j < g_BufferSize; j++)
+            {
+                if(direction == DIR_LONG && g_HighBuffer[j] > oppBetween) oppBetween = g_HighBuffer[j];
+                if(direction == DIR_SHORT && g_LowBuffer[j] < oppBetween) oppBetween = g_LowBuffer[j];
+            }
+            double retraceSize = (direction == DIR_LONG) ? (oppBetween - ext[extCount-1]) : (ext[extCount-1] - oppBetween);
+            if(retraceSize < atr * 0.3) hasRetrace = false;
+        }
+        if(!hasRetrace) continue;
+
+        double maxBody = 0;
+        int startJ = (extCount > 0) ? extBars[extCount-1] : MathMin(i + 5, g_BufferSize - 1);
+        for(int j = i; j <= startJ && j < g_BufferSize; j++)
+        {
+            double b = (direction == DIR_LONG) ? (g_OpenBuffer[j] - g_CloseBuffer[j]) : (g_CloseBuffer[j] - g_OpenBuffer[j]);
+            if(b > maxBody) maxBody = b;
+        }
+        ext[extCount] = ei;
+        extBars[extCount] = i;
+        extBodies[extCount] = maxBody;
+        extCount++;
+    }
+
+    if(extCount < 3) return SIGNAL_NONE;
+    // Brooks: 楔形=三推动量递减，第三推最弱，故实体/力度应递减 extBodies[0]>extBodies[1]>extBodies[2]
+    bool momentumDecline = (extBodies[0] > extBodies[1] && extBodies[1] > extBodies[2]);
+    if(!momentumDecline) return SIGNAL_NONE;
+
+    double currExt = (direction == DIR_LONG) ? g_LowBuffer[1] : g_HighBuffer[1];
+    double currOpp = (direction == DIR_LONG) ? g_HighBuffer[1] : g_LowBuffer[1];
+    bool nearThird = (MathAbs(currExt - ext[2]) <= atr * InpNearTrendlineATRMult);
+    if(!nearThird) return SIGNAL_NONE;
+
+    double kRange = g_HighBuffer[1] - g_LowBuffer[1];
+    if(kRange <= 0) return SIGNAL_NONE;
+    bool barDirection = (direction == DIR_LONG) ? (g_CloseBuffer[1] > g_OpenBuffer[1]) : (g_CloseBuffer[1] < g_OpenBuffer[1]);
+    double closePos = (direction == DIR_LONG) ? ((g_CloseBuffer[1] - g_LowBuffer[1]) / kRange) : ((g_HighBuffer[1] - g_CloseBuffer[1]) / kRange);
+    if(!barDirection || closePos < 0.50) return SIGNAL_NONE;
+
+    string sideStr = (direction == DIR_LONG) ? "buy" : "sell";
+    if(!CheckSignalCooldown(sideStr)) return SIGNAL_NONE;
+    // 楔底多: 止损在第三底下方; 楔顶空: 止损在第三顶上方 (Brooks)
+    stopLoss = ext[2] - (double)direction * atr * 0.5;
+    baseHeight = (direction == DIR_LONG) ? (g_HighBuffer[extBars[0]] - ext[2]) : (ext[2] - g_LowBuffer[extBars[0]]);
+    UpdateSignalCooldown(sideStr);
+    return (direction == DIR_LONG) ? SIGNAL_WEDGE_BUY : SIGNAL_WEDGE_SELL;
+}
+
+//+------------------------------------------------------------------+
+//| Check Climax Reversal - Brooks: 极端K线后的反转                    |
+//| Climax = 超大range趋势K线(通常>2.5ATR),之后出现反向K线             |
+//| 强趋势中第一次反转80%失败,需等第二入场                              |
+//+------------------------------------------------------------------+
+ENUM_SIGNAL_TYPE CheckClimax(double ema, double atr, double &stopLoss, double &baseHeight)
+{
+    if(atr <= 0) return SIGNAL_NONE;
+    
+    // Climax K线 = bar[2], 反转确认 = bar[1]
+    double prevHigh = g_HighBuffer[2], prevLow = g_LowBuffer[2];
+    double prevOpen = g_OpenBuffer[2], prevClose = g_CloseBuffer[2];
+    double prevRange = prevHigh - prevLow;
+    double prevBody = MathAbs(prevClose - prevOpen);
+    
+    double currHigh = g_HighBuffer[1], currLow = g_LowBuffer[1];
+    double currOpen = g_OpenBuffer[1], currClose = g_CloseBuffer[1];
+    double currRange = currHigh - currLow;
+    double currBody = MathAbs(currClose - currOpen);
+    
+    if(currRange <= 0 || prevBody <= 0) return SIGNAL_NONE;
+    
+    bool isStrictMode = (g_MarketCycle == MARKET_CYCLE_SPIKE);
+    double climaxMult = isStrictMode ? InpSpikeClimaxATRMult : 2.5;
+    
+    // --- 向上Climax -> 做空 ---
+    if(prevRange > atr * climaxMult && prevClose > prevOpen)
+    {
+        // 反转K线: 阴线,收盘低于climax K线收盘
+        if(currClose < currOpen && currClose < prevClose)
+        {
+            // 下影线不能太长(说明买方还在)
+            double lowerTail = MathMin(currOpen, currClose) - currLow;
+            if(currRange > 0 && lowerTail / currRange > 0.25) return SIGNAL_NONE;
+            
+            // 验证前期有足够的上涨空间
+            double lookbackLow = g_LowBuffer[3];
+            for(int i = 3; i <= 10 && i < g_BufferSize; i++)
+                if(g_LowBuffer[i] < lookbackLow) lookbackLow = g_LowBuffer[i];
+            
+            double priorMove = prevHigh - lookbackLow;
+            double minPrior = isStrictMode ? atr * 4.0 : atr * 2.0;
+            if(priorMove < minPrior) return SIGNAL_NONE;
+            
+            // 第二入场检查 - Brooks: 强趋势中第一次反转通常失败
+            if(isStrictMode && InpRequireSecondEntry)
+            {
+                if(!CheckForFailedReversalAttempt("bearish", atr))
+                {
+                    RecordReversalAttempt("bearish", currLow);
+                    return SIGNAL_NONE;
+                }
+            }
+            
+            if(!CheckSignalCooldown("sell")) return SIGNAL_NONE;
+            
+            stopLoss = CalculateStopLoss("sell", atr);
+            if(stopLoss > 0)
+            {
+                baseHeight = prevRange;
+                UpdateSignalCooldown("sell");
+                return SIGNAL_CLIMAX_SELL;
+            }
+        }
+    }
+    
+    // --- 向下Climax -> 做多 ---
+    if(prevRange > atr * climaxMult && prevClose < prevOpen)
+    {
+        if(currClose > currOpen && currClose > prevClose)
+        {
+            double upperTail = currHigh - MathMax(currOpen, currClose);
+            if(currRange > 0 && upperTail / currRange > 0.25) return SIGNAL_NONE;
+            
+            double lookbackHigh = g_HighBuffer[3];
+            for(int i = 3; i <= 10 && i < g_BufferSize; i++)
+                if(g_HighBuffer[i] > lookbackHigh) lookbackHigh = g_HighBuffer[i];
+            
+            double priorMove = lookbackHigh - prevLow;
+            double minPrior = isStrictMode ? atr * 4.0 : atr * 2.0;
+            if(priorMove < minPrior) return SIGNAL_NONE;
+            
+            if(isStrictMode && InpRequireSecondEntry)
+            {
+                if(!CheckForFailedReversalAttempt("bullish", atr))
+                {
+                    RecordReversalAttempt("bullish", currHigh);
+                    return SIGNAL_NONE;
+                }
+            }
+            
+            if(!CheckSignalCooldown("buy")) return SIGNAL_NONE;
+            
+            stopLoss = CalculateStopLoss("buy", atr);
+            if(stopLoss > 0)
+            {
+                baseHeight = prevRange;
+                UpdateSignalCooldown("buy");
+                return SIGNAL_CLIMAX_BUY;
+            }
+        }
+    }
+    
+    return SIGNAL_NONE;
+}
+
+//+------------------------------------------------------------------+
+//| Check MTR - Brooks: Major Trend Reversal                          |
+//| 完整流程: 趋势线突破 -> 回测趋势线失败 -> 形成higher low/lower high |
+//+------------------------------------------------------------------+
+ENUM_SIGNAL_TYPE CheckMTR(double ema, double atr, double &stopLoss, double &baseHeight)
+{
+    if(atr <= 0 || !g_TrendLineBroken) return SIGNAL_NONE;
+    
+    // MTR需要: 1)趋势线已被突破 2)回测趋势线失败 3)形成反转结构
+    
+    double currClose = g_CloseBuffer[1], currOpen = g_OpenBuffer[1];
+    double currHigh = g_HighBuffer[1], currLow = g_LowBuffer[1];
+    double currRange = currHigh - currLow;
+    
+    // 获取趋势线在当前位置的价格
+    double tlPrice = GetTrendLinePrice(1);
+    if(tlPrice <= 0) return SIGNAL_NONE;
+    
+    // --- 上升趋势线被突破 -> MTR Sell ---
+    if(g_TrendDirection == "up" || g_AlwaysIn == AI_LONG)
+    {
+        // 趋势线在价格下方,被向下突破
+        if(g_TrendLineBreakPrice > 0 && g_TrendLineBreakPrice < tlPrice)
+        {
+            // 回测: 价格反弹接近趋势线但未能突破,且出现反转K线形态(靠近=0.2*ATR)
+            double nearTolerance = atr * InpNearTrendlineATRMult;
+            bool retestFailed = false;
+            for(int i = 1; i <= 5 && i < g_BufferSize; i++)
+            {
+                if(g_HighBuffer[i] >= tlPrice - nearTolerance && g_CloseBuffer[i] < tlPrice)
+                {
+                    // 检查是否有反转K线形态(阴线或doji)
+                    double barRange = g_HighBuffer[i] - g_LowBuffer[i];
+                    if(barRange > 0)
+                    {
+                        bool isBearish = g_CloseBuffer[i] < g_OpenBuffer[i];
+                        bool isDoji = MathAbs(g_CloseBuffer[i] - g_OpenBuffer[i]) / barRange < 0.3;
+                        if(isBearish || isDoji)
+                        {
+                            retestFailed = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            
+            if(retestFailed)
+            {
+                // 形成lower high: 最近swing high低于前一个
+                double sh1 = GetRecentSwingHigh(1);
+                double sh2 = GetRecentSwingHigh(2);
+                if(sh1 > 0 && sh2 > 0 && sh1 < sh2)
+                {
+                    // 反转K线确认: 阴线且收盘在下半部
+                    if(currClose < currOpen && currRange > 0)
+                    {
+                        double closePos = (currHigh - currClose) / currRange;
+                        if(closePos >= 0.5 && ValidateSignalBar("sell") && CheckSignalCooldown("sell"))
+                        {
+                            stopLoss = sh1 + atr * 0.5;
+                            baseHeight = sh2 - currLow;
+                            UpdateSignalCooldown("sell");
+                            g_TrendLineBroken = false;
+                            return SIGNAL_MTR_SELL;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // --- 下降趋势线被突破 -> MTR Buy ---
+    if(g_TrendDirection == "down" || g_AlwaysIn == AI_SHORT)
+    {
+        if(g_TrendLineBreakPrice > 0 && g_TrendLineBreakPrice > tlPrice)
+        {
+            double nearTolerance = atr * InpNearTrendlineATRMult;
+            bool retestFailed = false;
+            for(int i = 1; i <= 5 && i < g_BufferSize; i++)
+            {
+                if(g_LowBuffer[i] <= tlPrice + nearTolerance && g_CloseBuffer[i] > tlPrice)
+                {
+                    double barRange = g_HighBuffer[i] - g_LowBuffer[i];
+                    if(barRange > 0)
+                    {
+                        bool isBullish = g_CloseBuffer[i] > g_OpenBuffer[i];
+                        bool isDoji = MathAbs(g_CloseBuffer[i] - g_OpenBuffer[i]) / barRange < 0.3;
+                        if(isBullish || isDoji)
+                        {
+                            retestFailed = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            
+            if(retestFailed)
+            {
+                double sl1 = GetRecentSwingLow(1);
+                double sl2 = GetRecentSwingLow(2);
+                if(sl1 > 0 && sl2 > 0 && sl1 > sl2)
+                {
+                    if(currClose > currOpen && currRange > 0)
+                    {
+                        double closePos = (currClose - currLow) / currRange;
+                        if(closePos >= 0.5 && ValidateSignalBar("buy") && CheckSignalCooldown("buy"))
+                        {
+                            stopLoss = sl1 - atr * 0.5;
+                            baseHeight = currHigh - sl2;
+                            UpdateSignalCooldown("buy");
+                            g_TrendLineBroken = false;
+                            return SIGNAL_MTR_BUY;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    return SIGNAL_NONE;
+}
+
+//+------------------------------------------------------------------+
+//| Trend Line Tracking - MTR需要趋势线突破和回测                      |
+//+------------------------------------------------------------------+
+void UpdateTrendLine(double atr)
+{
+    if(g_SwingPointCount < 4 || atr <= 0) return;
+    
+    // 上升趋势线: 连接两个递增的swing low
+    if(g_AlwaysIn == AI_LONG || g_TrendDirection == "up")
+    {
+        double sl1 = 0, sl2 = 0;
+        int sl1Bar = 0, sl2Bar = 0;
+        int found = 0;
+        
+        for(int i = 0; i < g_SwingPointCount && found < 2; i++)
+        {
+            if(!g_SwingPoints[i].isHigh)
+            {
+                if(found == 0) { sl1 = g_SwingPoints[i].price; sl1Bar = g_SwingPoints[i].barIndex; }
+                else { sl2 = g_SwingPoints[i].price; sl2Bar = g_SwingPoints[i].barIndex; }
+                found++;
+            }
+        }
+        
+        if(found >= 2 && sl2 < sl1 && sl2Bar > sl1Bar)
+        {
+            g_TrendLineStart = sl2;
+            g_TrendLineEnd = sl1;
+            g_TrendLineStartBar = sl2Bar;
+            g_TrendLineEndBar = sl1Bar;
+            // 检查趋势线是否被突破
+            double tlNow = GetTrendLinePrice(1);
+            if(tlNow > 0 && g_CloseBuffer[1] < tlNow - atr * 0.1 && !g_TrendLineBroken)
+            {
+                g_TrendLineBroken = true;
+                g_TrendLineBreakPrice = g_CloseBuffer[1];
+            }
+        }
+    }
+    
+    // 下降趋势线: 连接两个递减的swing high
+    if(g_AlwaysIn == AI_SHORT || g_TrendDirection == "down")
+    {
+        double sh1 = 0, sh2 = 0;
+        int sh1Bar = 0, sh2Bar = 0;
+        int found = 0;
+        
+        for(int i = 0; i < g_SwingPointCount && found < 2; i++)
+        {
+            if(g_SwingPoints[i].isHigh)
+            {
+                if(found == 0) { sh1 = g_SwingPoints[i].price; sh1Bar = g_SwingPoints[i].barIndex; }
+                else { sh2 = g_SwingPoints[i].price; sh2Bar = g_SwingPoints[i].barIndex; }
+                found++;
+            }
+        }
+        
+        if(found >= 2 && sh2 > sh1 && sh2Bar > sh1Bar)
+        {
+            g_TrendLineStart = sh2;
+            g_TrendLineEnd = sh1;
+            g_TrendLineStartBar = sh2Bar;
+            g_TrendLineEndBar = sh1Bar;
+            double tlNow = GetTrendLinePrice(1);
+            if(tlNow > 0 && g_CloseBuffer[1] > tlNow + atr * 0.1 && !g_TrendLineBroken)
+            {
+                g_TrendLineBroken = true;
+                g_TrendLineBreakPrice = g_CloseBuffer[1];
+            }
+        }
+    }
+}
+
+double GetTrendLinePrice(int barIndex)
+{
+    // 防止除零错误
+    if(g_TrendLineStartBar == g_TrendLineEndBar) 
+    {
+        // 如果两点重合,返回该点的价格
+        return g_TrendLineEnd;
+    }
+    
+    // 防止无效数据
+    if(g_TrendLineStart == 0 || g_TrendLineEnd == 0)
+        return 0;
+    
+    double slope = (g_TrendLineEnd - g_TrendLineStart) / 
+                   (double)(g_TrendLineStartBar - g_TrendLineEndBar);
+    return g_TrendLineEnd + slope * (g_TrendLineEndBar - barIndex);
+}
+
+
+//+------------------------------------------------------------------+
+//| Check Failed Breakout - Brooks: TR边界突破失败后反向入场            |
+//| 需要明确的TR上下边界,突破后快速回到TR内                             |
+//+------------------------------------------------------------------+
+ENUM_SIGNAL_TYPE CheckFailedBreakout(double ema, double atr, double &stopLoss, double &baseHeight)
+{
+    if(atr <= 0 || g_TR_High <= 0 || g_TR_Low <= 0) return SIGNAL_NONE;
+    
+    double trRange = g_TR_High - g_TR_Low;
+    if(trRange < atr * 1.0) return SIGNAL_NONE; // TR太窄
+    
+    double currHigh  = g_HighBuffer[1], currLow = g_LowBuffer[1];
+    double currClose = g_CloseBuffer[1], currOpen = g_OpenBuffer[1];
+    double kRange = currHigh - currLow;
+    if(kRange <= 0) return SIGNAL_NONE;
+    
+    // 向上突破失败: 突破TR高点后收回TR内
+    if(currHigh > g_TR_High && currClose < g_TR_High && currClose < currOpen)
+    {
+        double closePos = (currHigh - currClose) / kRange;
+        if(closePos >= 0.60 && CheckSignalCooldown("sell"))
+        {
+            stopLoss = currHigh + atr * 0.3;
+            if((stopLoss - currClose) > atr * InpMaxStopATRMult) return SIGNAL_NONE;
+            baseHeight = trRange;
+            UpdateSignalCooldown("sell");
+            return SIGNAL_FAILED_BO_SELL;
+        }
+    }
+    
+    // 向下突破失败: 突破TR低点后收回TR内
+    if(currLow < g_TR_Low && currClose > g_TR_Low && currClose > currOpen)
+    {
+        double closePos = (currClose - currLow) / kRange;
+        if(closePos >= 0.60 && CheckSignalCooldown("buy"))
+        {
+            stopLoss = currLow - atr * 0.3;
+            if((currClose - stopLoss) > atr * InpMaxStopATRMult) return SIGNAL_NONE;
+            baseHeight = trRange;
+            UpdateSignalCooldown("buy");
+            return SIGNAL_FAILED_BO_BUY;
+        }
+    }
+    
+    return SIGNAL_NONE;
+}
+
+//+------------------------------------------------------------------+
+//| Check Final Flag - Brooks: Tight Channel结束后的最后一推            |
+//+------------------------------------------------------------------+
+ENUM_SIGNAL_TYPE CheckFinalFlag(double ema, double atr, double &stopLoss, double &baseHeight)
+{
+    if(g_MarketState != MARKET_STATE_FINAL_FLAG) return SIGNAL_NONE;
+    
+    double currHigh = g_HighBuffer[1], currLow = g_LowBuffer[1];
+    double currClose = g_CloseBuffer[1], currOpen = g_OpenBuffer[1];
+    double kRange = currHigh - currLow;
+    if(kRange <= 0 || atr <= 0) return SIGNAL_NONE;
+    
+    if(g_TightChannelDir == "up" && currClose < currOpen)
+    {
+        if((currHigh - currClose) / kRange >= 0.60 && ValidateSignalBar("sell") && CheckSignalCooldown("sell"))
+        {
+            stopLoss = g_TightChannelExtreme > 0 ? 
+                       g_TightChannelExtreme + atr * 0.5 : currHigh + atr * 0.5;
+            baseHeight = atr * 2.5;
+            UpdateSignalCooldown("sell");
+            return SIGNAL_FINAL_FLAG_SELL;
+        }
+    }
+    else if(g_TightChannelDir == "down" && currClose > currOpen)
+    {
+        if((currClose - currLow) / kRange >= 0.60 && ValidateSignalBar("buy") && CheckSignalCooldown("buy"))
+        {
+            stopLoss = g_TightChannelExtreme > 0 ?
+                       g_TightChannelExtreme - atr * 0.5 : currLow - atr * 0.5;
+            baseHeight = atr * 2.5;
+            UpdateSignalCooldown("buy");
+            return SIGNAL_FINAL_FLAG_BUY;
+        }
+    }
+    
+    return SIGNAL_NONE;
+}
+
+
+//+------------------------------------------------------------------+
+//| Check Double Top/Bottom - Brooks: 两次测试同一价位后反转            |
+//| 方向中性: CheckDoubleTopBottomDirection(direction) 1=双底 -1=双顶   |
+//| Double Top: 两次高点接近(容差0.3ATR),第二次未能突破+反转K线         |
+//| Double Bottom: 两次低点接近,第二次未能跌破+反转K线                  |
+//+------------------------------------------------------------------+
+ENUM_SIGNAL_TYPE CheckDoubleTopBottomDirection(int direction, double atr, double &stopLoss, double &baseHeight)
+{
+    if(atr <= 0 || g_SwingPointCount < 4) return SIGNAL_NONE;
+    double level1 = (direction == DIR_LONG) ? GetRecentSwingLow(1) : GetRecentSwingHigh(1);
+    double level2 = (direction == DIR_LONG) ? GetRecentSwingLow(2) : GetRecentSwingHigh(2);
+    if(level1 <= 0 || level2 <= 0) return SIGNAL_NONE;
+
+    double currHigh = g_HighBuffer[1], currLow = g_LowBuffer[1];
+    double currClose = g_CloseBuffer[1], currOpen = g_OpenBuffer[1];
+    double kRange = currHigh - currLow;
+    if(kRange <= 0) return SIGNAL_NONE;
+    double tolerance = atr * 0.3;
+
+    double currExt = (direction == DIR_LONG) ? currLow : currHigh;
+    bool levelOk = (direction == DIR_LONG) ? (currLow <= level1 + tolerance) : (currHigh >= level1 - tolerance);
+    bool barDir  = (direction == DIR_LONG) ? (currClose > currOpen) : (currClose < currOpen);
+    double closePos = (direction == DIR_LONG) ? ((currClose - currLow) / kRange) : ((currHigh - currClose) / kRange);
+    if(MathAbs(level1 - level2) > tolerance || !levelOk || !barDir || closePos < 0.55) return SIGNAL_NONE;
+
+    string sideStr = (direction == DIR_LONG) ? "buy" : "sell";
+    if(!CheckSignalCooldown(sideStr)) return SIGNAL_NONE;
+    stopLoss = (direction == DIR_LONG) ? (MathMin(level1, level2) - atr * 0.3) : (MathMax(level1, level2) + atr * 0.3);
+    double risk = (direction == DIR_LONG) ? (currClose - stopLoss) : (stopLoss - currClose);
+    if(risk > atr * InpMaxStopATRMult) return SIGNAL_NONE;
+    double sh1 = GetRecentSwingHigh(1), sh2 = GetRecentSwingHigh(2), sl1 = GetRecentSwingLow(1), sl2 = GetRecentSwingLow(2);
+    double rangeHeight = MathMax(sh1, sh2) - MathMin(sl1, sl2);
+    baseHeight = (rangeHeight > 0) ? rangeHeight : atr * 2.0;
+    UpdateSignalCooldown(sideStr);
+    return (direction == DIR_LONG) ? SIGNAL_DT_BUY : SIGNAL_DT_SELL;
+}
+
+//+------------------------------------------------------------------+
+//| Check Trend Bar Entry - Brooks: 强趋势K线直接入场                  |
+//| 条件: 大实体趋势K线(>0.7range) + 收盘在极端位置 + AI方向一致         |
+//+------------------------------------------------------------------+
+ENUM_SIGNAL_TYPE CheckTrendBarEntry(double ema, double atr, double &stopLoss, double &baseHeight)
+{
+    if(atr <= 0) return SIGNAL_NONE;
+    
+    double currHigh = g_HighBuffer[1], currLow = g_LowBuffer[1];
+    double currClose = g_CloseBuffer[1], currOpen = g_OpenBuffer[1];
+    double kRange = currHigh - currLow;
+    if(kRange <= 0 || kRange < atr * 0.8) return SIGNAL_NONE;
+    
+    double body = MathAbs(currClose - currOpen);
+    double bodyRatio = body / kRange;
+    if(bodyRatio < 0.70) return SIGNAL_NONE;
+    
+    if(currClose > currOpen && g_AlwaysIn == AI_LONG)
+    {
+        double closePos = (currClose - currLow) / kRange;
+        if(closePos >= 0.75 && CheckSignalCooldown("buy"))
+        {
+            stopLoss = currLow - atr * 0.3;
+            if((currClose - stopLoss) > atr * InpMaxStopATRMult) return SIGNAL_NONE;
+            baseHeight = kRange;
+            UpdateSignalCooldown("buy");
+            return SIGNAL_TREND_BAR_BUY;
+        }
+    }
+    
+    if(currClose < currOpen && g_AlwaysIn == AI_SHORT)
+    {
+        double closePos = (currHigh - currClose) / kRange;
+        if(closePos >= 0.75 && CheckSignalCooldown("sell"))
+        {
+            stopLoss = currHigh + atr * 0.3;
+            if((stopLoss - currClose) > atr * InpMaxStopATRMult) return SIGNAL_NONE;
+            baseHeight = kRange;
+            UpdateSignalCooldown("sell");
+            return SIGNAL_TREND_BAR_SELL;
+        }
+    }
+    
+    return SIGNAL_NONE;
+}
+
+//+------------------------------------------------------------------+
+//| Check Reversal Bar Entry - Brooks: 反转K线入场                     |
+//| 条件: 长影线+实体在反方向 + 前期有足够运动空间                       |
+//+------------------------------------------------------------------+
+ENUM_SIGNAL_TYPE CheckReversalBarEntry(double ema, double atr, double &stopLoss, double &baseHeight)
+{
+    if(atr <= 0) return SIGNAL_NONE;
+    
+    double currHigh = g_HighBuffer[1], currLow = g_LowBuffer[1];
+    double currClose = g_CloseBuffer[1], currOpen = g_OpenBuffer[1];
+    double kRange = currHigh - currLow;
+    if(kRange <= 0 || kRange < atr * 0.5) return SIGNAL_NONE;
+    
+    double body = MathAbs(currClose - currOpen);
+    double upperTail = currHigh - MathMax(currClose, currOpen);
+    double lowerTail = MathMin(currClose, currOpen) - currLow;
+    
+    double lookbackLow = currLow, lookbackHigh = currHigh;
+    for(int i = 2; i <= 10 && i < g_BufferSize; i++)
+    {
+        if(g_LowBuffer[i] < lookbackLow) lookbackLow = g_LowBuffer[i];
+        if(g_HighBuffer[i] > lookbackHigh) lookbackHigh = g_HighBuffer[i];
+    }
+    
+    if(lowerTail > kRange * 0.4 && currClose > currOpen && lowerTail > body)
+    {
+        double priorDrop = currHigh - lookbackLow;
+        if(priorDrop >= atr * 1.5 && CheckSignalCooldown("buy"))
+        {
+            stopLoss = currLow - atr * 0.3;
+            if((currClose - stopLoss) > atr * InpMaxStopATRMult) return SIGNAL_NONE;
+            baseHeight = priorDrop;
+            UpdateSignalCooldown("buy");
+            return SIGNAL_REV_BAR_BUY;
+        }
+    }
+    
+    if(upperTail > kRange * 0.4 && currClose < currOpen && upperTail > body)
+    {
+        double priorRise = lookbackHigh - currLow;
+        if(priorRise >= atr * 1.5 && CheckSignalCooldown("sell"))
+        {
+            stopLoss = currHigh + atr * 0.3;
+            if((stopLoss - currClose) > atr * InpMaxStopATRMult) return SIGNAL_NONE;
+            baseHeight = priorRise;
+            UpdateSignalCooldown("sell");
+            return SIGNAL_REV_BAR_SELL;
+        }
+    }
+    
+    return SIGNAL_NONE;
+}
+
+//+------------------------------------------------------------------+
+//| Check ii/iii Pattern - Brooks: 连续内包线后的突破                   |
+//| ii = 两根连续内包线, iii = 三根连续内包线                           |
+//| 入场: 突破内包线序列的高/低点                                       |
+//+------------------------------------------------------------------+
+ENUM_SIGNAL_TYPE CheckIIPattern(double ema, double atr, double &stopLoss, double &baseHeight)
+{
+    if(atr <= 0 || g_BufferSize < 7) return SIGNAL_NONE;
+    
+    int insideCount = 0;
+    double patternHigh = g_HighBuffer[2];
+    double patternLow = g_LowBuffer[2];
+    
+    // 确保不会越界: i最大为4, 需要访问i+1=5, 所以g_BufferSize需要>=7
+    int maxCheck = MathMin(4, g_BufferSize - 3);
+    for(int i = 2; i <= maxCheck; i++)
+    {
+        double motherHigh = g_HighBuffer[i + 1];
+        double motherLow = g_LowBuffer[i + 1];
+        double childHigh = g_HighBuffer[i];
+        double childLow = g_LowBuffer[i];
+        
+        if(childHigh <= motherHigh && childLow >= motherLow)
+        {
+            insideCount++;
+            if(childHigh > patternHigh) patternHigh = childHigh;
+            if(childLow < patternLow) patternLow = childLow;
+        }
+        else
+            break;
+    }
+    
+    if(insideCount < 2) return SIGNAL_NONE;
+    
+    double currHigh = g_HighBuffer[1], currLow = g_LowBuffer[1];
+    double currClose = g_CloseBuffer[1], currOpen = g_OpenBuffer[1];
+    
+    if(currHigh > patternHigh && currClose > currOpen && CheckSignalCooldown("buy"))
+    {
+        stopLoss = patternLow - atr * 0.3;
+        if((currClose - stopLoss) > atr * InpMaxStopATRMult) return SIGNAL_NONE;
+        baseHeight = patternHigh - patternLow;
+        UpdateSignalCooldown("buy");
+        return SIGNAL_II_BUY;
+    }
+    
+    if(currLow < patternLow && currClose < currOpen && CheckSignalCooldown("sell"))
+    {
+        stopLoss = patternHigh + atr * 0.3;
+        if((stopLoss - currClose) > atr * InpMaxStopATRMult) return SIGNAL_NONE;
+        baseHeight = patternHigh - patternLow;
+        UpdateSignalCooldown("sell");
+        return SIGNAL_II_SELL;
+    }
+    
+    return SIGNAL_NONE;
+}
+
+//+------------------------------------------------------------------+
+//| Check Outside Bar Reversal - Brooks: 外包线反转                    |
+//| 外包线完全包住前一根K线,收盘方向决定信号方向                         |
+//+------------------------------------------------------------------+
+ENUM_SIGNAL_TYPE CheckOutsideBarReversal(double ema, double atr, double &stopLoss, double &baseHeight)
+{
+    if(atr <= 0 || g_BufferSize < 3) return SIGNAL_NONE;
+    
+    double currHigh = g_HighBuffer[1], currLow = g_LowBuffer[1];
+    double currClose = g_CloseBuffer[1], currOpen = g_OpenBuffer[1];
+    double prevHigh = g_HighBuffer[2], prevLow = g_LowBuffer[2];
+    double kRange = currHigh - currLow;
+    
+    if(kRange <= 0) return SIGNAL_NONE;
+    
+    bool isOutsideBar = (currHigh > prevHigh && currLow < prevLow);
+    if(!isOutsideBar) return SIGNAL_NONE;
+    
+    double body = MathAbs(currClose - currOpen);
+    if(body / kRange < 0.40) return SIGNAL_NONE;
+    
+    double lookbackLow = currLow, lookbackHigh = currHigh;
+    for(int i = 2; i <= 8 && i < g_BufferSize; i++)
+    {
+        if(g_LowBuffer[i] < lookbackLow) lookbackLow = g_LowBuffer[i];
+        if(g_HighBuffer[i] > lookbackHigh) lookbackHigh = g_HighBuffer[i];
+    }
+    
+    if(currClose > currOpen)
+    {
+        double priorDrop = currHigh - lookbackLow;
+        if(priorDrop >= atr * 1.0 && CheckSignalCooldown("buy"))
+        {
+            stopLoss = currLow - atr * 0.3;
+            if((currClose - stopLoss) > atr * InpMaxStopATRMult) return SIGNAL_NONE;
+            baseHeight = kRange;
+            UpdateSignalCooldown("buy");
+            return SIGNAL_OUTSIDE_BAR_BUY;
+        }
+    }
+    
+    if(currClose < currOpen)
+    {
+        double priorRise = lookbackHigh - currLow;
+        if(priorRise >= atr * 1.0 && CheckSignalCooldown("sell"))
+        {
+            stopLoss = currHigh + atr * 0.3;
+            if((stopLoss - currClose) > atr * InpMaxStopATRMult) return SIGNAL_NONE;
+            baseHeight = kRange;
+            UpdateSignalCooldown("sell");
+            return SIGNAL_OUTSIDE_BAR_SELL;
+        }
+    }
+    
+    return SIGNAL_NONE;
+}
+
+//+------------------------------------------------------------------+
+//| Check Measured Move - Brooks: 等距运动目标                         |
+//| AB=CD形态: 第二段运动等于第一段运动                                 |
+//+------------------------------------------------------------------+
+ENUM_SIGNAL_TYPE CheckMeasuredMove(double ema, double atr, double &stopLoss, double &baseHeight)
+{
+    if(atr <= 0 || g_SwingPointCount < 4) return SIGNAL_NONE;
+    
+    double sh1 = GetRecentSwingHigh(1);
+    double sh2 = GetRecentSwingHigh(2);
+    double sl1 = GetRecentSwingLow(1);
+    double sl2 = GetRecentSwingLow(2);
+    
+    if(sh1 <= 0 || sh2 <= 0 || sl1 <= 0 || sl2 <= 0) return SIGNAL_NONE;
+    
+    double currClose = g_CloseBuffer[1], currOpen = g_OpenBuffer[1];
+    double currHigh = g_HighBuffer[1], currLow = g_LowBuffer[1];
+    double tolerance = atr * 0.5;
+    
+    if(sl2 < sl1 && sh2 < sh1)
+    {
+        double leg1 = sh2 - sl2;
+        double projectedTarget = sl1 + leg1;
+        
+        if(currHigh >= projectedTarget - tolerance && currHigh <= projectedTarget + tolerance)
+        {
+            if(currClose < currOpen && CheckSignalCooldown("sell"))
+            {
+                stopLoss = currHigh + atr * 0.3;
+                if((stopLoss - currClose) > atr * InpMaxStopATRMult) return SIGNAL_NONE;
+                baseHeight = leg1;
+                UpdateSignalCooldown("sell");
+                return SIGNAL_MEASURED_MOVE_SELL;
+            }
+        }
+    }
+    
+    if(sh2 > sh1 && sl2 > sl1)
+    {
+        double leg1 = sh2 - sl2;
+        double projectedTarget = sh1 - leg1;
+        
+        if(currLow <= projectedTarget + tolerance && currLow >= projectedTarget - tolerance)
+        {
+            if(currClose > currOpen && CheckSignalCooldown("buy"))
+            {
+                stopLoss = currLow - atr * 0.3;
+                if((currClose - stopLoss) > atr * InpMaxStopATRMult) return SIGNAL_NONE;
+                baseHeight = leg1;
+                UpdateSignalCooldown("buy");
+                return SIGNAL_MEASURED_MOVE_BUY;
+            }
+        }
+    }
+    
+    return SIGNAL_NONE;
+}
+
+//+------------------------------------------------------------------+
+//| Check TR Breakout - Brooks: Trading Range突破入场                  |
+//| 条件: 强势突破K线 + 收盘在TR外 + 突破方向与AI一致                    |
+//+------------------------------------------------------------------+
+ENUM_SIGNAL_TYPE CheckTRBreakout(double ema, double atr, double &stopLoss, double &baseHeight)
+{
+    if(atr <= 0 || g_TR_High <= 0 || g_TR_Low <= 0) return SIGNAL_NONE;
+    if(IsTightTradingRange(atr)) return SIGNAL_NONE;  // TTR观望,不过早入场
+    
+    double trRange = g_TR_High - g_TR_Low;
+    if(trRange < atr * 1.5) return SIGNAL_NONE;
+    
+    double currHigh = g_HighBuffer[1], currLow = g_LowBuffer[1];
+    double currClose = g_CloseBuffer[1], currOpen = g_OpenBuffer[1];
+    double kRange = currHigh - currLow;
+    if(kRange <= 0) return SIGNAL_NONE;
+    
+    double body = MathAbs(currClose - currOpen);
+    if(body / kRange < 0.50) return SIGNAL_NONE;
+    
+    if(currClose > g_TR_High && currClose > currOpen)
+    {
+        if(g_AlwaysIn != AI_SHORT && ValidateSignalBar("buy") && CheckSignalCooldown("buy"))
+        {
+            stopLoss = MathMax(currLow, g_TR_High - trRange * 0.3) - atr * 0.2;
+            if((currClose - stopLoss) > atr * InpMaxStopATRMult)
+                stopLoss = currLow - atr * 0.3;
+            if((currClose - stopLoss) > atr * InpMaxStopATRMult) return SIGNAL_NONE;
+            baseHeight = trRange;
+            UpdateSignalCooldown("buy");
+            g_RecentBreakout = true;
+            g_BreakoutDir = "up";
+            g_BreakoutLevel = g_TR_High;
+            g_BreakoutBarAge = 0;
+            return SIGNAL_TR_BREAKOUT_BUY;
+        }
+    }
+    
+    if(currClose < g_TR_Low && currClose < currOpen)
+    {
+        if(g_AlwaysIn != AI_LONG && ValidateSignalBar("sell") && CheckSignalCooldown("sell"))
+        {
+            stopLoss = MathMin(currHigh, g_TR_Low + trRange * 0.3) + atr * 0.2;
+            if((stopLoss - currClose) > atr * InpMaxStopATRMult)
+                stopLoss = currHigh + atr * 0.3;
+            if((stopLoss - currClose) > atr * InpMaxStopATRMult) return SIGNAL_NONE;
+            baseHeight = trRange;
+            UpdateSignalCooldown("sell");
+            g_RecentBreakout = true;
+            g_BreakoutDir = "down";
+            g_BreakoutLevel = g_TR_Low;
+            g_BreakoutBarAge = 0;
+            return SIGNAL_TR_BREAKOUT_SELL;
+        }
+    }
+    
+    return SIGNAL_NONE;
+}
+
+//+------------------------------------------------------------------+
+//| Update Breakout Pullback Tracking                                 |
+//+------------------------------------------------------------------+
+void UpdateBreakoutPullbackTracking(double ema, double atr)
+{
+    if(!g_RecentBreakout) return;
+    
+    g_BreakoutBarAge++;
+    
+    // 根据市场状态动态调整过期时间
+    int maxAge = 10;
+    if(g_MarketState == MARKET_STATE_STRONG_TREND || g_MarketState == MARKET_STATE_BREAKOUT)
+        maxAge = 15; // 强趋势中给更多时间等待回调
+    else if(g_MarketState == MARKET_STATE_TRADING_RANGE)
+        maxAge = 8;  // TR中回调应该更快
+    
+    if(g_BreakoutBarAge > maxAge)
+    {
+        g_RecentBreakout = false;
+        g_BreakoutDir = "";
+        g_BreakoutLevel = 0;
+        g_BreakoutBarAge = 0;
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Check Breakout Pullback - Brooks: 突破后回调入场                   |
+//| 条件: 有效突破后 + 回调至突破位附近 + 反转K线确认                    |
+//+------------------------------------------------------------------+
+ENUM_SIGNAL_TYPE CheckBreakoutPullback(double ema, double atr, double &stopLoss, double &baseHeight)
+{
+    if(atr <= 0 || !g_RecentBreakout || g_BreakoutLevel <= 0) return SIGNAL_NONE;
+    if(g_BreakoutBarAge < 2 || g_BreakoutBarAge > 8) return SIGNAL_NONE;
+    
+    double currHigh = g_HighBuffer[1], currLow = g_LowBuffer[1];
+    double currClose = g_CloseBuffer[1], currOpen = g_OpenBuffer[1];
+    double tolerance = atr * 0.5;
+    
+    if(g_BreakoutDir == "up")
+    {
+        if(currLow <= g_BreakoutLevel + tolerance && currClose > currOpen)
+        {
+            if(currClose > g_BreakoutLevel && CheckSignalCooldown("buy"))
+            {
+                stopLoss = MathMin(currLow, g_BreakoutLevel) - atr * 0.3;
+                if((currClose - stopLoss) > atr * InpMaxStopATRMult) return SIGNAL_NONE;
+                baseHeight = atr * 2.0;
+                UpdateSignalCooldown("buy");
+                g_RecentBreakout = false;
+                return SIGNAL_BO_PULLBACK_BUY;
+            }
+        }
+    }
+    
+    if(g_BreakoutDir == "down")
+    {
+        if(currHigh >= g_BreakoutLevel - tolerance && currClose < currOpen)
+        {
+            if(currClose < g_BreakoutLevel && CheckSignalCooldown("sell"))
+            {
+                stopLoss = MathMax(currHigh, g_BreakoutLevel) + atr * 0.3;
+                if((stopLoss - currClose) > atr * InpMaxStopATRMult) return SIGNAL_NONE;
+                baseHeight = atr * 2.0;
+                UpdateSignalCooldown("sell");
+                g_RecentBreakout = false;
+                return SIGNAL_BO_PULLBACK_SELL;
+            }
+        }
+    }
+    
+    return SIGNAL_NONE;
+}
+
+//+------------------------------------------------------------------+
+//| Check Gap Bar - Brooks: 缺口K线入场                                |
+//| 缺口K线 = 开盘价与前一根收盘价之间有明显跳空                         |
+//+------------------------------------------------------------------+
+ENUM_SIGNAL_TYPE CheckGapBar(double ema, double atr, double &stopLoss, double &baseHeight)
+{
+    if(atr <= 0 || g_BufferSize < 3) return SIGNAL_NONE;
+    
+    double currOpen = g_OpenBuffer[1], currClose = g_CloseBuffer[1];
+    double currHigh = g_HighBuffer[1], currLow = g_LowBuffer[1];
+    double prevClose = g_CloseBuffer[2], prevHigh = g_HighBuffer[2], prevLow = g_LowBuffer[2];
+    
+    double gapThreshold = atr * 0.3;
+    
+    double gapUp = currOpen - prevHigh;
+    double gapDown = prevLow - currOpen;
+    
+    if(gapUp >= gapThreshold && currClose > currOpen)
+    {
+        if(g_AlwaysIn == AI_LONG && ValidateSignalBar("buy") && CheckSignalCooldown("buy"))
+        {
+            stopLoss = MathMin(currLow, prevHigh) - atr * 0.3;
+            if((currClose - stopLoss) > atr * InpMaxStopATRMult) return SIGNAL_NONE;
+            baseHeight = atr * 2.0;
+            UpdateSignalCooldown("buy");
+            return SIGNAL_GAP_BAR_BUY;
+        }
+    }
+    
+    if(gapDown >= gapThreshold && currClose < currOpen)
+    {
+        if(g_AlwaysIn == AI_SHORT && ValidateSignalBar("sell") && CheckSignalCooldown("sell"))
+        {
+            stopLoss = MathMax(currHigh, prevLow) + atr * 0.3;
+            if((stopLoss - currClose) > atr * InpMaxStopATRMult) return SIGNAL_NONE;
+            baseHeight = atr * 2.0;
+            UpdateSignalCooldown("sell");
+            return SIGNAL_GAP_BAR_SELL;
+        }
+    }
+    
+    return SIGNAL_NONE;
+}
+
+
+//+------------------------------------------------------------------+
+//| Market State Detection                                            |
+//+------------------------------------------------------------------+
+void DetectMarketState(double ema, double atr)
+{
+    ENUM_MARKET_STATE detectedState = MARKET_STATE_CHANNEL;
+    
+    if(DetectStrongTrend(ema, atr))
+        detectedState = MARKET_STATE_STRONG_TREND;
+    else if(DetectTightChannel(ema, atr))
+    {
+        detectedState = MARKET_STATE_TIGHT_CHANNEL;
+        g_TightChannelBars++;
+        UpdateTightChannelTracking();
+    }
+    else if(DetectFinalFlag(ema, atr))
+    {
+        detectedState = MARKET_STATE_FINAL_FLAG;
+        if(g_TightChannelBars > 0) { g_LastTightChannelEndBar = 1; }
+    }
+    else if(DetectTradingRange(ema, atr))
+    {
+        detectedState = MARKET_STATE_TRADING_RANGE;
+        if(g_TightChannelBars > 0) g_LastTightChannelEndBar = 1;
+        g_TightChannelBars = 0;
+    }
+    else if(DetectBreakout(ema, atr))
+        detectedState = MARKET_STATE_BREAKOUT;
+    else
+    {
+        if(g_TightChannelBars > 0) g_LastTightChannelEndBar = 1;
+        g_TightChannelBars = 0;
+    }
+    
+    ApplyStateInertia(detectedState);
+}
+
+// Brooks: 强趋势 = 连续趋势K线 + higher highs/higher lows + 价格远离EMA
+bool DetectStrongTrend(double ema, double atr)
+{
+    if(g_BufferSize < 12) return false;
     int lookback = 10;
+    int bullishStreak = 0, bearishStreak = 0;
+    int currentBullish = 0, currentBearish = 0;
+    int higherHighs = 0, lowerLows = 0;
+    int barsAboveEMA = 0, barsBelowEMA = 0;
     
-    // 统计连续同向K线
-    int bullishStreak = 0;
-    int bearishStreak = 0;
-    int currentBullish = 0;
-    int currentBearish = 0;
-    int higherHighs = 0;
-    int lowerLows = 0;
-    int barsAboveEMA = 0;
-    int barsBelowEMA = 0;
-    
-    for(int i = 1; i <= lookback; i++)
+    for(int i = 1; i <= lookback && i < g_BufferSize; i++)
     {
         bool isBullish = g_CloseBuffer[i] > g_OpenBuffer[i];
         bool isBearish = g_CloseBuffer[i] < g_OpenBuffer[i];
         
-        // 连续同向K线
-        if(isBullish)
-        {
-            currentBullish++;
-            currentBearish = 0;
-            if(currentBullish > bullishStreak) bullishStreak = currentBullish;
-        }
-        else if(isBearish)
-        {
-            currentBearish++;
-            currentBullish = 0;
-            if(currentBearish > bearishStreak) bearishStreak = currentBearish;
-        }
+        if(isBullish) { currentBullish++; currentBearish = 0; }
+        else if(isBearish) { currentBearish++; currentBullish = 0; }
+        if(currentBullish > bullishStreak) bullishStreak = currentBullish;
+        if(currentBearish > bearishStreak) bearishStreak = currentBearish;
         
-        // 连续创新高/新低
-        if(i > 1)
+        if(i + 1 < g_BufferSize)
         {
             if(g_HighBuffer[i] > g_HighBuffer[i+1]) higherHighs++;
             if(g_LowBuffer[i] < g_LowBuffer[i+1]) lowerLows++;
         }
         
-        // EMA 位置
-        if(g_CloseBuffer[i] > g_EMABuffer[i]) barsAboveEMA++;
-        else barsBelowEMA++;
+        if(i < ArraySize(g_EMABuffer))
+        {
+            if(g_CloseBuffer[i] > g_EMABuffer[i]) barsAboveEMA++;
+            else barsBelowEMA++;
+        }
     }
     
-    // 计算价格变化百分比
-    double priceChange = 0;
-    if(g_OpenBuffer[5] > 0)
-        priceChange = (g_CloseBuffer[1] - g_OpenBuffer[5]) / g_OpenBuffer[5];
+    double upScore = 0, downScore = 0;
     
-    // 计算趋势得分
-    double upScore = 0;
-    double downScore = 0;
-    
-    // 上涨趋势
     if(bullishStreak >= 3) upScore += 0.25;
     if(bullishStreak >= 5) upScore += 0.25;
-    if(higherHighs >= 4) upScore += 0.2;
-    if(barsAboveEMA >= 8) upScore += 0.15;
-    if(priceChange > 0.008) upScore += 0.15;
+    if(higherHighs >= 4)   upScore += 0.2;
+    if(barsAboveEMA >= 8)  upScore += 0.15;
     
-    // 下跌趋势
     if(bearishStreak >= 3) downScore += 0.25;
     if(bearishStreak >= 5) downScore += 0.25;
-    if(lowerLows >= 4) downScore += 0.2;
-    if(barsBelowEMA >= 8) downScore += 0.15;
-    if(priceChange < -0.008) downScore += 0.15;
+    if(lowerLows >= 4)     downScore += 0.2;
+    if(barsBelowEMA >= 8)  downScore += 0.15;
     
-    // 确定趋势方向
+    // 价格距离EMA的程度
+    if(atr > 0)
+    {
+        double dist = (g_CloseBuffer[1] - ema) / atr;
+        if(dist > 1.0) upScore += 0.15;
+        if(dist < -1.0) downScore += 0.15;
+    }
+    
     if(upScore >= InpStrongTrendScore && upScore > downScore)
     {
         g_TrendDirection = "up";
@@ -1410,111 +2629,50 @@ bool DetectStrongTrend(double ema)
     return false;
 }
 
-//+------------------------------------------------------------------+
-//| Detect Tight Channel (紧凑通道检测)                                |
-//| Al Brooks: Micro Channel 可以贴着 EMA 走，关键看极值跟随             |
-//+------------------------------------------------------------------+
-bool DetectTightChannel(double ema)
+// Micro Channel回调深度: Brooks原意是回调极浅(通常<25%)
+bool DetectTightChannel(double ema, double atr)
 {
-    int lookback = 10;
+    if(g_BufferSize < 15 || atr <= 0) return false;
+    int lookback = 12;
     
-    //=================================================================
-    // 【条件D - 新增】极值跟随检测（Al Brooks 核心逻辑）
-    // 即使 K 线触碰 EMA，只要满足极值跟随，仍视为 Tight Channel
-    // - 上涨：连续 5 根 K 线，每根 Low >= 前一根 Low
-    // - 下跌：连续 5 根 K 线，每根 High <= 前一根 High
-    //=================================================================
-    bool extremeFollowUp = CheckExtremeFollow("up", 5);
-    bool extremeFollowDown = CheckExtremeFollow("down", 5);
+    // 检查K线重叠程度和方向一致性
+    int bullBars = 0, bearBars = 0;
+    int consecutiveNewHighs = 0, consecutiveNewLows = 0;
+    int shallowPullbacks = 0;
     
-    //=================================================================
-    // 【条件A】所有 K 线都在 EMA 一侧（原有逻辑）
-    //=================================================================
-    bool allAboveEMA = true;
-    bool allBelowEMA = true;
-    
-    for(int i = 1; i <= lookback; i++)
+    for(int i = 1; i <= lookback && i + 1 < g_BufferSize; i++)
     {
-        // 允许 0.1% 的容差（避免刚好触碰被误判）
-        if(g_LowBuffer[i] <= g_EMABuffer[i] * 1.001) allAboveEMA = false;
-        if(g_HighBuffer[i] >= g_EMABuffer[i] * 0.999) allBelowEMA = false;
+        if(g_CloseBuffer[i] > g_OpenBuffer[i]) bullBars++;
+        else if(g_CloseBuffer[i] < g_OpenBuffer[i]) bearBars++;
+        
+        // 创新高/新低
+        if(g_HighBuffer[i] > g_HighBuffer[i+1]) consecutiveNewHighs++;
+        if(g_LowBuffer[i] < g_LowBuffer[i+1]) consecutiveNewLows++;
+        
+        // 回调深度: 当前K线回调不超过前一根range的25%(Brooks标准更严格)
+        double prevRange = g_HighBuffer[i+1] - g_LowBuffer[i+1];
+        if(prevRange > 0)
+        {
+            // 上升TC: 当前低点不低于前一根75%位置
+            double prevThreshold = g_LowBuffer[i+1] + prevRange * 0.75;
+            if(g_LowBuffer[i] >= prevThreshold) shallowPullbacks++;
+            // 下降TC: 当前高点不高于前一根25%位置
+            double prevThresholdDown = g_HighBuffer[i+1] - prevRange * 0.75;
+            if(g_HighBuffer[i] <= prevThresholdDown) shallowPullbacks++;
+        }
     }
     
-    //=================================================================
-    // 【条件B】方向一致性（最近 5 根 K 线的阴阳比例）
-    //=================================================================
-    int bullishBars = 0;
-    int bearishBars = 0;
-    
-    for(int i = 1; i <= 5; i++)
-    {
-        if(g_CloseBuffer[i] > g_OpenBuffer[i]) bullishBars++;
-        else if(g_CloseBuffer[i] < g_OpenBuffer[i]) bearishBars++;
-    }
-    
-    bool conditionB_Up = bullishBars >= 3;
-    bool conditionB_Down = bearishBars >= 3;
-    
-    //=================================================================
-    // 【条件C】强斜率（价格变化百分比）
-    //=================================================================
-    double slopePct = 0;
-    if(g_CloseBuffer[lookback] > 0)
-        slopePct = (g_CloseBuffer[1] - g_CloseBuffer[lookback]) / g_CloseBuffer[lookback];
-    
-    bool conditionC_Up = slopePct > InpSlopeThreshold;
-    bool conditionC_Down = slopePct < -InpSlopeThreshold;
-    
-    //=================================================================
-    // 综合判断（OR 关系：满足任一组合即可）
-    //=================================================================
-    
-    // 上涨 Tight Channel 判定
-    int upConditions = 0;
-    if(allAboveEMA) upConditions++;
-    if(conditionB_Up) upConditions++;
-    if(conditionC_Up) upConditions++;
-    
-    // 【新增】极值跟随作为独立判定条件
-    // 如果连续 5 根 K 线的 Low 都在抬升，即使触碰 EMA 也是强趋势
-    bool isUpTightChannel = (upConditions >= 2) || 
-                            (extremeFollowUp && conditionB_Up) ||
-                            (extremeFollowUp && conditionC_Up);
-    
-    // 下跌 Tight Channel 判定
-    int downConditions = 0;
-    if(allBelowEMA) downConditions++;
-    if(conditionB_Down) downConditions++;
-    if(conditionC_Down) downConditions++;
-    
-    // 【新增】极值跟随作为独立判定条件
-    bool isDownTightChannel = (downConditions >= 2) ||
-                              (extremeFollowDown && conditionB_Down) ||
-                              (extremeFollowDown && conditionC_Down);
-    
-    //=================================================================
-    // 返回结果
-    //=================================================================
-    if(isUpTightChannel)
+    // 上升Tight Channel
+    if(bullBars >= lookback * 0.6 && consecutiveNewHighs >= lookback * 0.5 && shallowPullbacks >= lookback * 0.4)
     {
         g_TightChannelDir = "up";
-        
-        // 调试日志（仅在极值跟随触发时输出）
-        if(extremeFollowUp && !allAboveEMA)
-        {
-            Print("📈 Tight Channel UP (极值跟随): Low 连续抬升，虽触碰 EMA 但趋势未变");
-        }
         return true;
     }
-    else if(isDownTightChannel)
+    
+    // 下降Tight Channel
+    if(bearBars >= lookback * 0.6 && consecutiveNewLows >= lookback * 0.5 && shallowPullbacks >= lookback * 0.4)
     {
         g_TightChannelDir = "down";
-        
-        // 调试日志
-        if(extremeFollowDown && !allBelowEMA)
-        {
-            Print("📉 Tight Channel DOWN (极值跟随): High 连续下降，虽触碰 EMA 但趋势未变");
-        }
         return true;
     }
     
@@ -1522,172 +2680,136 @@ bool DetectTightChannel(double ema)
     return false;
 }
 
-//+------------------------------------------------------------------+
-//| Check Extreme Follow (极值跟随检测)                                |
-//| Al Brooks: 强趋势中，K 线极值会有序跟随                             |
-//| - 上涨：每根 K 线的 Low >= 前一根 Low（允许相等）                    |
-//| - 下跌：每根 K 线的 High <= 前一根 High（允许相等）                  |
-//+------------------------------------------------------------------+
-bool CheckExtremeFollow(string direction, int barsToCheck)
+// Brooks: Trading Range = 价格在明确的高低边界内震荡
+// 识别上下边界,而非仅靠EMA穿越次数
+bool DetectTradingRange(double ema, double atr)
 {
-    if(barsToCheck < 2) return false;
+    if(g_BufferSize < 25 || atr <= 0) return false;
+    int lookback = 20;
     
-    // 确保有足够数据
-    if(ArraySize(g_LowBuffer) < barsToCheck + 1 || 
-       ArraySize(g_HighBuffer) < barsToCheck + 1)
-        return false;
-    
-    if(direction == "up")
+    // 找出lookback期间的高低点
+    double rangeHigh = g_HighBuffer[1], rangeLow = g_LowBuffer[1];
+    for(int i = 2; i <= lookback && i < g_BufferSize; i++)
     {
-        // 上涨：检查 Low 是否逐步抬升
-        // bar[1] 是最新完成的 K 线，bar[barsToCheck] 是最早的
-        for(int i = 1; i < barsToCheck; i++)
-        {
-            // 当前 K 线的 Low 不能低于前一根 K 线的 Low
-            // g_LowBuffer[i] 是较新的，g_LowBuffer[i+1] 是较旧的
-            if(g_LowBuffer[i] < g_LowBuffer[i + 1])
-                return false;
-        }
-        return true;
+        if(g_HighBuffer[i] > rangeHigh) rangeHigh = g_HighBuffer[i];
+        if(g_LowBuffer[i] < rangeLow)  rangeLow = g_LowBuffer[i];
     }
-    else if(direction == "down")
+    
+    double totalRange = rangeHigh - rangeLow;
+    if(totalRange < atr * 2.0) return false; // 太窄不算TR
+    
+    // 检查价格是否在边界内来回震荡(多次触及上下边界)
+    int touchHigh = 0, touchLow = 0;
+    double upperZone = rangeHigh - totalRange * 0.2;
+    double lowerZone = rangeLow + totalRange * 0.2;
+    int emaCrosses = 0;
+    bool prevAbove = g_CloseBuffer[lookback] > ema;
+    
+    for(int i = 1; i <= lookback && i < g_BufferSize; i++)
     {
-        // 下跌：检查 High 是否逐步下降
-        for(int i = 1; i < barsToCheck; i++)
-        {
-            // 当前 K 线的 High 不能高于前一根 K 线的 High
-            if(g_HighBuffer[i] > g_HighBuffer[i + 1])
-                return false;
-        }
+        if(g_HighBuffer[i] >= upperZone) touchHigh++;
+        if(g_LowBuffer[i] <= lowerZone) touchLow++;
+        
+        bool currAbove = g_CloseBuffer[i] > ema;
+        if(currAbove != prevAbove) { emaCrosses++; prevAbove = currAbove; }
+    }
+    
+    // TR条件: 多次触及上下边界 + EMA穿越频繁
+    if(touchHigh >= 2 && touchLow >= 2 && emaCrosses >= 4)
+    {
+        g_TR_High = rangeHigh;
+        g_TR_Low = rangeLow;
         return true;
     }
     
     return false;
 }
 
-//+------------------------------------------------------------------+
-//| Detect Trading Range (交易区间检测)                                |
-//+------------------------------------------------------------------+
-bool DetectTradingRange(double ema)
+// 20根棒线重叠度: 总范围/各棒range之和, 越小=重叠越高=越像紧凑区间
+double GetBarOverlapRatio(int lookback = 20)
 {
-    int lookback = 20;
-    int emaCrosses = 0;
-    bool prevAboveEMA = g_CloseBuffer[lookback] > g_EMABuffer[lookback];
-    
-    for(int i = lookback - 1; i >= 1; i--)
+    if(g_BufferSize < lookback + 1) return 1.0;
+    double rangeHigh = g_HighBuffer[1], rangeLow = g_LowBuffer[1];
+    double sumRange = 0;
+    for(int i = 1; i <= lookback && i < g_BufferSize; i++)
     {
-        bool currentAboveEMA = g_CloseBuffer[i] > g_EMABuffer[i];
-        if(currentAboveEMA != prevAboveEMA)
-        {
-            emaCrosses++;
-            prevAboveEMA = currentAboveEMA;
-        }
+        if(g_HighBuffer[i] > rangeHigh) rangeHigh = g_HighBuffer[i];
+        if(g_LowBuffer[i] < rangeLow) rangeLow = g_LowBuffer[i];
+        double barRange = g_HighBuffer[i] - g_LowBuffer[i];
+        if(barRange > 0) sumRange += barRange;
     }
-    
-    // 穿越次数 >= 6 视为 Trading Range
-    return emaCrosses >= 6;
+    double totalRange = rangeHigh - rangeLow;
+    if(sumRange <= 0 || totalRange <= 0) return 1.0;
+    return totalRange / sumRange;
 }
 
-//+------------------------------------------------------------------+
-//| Detect Breakout (突破检测)                                         |
-//+------------------------------------------------------------------+
+// 紧凑交易区间(TTR): Brooks强调应观望,过滤突破与趋势信号
+bool IsTightTradingRange(double atr)
+{
+    if(g_MarketState != MARKET_STATE_TRADING_RANGE || atr <= 0) return false;
+    if(g_TR_High <= g_TR_Low) return false;
+    double trRange = g_TR_High - g_TR_Low;
+    if(trRange >= atr * InpTTRRangeATRMult) return false;  // 区间过宽不算TTR
+    double overlapRatio = GetBarOverlapRatio(20);
+    return (overlapRatio < InpTTROverlapThreshold);
+}
+
 bool DetectBreakout(double ema, double atr)
 {
-    // 当前K线实体大小
-    double bodySize = MathAbs(g_CloseBuffer[1] - g_OpenBuffer[1]);
+    if(g_BufferSize < 12 || atr <= 0) return false;
     
-    // 计算近期平均实体
+    double bodySize = MathAbs(g_CloseBuffer[1] - g_OpenBuffer[1]);
+    double range = g_HighBuffer[1] - g_LowBuffer[1];
+    if(range <= 0) return false;
+    
+    // Breakout K线: 实体大于平均实体1.5倍,收盘在极端位置
     double avgBody = 0;
-    for(int i = 2; i <= 11; i++)
+    for(int i = 2; i <= 11 && i < g_BufferSize; i++)
         avgBody += MathAbs(g_CloseBuffer[i] - g_OpenBuffer[i]);
     avgBody /= 10;
     
-    // 当前实体 > 平均实体 * 1.5
     if(avgBody > 0 && bodySize > avgBody * 1.5)
     {
         double close = g_CloseBuffer[1];
-        double high = g_HighBuffer[1];
-        double low = g_LowBuffer[1];
-        double range = high - low;
-        
-        if(range > 0)
-        {
-            // 强势收盘
-            if(close > ema && (close - low) / range > 0.7)
-                return true;
-            if(close < ema && (high - close) / range > 0.7)
-                return true;
-        }
+        if(close > ema && (close - g_LowBuffer[1]) / range > 0.7) return true;
+        if(close < ema && (g_HighBuffer[1] - close) / range > 0.7) return true;
     }
-    
     return false;
 }
 
-//+------------------------------------------------------------------+
-//| Detect Final Flag (终极旗形检测)                                   |
-//+------------------------------------------------------------------+
 bool DetectFinalFlag(double ema, double atr)
 {
-    // 必须刚从 Tight Channel 退出
-    if(g_TightChannelBars < 5) return false;
-    if(g_LastTightChannelEndBar < 0) return false;
+    if(g_TightChannelBars < 5 || g_LastTightChannelEndBar < 0) return false;
     
-    int barsSinceTCEnd = g_LastTightChannelEndBar;
-    if(barsSinceTCEnd < 3 || barsSinceTCEnd > 8) return false;
+    int barsSince = g_LastTightChannelEndBar;
+    if(barsSince < 3 || barsSince > 8) return false;
     
-    // 价格仍远离 EMA
-    double distancePct = (g_CloseBuffer[1] - ema) / ema;
+    if(atr <= 0) return false;
+    double dist = (g_CloseBuffer[1] - ema) / atr;
     
-    if(g_TightChannelDir == "up")
-    {
-        if(distancePct < 0.01) return false; // 距离 > 1%
-    }
-    else if(g_TightChannelDir == "down")
-    {
-        if(distancePct > -0.01) return false;
-    }
-    else
-    {
-        return false;
-    }
+    if(g_TightChannelDir == "up" && dist < 0.5) return false;
+    if(g_TightChannelDir == "down" && dist > -0.5) return false;
+    if(g_TightChannelDir == "") return false;
     
     return true;
 }
 
-//+------------------------------------------------------------------+
-//| Update Tight Channel Tracking                                     |
-//+------------------------------------------------------------------+
 void UpdateTightChannelTracking()
 {
     if(g_TightChannelDir == "up")
     {
         if(g_TightChannelExtreme == 0 || g_HighBuffer[1] > g_TightChannelExtreme)
-            g_TightChannelExtreme = g_HighBuffer[1];
+        { g_TightChannelExtreme = g_HighBuffer[1]; }
     }
     else if(g_TightChannelDir == "down")
     {
         if(g_TightChannelExtreme == 0 || g_LowBuffer[1] < g_TightChannelExtreme)
-            g_TightChannelExtreme = g_LowBuffer[1];
+        { g_TightChannelExtreme = g_LowBuffer[1]; }
     }
 }
 
-//+------------------------------------------------------------------+
-//| Apply State Inertia (状态惯性)                                     |
-//+------------------------------------------------------------------+
 void ApplyStateInertia(ENUM_MARKET_STATE newState)
 {
-    // 状态最小保持期
-    int minHold = 1;
-    switch(g_CurrentLockedState)
-    {
-        case MARKET_STATE_STRONG_TREND: minHold = 3; break;
-        case MARKET_STATE_TIGHT_CHANNEL: minHold = 3; break;
-        case MARKET_STATE_TRADING_RANGE: minHold = 2; break;
-        case MARKET_STATE_BREAKOUT: minHold = 2; break;
-        default: minHold = 1;
-    }
-    
-    // 如果还在保持期内
     if(g_StateHoldBars > 0)
     {
         g_StateHoldBars--;
@@ -1695,19 +2817,27 @@ void ApplyStateInertia(ENUM_MARKET_STATE newState)
         return;
     }
     
-    // 切换状态
     if(newState != g_CurrentLockedState)
     {
+        int minHold = 1;
+        switch(g_CurrentLockedState)
+        {
+            case MARKET_STATE_STRONG_TREND:  minHold = 3; break;
+            case MARKET_STATE_TIGHT_CHANNEL: minHold = 3; break;
+            case MARKET_STATE_TRADING_RANGE: minHold = 2; break;
+            case MARKET_STATE_BREAKOUT:      minHold = 2; break;
+            default: minHold = 1;
+        }
         g_CurrentLockedState = newState;
         g_StateHoldBars = minHold;
     }
     
-    g_MarketState = newState;
+    if(g_MarketState != newState)
+    {
+        g_MarketState = newState;
+    }
 }
 
-//+------------------------------------------------------------------+
-//| Get Market Cycle                                                  |
-//+------------------------------------------------------------------+
 ENUM_MARKET_CYCLE GetMarketCycle(ENUM_MARKET_STATE state)
 {
     if(state == MARKET_STATE_BREAKOUT)
@@ -1718,1533 +2848,275 @@ ENUM_MARKET_CYCLE GetMarketCycle(ENUM_MARKET_STATE state)
         return MARKET_CYCLE_CHANNEL;
 }
 
+
 //+------------------------------------------------------------------+
-//| Check Spike Market Entry (Context Bypass - SPIKE 周期应急入场)     |
-//| 在 SPIKE 周期中，只要当前是强趋势棒，立即市价入场                   |
+//| 实时波动率刷新 - Brooks Spike(波幅>1.5ATR)时更新,供止损防扫单          |
+//| 节流: 至少间隔 5 秒执行，避免 Tick 内频繁 CopyBuffer                   |
 //+------------------------------------------------------------------+
-ENUM_SIGNAL_TYPE CheckSpikeMarketEntry(double ema, double atr, double &stopLoss, double &baseHeight)
+void RefreshRealTimeATR()
 {
-    // 当前K线（刚收盘）
-    double currHigh = g_HighBuffer[1];
-    double currLow = g_LowBuffer[1];
-    double currOpen = g_OpenBuffer[1];
-    double currClose = g_CloseBuffer[1];
-    double currBody = MathAbs(currClose - currOpen);
-    double currRange = currHigh - currLow;
+    if(TimeCurrent() - g_LastRefreshRealTimeATR < 5) return;
+    g_LastRefreshRealTimeATR = TimeCurrent();
     
-    if(currRange <= 0) return SIGNAL_NONE;
+    int required = InpLookbackPeriod + 50;
+    if(CopyBuffer(handleATR, 0, 0, required, g_ATRBuffer) < required) return;
     
-    double bodyRatio = currBody / currRange;
+    double baseAtr = (ArraySize(g_ATRBuffer) > 1) ? g_ATRBuffer[1] : 0;
+    double currentRange = iHigh(_Symbol, PERIOD_CURRENT, 0) - iLow(_Symbol, PERIOD_CURRENT, 0);
     
-    // 强趋势棒条件：实体 > 60%，方向明确
-    if(bodyRatio < 0.60) return SIGNAL_NONE;
-    
-    bool isBullish = currClose > currOpen;
-    bool isBearish = currClose < currOpen;
-    
-    // 必须与 SPIKE 方向一致
-    if(isBullish && g_TrendDirection == "up")
-    {
-        // 向上 SPIKE，做多
-        if(!CheckSignalCooldown("buy")) return SIGNAL_NONE;
-        
-        // 收盘位置检查：收盘在顶部 25%
-        double closePosition = (currClose - currLow) / currRange;
-        if(closePosition < 0.75) return SIGNAL_NONE;
-        
-        stopLoss = currLow - atr * 0.3;
-        
-        // 检查风险
-        double riskDistance = currClose - stopLoss;
-        if(atr > 0 && riskDistance > atr * InpMaxStopATRMult)
-            return SIGNAL_NONE;
-        
-        baseHeight = atr * 2.0;
-        UpdateSignalCooldown("buy");
-        
-        Print("📈 Spike_Market_Entry BUY | GapCount: ", g_GapCount, " | Body: ", DoubleToString(bodyRatio*100, 1), "%");
-        return SIGNAL_SPIKE_MARKET_BUY;
-    }
-    else if(isBearish && g_TrendDirection == "down")
-    {
-        // 向下 SPIKE，做空
-        if(!CheckSignalCooldown("sell")) return SIGNAL_NONE;
-        
-        // 收盘位置检查：收盘在底部 25%
-        double closePosition = (currHigh - currClose) / currRange;
-        if(closePosition < 0.75) return SIGNAL_NONE;
-        
-        stopLoss = currHigh + atr * 0.3;
-        
-        double riskDistance = stopLoss - currClose;
-        if(atr > 0 && riskDistance > atr * InpMaxStopATRMult)
-            return SIGNAL_NONE;
-        
-        baseHeight = atr * 2.0;
-        UpdateSignalCooldown("sell");
-        
-        Print("📉 Spike_Market_Entry SELL | GapCount: ", g_GapCount, " | Body: ", DoubleToString(bodyRatio*100, 1), "%");
-        return SIGNAL_SPIKE_MARKET_SELL;
-    }
-    
-    return SIGNAL_NONE;
+    if(baseAtr > 0 && currentRange > baseAtr * 1.5)
+        g_AtrValue = MathMax(baseAtr, currentRange / 1.5);
+    else
+        g_AtrValue = baseAtr;
 }
 
 //+------------------------------------------------------------------+
-//| Check Emergency Spike (极值棒下一根开盘市价入场)                    |
-//| 极值检测：实体 > 3×ATR 且收盘在棒线极端 10% 内（极强收盘）            |
-//| 提前入场：不等待 3 根确认，下一根 K 线开盘时市价入场                  |
-//| 止损：信号棒 50% 位置（Al Brooks：回测超 50% 则极强棒强度不再成立）   |
+//| Market Data & HTF                                                 |
 //+------------------------------------------------------------------+
-ENUM_SIGNAL_TYPE CheckEmergencySpike(double ema, double atr, double &stopLoss, double &baseHeight)
+bool GetMarketData()
 {
-    if(!InpEnableEmergencySpike || atr <= 0) return SIGNAL_NONE;
+    int required = InpLookbackPeriod + 50;
     
-    // 信号棒 = 刚收盘的那根（bar[1]），下一根开盘 = 当前市价入场
-    double sh = g_HighBuffer[1];
-    double sl = g_LowBuffer[1];
-    double so = g_OpenBuffer[1];
-    double sc = g_CloseBuffer[1];
+    if(CopyBuffer(handleEMA, 0, 0, required, g_EMABuffer) < required) return false;
+    if(CopyBuffer(handleATR, 0, 0, required, g_ATRBuffer) < required) return false;
+    if(CopyBuffer(handleHTFEMA, 0, 0, 10, g_HTFEMABuffer) < 5) return false;
     
-    double body = MathAbs(sc - so);
-    double range = sh - sl;
-    if(range <= 0) return SIGNAL_NONE;
+    MqlRates rates[];
+    ArraySetAsSeries(rates, true);
+    int copied = CopyRates(_Symbol, PERIOD_CURRENT, 0, required, rates);
+    if(copied < required) return false;
     
-    // 1. 极值检测：实体长度 > InpEmergencySpikeATRMult * ATR
-    if(body < atr * InpEmergencySpikeATRMult)
-        return SIGNAL_NONE;
+    ArrayResize(g_OpenBuffer, copied);
+    ArrayResize(g_HighBuffer, copied);
+    ArrayResize(g_LowBuffer, copied);
+    ArrayResize(g_CloseBuffer, copied);
+    ArrayResize(g_VolumeBuffer, copied);
+    ArraySetAsSeries(g_OpenBuffer, true);
+    ArraySetAsSeries(g_HighBuffer, true);
+    ArraySetAsSeries(g_LowBuffer, true);
+    ArraySetAsSeries(g_CloseBuffer, true);
+    ArraySetAsSeries(g_VolumeBuffer, true);
     
-    // 2. 极强收盘：收盘位于棒线极端的 10% 范围内
-    double closeFromHigh = (sh - sc) / range;   // 0 = 收在最高，1 = 收在最低
-    double closeFromLow  = (sc - sl) / range;   // 0 = 收在最低，1 = 收在最高
-    
-    bool isBullish = sc > so;
-    bool isBearish = sc < so;
-    
-    // 信号棒 50% 位置（中点），用于止损
-    double midpoint = sl + range * 0.5;
-    double spreadPrice = GetCurrentSpreadPrice();
-    
-    if(isBullish)
+    for(int i = 0; i < copied; i++)
     {
-        // 阳线：收盘应在顶端 10% 内 → closeFromHigh <= 0.10
-        if(closeFromHigh > InpEmergencySpikeClosePct)
-            return SIGNAL_NONE;
-        
-        if(!CheckSignalCooldown("buy")) return SIGNAL_NONE;
-        
-        // 3. 止损设在信号棒 50% 下方（回测超 50% = 强度不再成立）
-        stopLoss = midpoint - spreadPrice;
-        stopLoss = NormalizeDouble(stopLoss, g_SymbolDigits);
-        
-        double riskDist = sc - stopLoss;
-        if(riskDist > atr * InpMaxStopATRMult)
-            return SIGNAL_NONE;
-        
-        baseHeight = body;
-        UpdateSignalCooldown("buy");
-        
-        Print("🚨 Emergency_Spike BUY | Body=", DoubleToString(body/atr, 2), "×ATR | 收盘极强 ",
-              DoubleToString(closeFromHigh*100, 1), "% from high | SL=信号棒50% ", DoubleToString(midpoint, g_SymbolDigits));
-        return SIGNAL_EMERGENCY_SPIKE_BUY;
+        g_OpenBuffer[i]   = rates[i].open;
+        g_HighBuffer[i]   = rates[i].high;
+        g_LowBuffer[i]    = rates[i].low;
+        g_CloseBuffer[i]  = rates[i].close;
+        g_VolumeBuffer[i] = rates[i].tick_volume;
     }
     
-    if(isBearish)
-    {
-        // 阴线：收盘应在底端 10% 内 → closeFromLow <= 0.10
-        if(closeFromLow > InpEmergencySpikeClosePct)
-            return SIGNAL_NONE;
-        
-        if(!CheckSignalCooldown("sell")) return SIGNAL_NONE;
-        
-        // 3. 止损设在信号棒 50% 上方
-        stopLoss = midpoint + spreadPrice;
-        stopLoss = NormalizeDouble(stopLoss, g_SymbolDigits);
-        
-        double riskDist = stopLoss - sc;
-        if(riskDist > atr * InpMaxStopATRMult)
-            return SIGNAL_NONE;
-        
-        baseHeight = body;
-        UpdateSignalCooldown("sell");
-        
-        Print("🚨 Emergency_Spike SELL | Body=", DoubleToString(body/atr, 2), "×ATR | 收盘极强 ",
-              DoubleToString(closeFromLow*100, 1), "% from low | SL=信号棒50% ", DoubleToString(midpoint, g_SymbolDigits));
-        return SIGNAL_EMERGENCY_SPIKE_SELL;
-    }
-    
-    return SIGNAL_NONE;
+    g_BufferSize = copied;
+    UpdateHTFTrend();
+    return true;
 }
 
-//+------------------------------------------------------------------+
-//| Check Micro Channel H1 (Context Bypass - TIGHT_CHANNEL 应急入场)   |
-//| 在 TIGHT_CHANNEL 中，GapCount >= 3 时，突破前一棒高点立即入场       |
-//| 忽略 H2 状态机的阴线计数要求                                        |
-//+------------------------------------------------------------------+
-ENUM_SIGNAL_TYPE CheckMicroChannelH1(double ema, double atr, int gapCount, 
-                                      double &stopLoss, double &baseHeight)
+void UpdateHTFTrend()
 {
-    // 当前K线
-    double currHigh = g_HighBuffer[1];
-    double currLow = g_LowBuffer[1];
-    double currOpen = g_OpenBuffer[1];
-    double currClose = g_CloseBuffer[1];
+    if(ArraySize(g_HTFEMABuffer) < 3) return;
     
-    // 前一K线
-    double prevHigh = g_HighBuffer[2];
-    double prevLow = g_LowBuffer[2];
-    
-    // Tight Channel 向上
-    if(g_TightChannelDir == "up")
-    {
-        // 突破前一棒高点 -> H1 买入
-        if(currHigh > prevHigh && currClose > currOpen)
-        {
-            if(!CheckSignalCooldown("buy")) return SIGNAL_NONE;
-            
-            // 不需要完整的 H2 状态机验证，直接入场
-            stopLoss = MathMin(currLow, prevLow) - atr * 0.3;
-            
-            double riskDistance = currClose - stopLoss;
-            if(atr > 0 && riskDistance > atr * InpMaxStopATRMult)
-                return SIGNAL_NONE;
-            
-            baseHeight = atr * 2.0;
-            UpdateSignalCooldown("buy");
-            
-            Print("🚀 Micro_Channel_H1 BUY | GapCount: ", gapCount, " | TightChannel: ", g_TightChannelBars, " bars");
-            return SIGNAL_MICRO_CH_H1_BUY;
-        }
-    }
-    // Tight Channel 向下
-    else if(g_TightChannelDir == "down")
-    {
-        // 跌破前一棒低点 -> L1 卖出
-        if(currLow < prevLow && currClose < currOpen)
-        {
-            if(!CheckSignalCooldown("sell")) return SIGNAL_NONE;
-            
-            stopLoss = MathMax(currHigh, prevHigh) + atr * 0.3;
-            
-            double riskDistance = stopLoss - currClose;
-            if(atr > 0 && riskDistance > atr * InpMaxStopATRMult)
-                return SIGNAL_NONE;
-            
-            baseHeight = atr * 2.0;
-            UpdateSignalCooldown("sell");
-            
-            Print("🚀 Micro_Channel_H1 SELL | GapCount: ", gapCount, " | TightChannel: ", g_TightChannelBars, " bars");
-            return SIGNAL_MICRO_CH_H1_SELL;
-        }
-    }
-    
-    return SIGNAL_NONE;
-}
-
-//+------------------------------------------------------------------+
-//| Check H2/L2 with HTF Filter                                       |
-//| htfBypass = true 时忽略 HTF 反向过滤                               |
-//+------------------------------------------------------------------+
-ENUM_SIGNAL_TYPE CheckH2L2WithHTF(double ema, double atr, bool htfBypass, 
-                                   double &stopLoss, double &baseHeight)
-{
-    double close = g_CloseBuffer[1];
-    double high = g_HighBuffer[1];
-    double low = g_LowBuffer[1];
-    
-    // 更新 H2 状态机
-    ENUM_SIGNAL_TYPE h2Signal = UpdateH2StateMachine(close, high, low, ema, atr, stopLoss, baseHeight);
-    if(h2Signal != SIGNAL_NONE)
-    {
-        // HTF 过滤：除非 bypass
-        if(InpEnableHTFFilter && !htfBypass)
-        {
-            // 买入信号需要 HTF 不是明确的 down
-            if((h2Signal == SIGNAL_H1_BUY || h2Signal == SIGNAL_H2_BUY) && g_HTFTrendDir == "down")
-            {
-                Print("⚠️ H2 BUY blocked by HTF filter (HTF: down, GapCount: ", g_GapCount, ")");
-                return SIGNAL_NONE;
-            }
-        }
-        
-        if(htfBypass && (h2Signal == SIGNAL_H1_BUY || h2Signal == SIGNAL_H2_BUY))
-        {
-            Print("✨ H2 BUY - HTF filter bypassed (StrongTrend + GapCount: ", g_GapCount, " >= ", InpHTFBypassGapCount, ")");
-        }
-        
-        return h2Signal;
-    }
-    
-    // 更新 L2 状态机
-    ENUM_SIGNAL_TYPE l2Signal = UpdateL2StateMachine(close, high, low, ema, atr, stopLoss, baseHeight);
-    if(l2Signal != SIGNAL_NONE)
-    {
-        // HTF 过滤：除非 bypass
-        if(InpEnableHTFFilter && !htfBypass)
-        {
-            // 卖出信号需要 HTF 不是明确的 up
-            if((l2Signal == SIGNAL_L1_SELL || l2Signal == SIGNAL_L2_SELL) && g_HTFTrendDir == "up")
-            {
-                Print("⚠️ L2 SELL blocked by HTF filter (HTF: up, GapCount: ", g_GapCount, ")");
-                return SIGNAL_NONE;
-            }
-        }
-        
-        if(htfBypass && (l2Signal == SIGNAL_L1_SELL || l2Signal == SIGNAL_L2_SELL))
-        {
-            Print("✨ L2 SELL - HTF filter bypassed (StrongTrend + GapCount: ", g_GapCount, " >= ", InpHTFBypassGapCount, ")");
-        }
-        
-        return l2Signal;
-    }
-    
-    return SIGNAL_NONE;
-}
-
-//+------------------------------------------------------------------+
-//| Check Spike Signal                                                |
-//+------------------------------------------------------------------+
-ENUM_SIGNAL_TYPE CheckSpike(double ema, double atr, double &stopLoss, double &baseHeight)
-{
-    if(g_MarketState != MARKET_STATE_BREAKOUT && 
-       g_MarketState != MARKET_STATE_CHANNEL && 
-       g_MarketState != MARKET_STATE_STRONG_TREND)
-        return SIGNAL_NONE;
-    
-    // Signal Bar = bar[2], Entry Bar = bar[1]
-    double s_high = g_HighBuffer[2];
-    double s_low = g_LowBuffer[2];
-    double s_open = g_OpenBuffer[2];
-    double s_close = g_CloseBuffer[2];
-    double s_body = MathAbs(s_close - s_open);
-    double s_range = s_high - s_low;
-    
-    double e_close = g_CloseBuffer[1];
-    double e_open = g_OpenBuffer[1];
-    double e_high = g_HighBuffer[1];
-    double e_low = g_LowBuffer[1];
-    double e_body = MathAbs(e_close - e_open);
-    double e_range = e_high - e_low;
-    
-    if(s_range <= 0 || e_range <= 0)
-        return SIGNAL_NONE;
-    
-    // 过去10根的最高/最低
-    double max10High = g_HighBuffer[3];
-    double min10Low = g_LowBuffer[3];
-    for(int i = 3; i <= 12; i++)
-    {
-        if(g_HighBuffer[i] > max10High) max10High = g_HighBuffer[i];
-        if(g_LowBuffer[i] < min10Low) min10Low = g_LowBuffer[i];
-    }
-    
-    // 向上 Spike
-    if(s_close > s_open && e_close > e_open)
-    {
-        double signalBodyRatio = s_body / s_range;
-        double entryBodyRatio = e_body / e_range;
-        
-        if(signalBodyRatio > 0.65 && entryBodyRatio > 0.50 && s_high > max10High && e_close > ema)
-        {
-            // 检查冷却期
-            if(!CheckSignalCooldown("buy")) return SIGNAL_NONE;
-            
-            // 检查趋势方向过滤
-            if(g_MarketState == MARKET_STATE_STRONG_TREND && g_TrendDirection == "down")
-                return SIGNAL_NONE;
-            
-            // 止损：Signal Bar 低点外
-            stopLoss = s_low * 0.999;
-            
-            // 检查止损距离
-            double riskDistance = e_close - stopLoss;
-            if(atr > 0 && riskDistance > atr * InpMaxStopATRMult)
-                return SIGNAL_NONE;
-            
-            baseHeight = atr * 2.0;
-            
-            UpdateSignalCooldown("buy");
-            return SIGNAL_SPIKE_BUY;
-        }
-    }
-    
-    // 向下 Spike
-    if(s_close < s_open && e_close < e_open)
-    {
-        double signalBodyRatio = s_body / s_range;
-        double entryBodyRatio = e_body / e_range;
-        
-        if(signalBodyRatio > 0.65 && entryBodyRatio > 0.50 && s_low < min10Low && e_close < ema)
-        {
-            if(!CheckSignalCooldown("sell")) return SIGNAL_NONE;
-            
-            if(g_MarketState == MARKET_STATE_STRONG_TREND && g_TrendDirection == "up")
-                return SIGNAL_NONE;
-            
-            stopLoss = s_high * 1.001;
-            
-            double riskDistance = stopLoss - e_close;
-            if(atr > 0 && riskDistance > atr * InpMaxStopATRMult)
-                return SIGNAL_NONE;
-            
-            baseHeight = atr * 2.0;
-            
-            UpdateSignalCooldown("sell");
-            return SIGNAL_SPIKE_SELL;
-        }
-    }
-    
-    return SIGNAL_NONE;
-}
-
-//+------------------------------------------------------------------+
-//| Check H2/L2 Signal                                                |
-//+------------------------------------------------------------------+
-ENUM_SIGNAL_TYPE CheckH2L2(double ema, double atr, double &stopLoss, double &baseHeight)
-{
-    double close = g_CloseBuffer[1];
-    double high = g_HighBuffer[1];
-    double low = g_LowBuffer[1];
-    
-    // 更新 H2 状态机
-    ENUM_SIGNAL_TYPE h2Signal = UpdateH2StateMachine(close, high, low, ema, atr, stopLoss, baseHeight);
-    if(h2Signal != SIGNAL_NONE)
-        return h2Signal;
-    
-    // 更新 L2 状态机
-    ENUM_SIGNAL_TYPE l2Signal = UpdateL2StateMachine(close, high, low, ema, atr, stopLoss, baseHeight);
-    if(l2Signal != SIGNAL_NONE)
-        return l2Signal;
-    
-    return SIGNAL_NONE;
-}
-
-//+------------------------------------------------------------------+
-//| Update H2 State Machine                                           |
-//| Al Brooks: 强趋势中放宽 Counting Bars 要求                         |
-//+------------------------------------------------------------------+
-ENUM_SIGNAL_TYPE UpdateH2StateMachine(double close, double high, double low, 
-                                       double ema, double atr,
-                                       double &stopLoss, double &baseHeight)
-{
-    ENUM_SIGNAL_TYPE signal = SIGNAL_NONE;
-    double emaTolerance = ema * 0.003; // 0.3% 容差
-    
-    bool isInUptrend = close >= (ema - emaTolerance);
-    
-    //=================================================================
-    // 【新增】StrongTrendOverride: 强趋势中放宽回调要求
-    // 在 STRONG_TREND 或 TIGHT_CHANNEL 中，不强制要求反向 K 线
-    //=================================================================
-    bool isStrongTrendMode = (g_MarketState == MARKET_STATE_STRONG_TREND || 
-                              g_MarketState == MARKET_STATE_TIGHT_CHANNEL);
-    
-    if(isInUptrend)
-    {
-        switch(g_H2State)
-        {
-            case H2_WAITING_FOR_PULLBACK:
-                if(g_H2_TrendHigh == 0 || high > g_H2_TrendHigh)
-                    g_H2_TrendHigh = high;
-                break;
-                
-            case H2_IN_PULLBACK:
-                if(g_H2_TrendHigh > 0 && high > g_H2_TrendHigh)
-                {
-                    g_H2State = H2_H1_DETECTED;
-                    g_H2_H1High = high;
-                    g_H2_H1BarIndex = 1;
-                    
-                    // 强趋势中触发 H1
-                    if(g_H2_IsStrongTrend)
-                    {
-                        // 20 Gap Bar 法则检查：屏蔽第一次回测的 H1
-                        if(Check20GapBarBlock("H1"))
-                        {
-                            // 被屏蔽，但继续状态机流转（等待 H2）
-                            g_H2_IsStrongTrend = false;
-                        }
-                        else if(CheckSignalCooldown("buy"))
-                        {
-                            stopLoss = CalculateStopLoss("buy", atr);
-                            if(stopLoss > 0)
-                            {
-                                baseHeight = atr * 2.0;
-                                signal = SIGNAL_H1_BUY;
-                                UpdateSignalCooldown("buy");
-                            }
-                        }
-                        g_H2_IsStrongTrend = false;
-                    }
-                }
-                break;
-                
-            case H2_H1_DETECTED:
-                // 强趋势下：当前 K 线为 Inside Bar 时不重置（Al Brooks 时间回调）
-                if(g_H2_PullbackStartLow > 0 && low < g_H2_PullbackStartLow)
-                {
-                    if(!(isStrongTrendMode && IsInsideBar(1)))
-                    {
-                        ResetH2StateMachine();
-                        g_H2_TrendHigh = high;
-                    }
-                }
-                else if(high > g_H2_H1High)
-                {
-                    g_H2_H1High = high;
-                    g_H2_H1BarIndex = 1;
-                }
-                else if(g_H2_H1High > 0 && low < g_H2_H1High)
-                {
-                    g_H2State = H2_WAITING_FOR_H2;
-                }
-                break;
-                
-            case H2_WAITING_FOR_H2:
-                // 入场触发：价格突破横盘区间最高点即触发 H2（Al Brooks 等距突破）
-                if(g_H2_H1High > 0 && high > g_H2_H1High)
-                {
-                    //=================================================================
-                    // 强趋势：Inside Bar / 小实体棒视为有效“时间回调”，突破即触发
-                    // 正常：仍需 Counting Bars（价格或时间回调）
-                    //=================================================================
-                    bool validCountingBars = false;
-                    
-                    if(isStrongTrendMode)
-                    {
-                        // 停顿棒（Doji、Inside Bar、小实体）或 时间回调棒 任一即可
-                        validCountingBars = HasPauseBars(g_H2_H1BarIndex, 1, atr) ||
-                                            HasTimeCorrectionBars(g_H2_H1BarIndex, 1, atr);
-                        
-                        if(validCountingBars)
-                        {
-                            Print("📊 H2 时间回调确认: 横盘/Inside Bar 有效 → 突破 ", DoubleToString(g_H2_H1High, g_SymbolDigits), " 触发");
-                        }
-                    }
-                    else
-                    {
-                        validCountingBars = HasCountingBars(g_H2_H1BarIndex, 1, true);
-                    }
-                    
-                    if(validCountingBars)
-                    {
-                        if(CheckSignalCooldown("buy"))
-                        {
-                            stopLoss = CalculateStopLoss("buy", atr);
-                            if(stopLoss > 0 && ValidateSignalBar("buy"))
-                            {
-                                baseHeight = atr * 2.0;
-                                signal = SIGNAL_H2_BUY;
-                                UpdateSignalCooldown("buy");
-                            }
-                        }
-                    }
-                    
-                    ResetH2StateMachine();
-                    g_H2_TrendHigh = high;
-                }
-                else if(g_H2_PullbackStartLow > 0 && low < g_H2_PullbackStartLow)
-                {
-                    // 强趋势下：Inside Bar 不重置
-                    if(!(isStrongTrendMode && IsInsideBar(1)))
-                    {
-                        ResetH2StateMachine();
-                        g_H2_TrendHigh = high;
-                    }
-                }
-                break;
-        }
-    }
-    else // 价格在 EMA 下方
-    {
-        switch(g_H2State)
-        {
-            case H2_WAITING_FOR_PULLBACK:
-                if(close < (ema - emaTolerance))
-                {
-                    g_H2State = H2_IN_PULLBACK;
-                    g_H2_PullbackStartLow = low;
-                }
-                break;
-                
-            case H2_IN_PULLBACK:
-                if(g_H2_PullbackStartLow == 0 || low < g_H2_PullbackStartLow)
-                    g_H2_PullbackStartLow = low;
-                break;
-                
-            case H2_H1_DETECTED:
-            case H2_WAITING_FOR_H2:
-                if(g_H2_PullbackStartLow > 0 && low < g_H2_PullbackStartLow)
-                {
-                    if(!(isStrongTrendMode && IsInsideBar(1)))
-                        ResetH2StateMachine();
-                }
-                break;
-        }
-    }
-    
-    return signal;
-}
-
-//+------------------------------------------------------------------+
-//| Update L2 State Machine                                           |
-//| Al Brooks: 强趋势中放宽 Counting Bars 要求                         |
-//+------------------------------------------------------------------+
-ENUM_SIGNAL_TYPE UpdateL2StateMachine(double close, double high, double low, 
-                                       double ema, double atr,
-                                       double &stopLoss, double &baseHeight)
-{
-    ENUM_SIGNAL_TYPE signal = SIGNAL_NONE;
-    double emaTolerance = ema * 0.003;
-    
-    bool isInDowntrend = close <= (ema + emaTolerance);
-    
-    //=================================================================
-    // 【新增】StrongTrendOverride: 强趋势中放宽回调要求
-    //=================================================================
-    bool isStrongTrendMode = (g_MarketState == MARKET_STATE_STRONG_TREND || 
-                              g_MarketState == MARKET_STATE_TIGHT_CHANNEL);
-    
-    if(isInDowntrend)
-    {
-        switch(g_L2State)
-        {
-            case L2_WAITING_FOR_BOUNCE:
-                if(g_L2_TrendLow == 0 || low < g_L2_TrendLow)
-                    g_L2_TrendLow = low;
-                break;
-                
-            case L2_IN_BOUNCE:
-                if(g_L2_TrendLow > 0 && low < g_L2_TrendLow)
-                {
-                    g_L2State = L2_L1_DETECTED;
-                    g_L2_L1Low = low;
-                    g_L2_L1BarIndex = 1;
-                    
-                    if(g_L2_IsStrongTrend)
-                    {
-                        // 20 Gap Bar 法则检查：屏蔽第一次回测的 L1
-                        if(Check20GapBarBlock("L1"))
-                        {
-                            // 被屏蔽，但继续状态机流转（等待 L2）
-                            g_L2_IsStrongTrend = false;
-                        }
-                        else if(CheckSignalCooldown("sell"))
-                        {
-                            stopLoss = CalculateStopLoss("sell", atr);
-                            if(stopLoss > 0)
-                            {
-                                baseHeight = atr * 2.0;
-                                signal = SIGNAL_L1_SELL;
-                                UpdateSignalCooldown("sell");
-                            }
-                        }
-                        g_L2_IsStrongTrend = false;
-                    }
-                }
-                break;
-                
-            case L2_L1_DETECTED:
-                // 强趋势下：当前 K 线为 Inside Bar 时不重置（Al Brooks 时间回调）
-                if(g_L2_BounceStartHigh > 0 && high > g_L2_BounceStartHigh)
-                {
-                    if(!(isStrongTrendMode && IsInsideBar(1)))
-                    {
-                        ResetL2StateMachine();
-                        g_L2_TrendLow = low;
-                    }
-                }
-                else if(low < g_L2_L1Low)
-                {
-                    g_L2_L1Low = low;
-                    g_L2_L1BarIndex = 1;
-                }
-                else if(g_L2_L1Low > 0 && high > g_L2_L1Low)
-                {
-                    g_L2State = L2_WAITING_FOR_L2;
-                }
-                break;
-                
-            case L2_WAITING_FOR_L2:
-                // 入场触发：价格突破横盘区间最低点即触发 L2（Al Brooks 等距突破）
-                if(g_L2_L1Low > 0 && low < g_L2_L1Low)
-                {
-                    //=================================================================
-                    // 强趋势：Inside Bar / 小实体棒视为有效“时间回调”，突破即触发
-                    //=================================================================
-                    bool validCountingBars = false;
-                    
-                    if(isStrongTrendMode)
-                    {
-                        validCountingBars = HasPauseBars(g_L2_L1BarIndex, 1, atr) ||
-                                            HasTimeCorrectionBars(g_L2_L1BarIndex, 1, atr);
-                        
-                        if(validCountingBars)
-                        {
-                            Print("📊 L2 时间回调确认: 横盘/Inside Bar 有效 → 突破 ", DoubleToString(g_L2_L1Low, g_SymbolDigits), " 触发");
-                        }
-                    }
-                    else
-                    {
-                        validCountingBars = HasCountingBars(g_L2_L1BarIndex, 1, false);
-                    }
-                    
-                    if(validCountingBars)
-                    {
-                        if(CheckSignalCooldown("sell"))
-                        {
-                            stopLoss = CalculateStopLoss("sell", atr);
-                            if(stopLoss > 0 && ValidateSignalBar("sell"))
-                            {
-                                baseHeight = atr * 2.0;
-                                signal = SIGNAL_L2_SELL;
-                                UpdateSignalCooldown("sell");
-                            }
-                        }
-                    }
-                    
-                    ResetL2StateMachine();
-                    g_L2_TrendLow = low;
-                }
-                else if(g_L2_BounceStartHigh > 0 && high > g_L2_BounceStartHigh)
-                {
-                    // 强趋势下：Inside Bar 不重置
-                    if(!(isStrongTrendMode && IsInsideBar(1)))
-                    {
-                        ResetL2StateMachine();
-                        g_L2_TrendLow = low;
-                    }
-                }
-                break;
-        }
-    }
-    else // 价格在 EMA 上方
-    {
-        switch(g_L2State)
-        {
-            case L2_WAITING_FOR_BOUNCE:
-                if(close > (ema + emaTolerance))
-                {
-                    g_L2State = L2_IN_BOUNCE;
-                    g_L2_BounceStartHigh = high;
-                }
-                break;
-                
-            case L2_IN_BOUNCE:
-                if(g_L2_BounceStartHigh == 0 || high > g_L2_BounceStartHigh)
-                    g_L2_BounceStartHigh = high;
-                break;
-                
-            case L2_L1_DETECTED:
-            case L2_WAITING_FOR_L2:
-                if(g_L2_BounceStartHigh > 0 && high > g_L2_BounceStartHigh)
-                {
-                    if(!(isStrongTrendMode && IsInsideBar(1)))
-                        ResetL2StateMachine();
-                }
-                break;
-        }
-    }
-    
-    return signal;
-}
-
-//+------------------------------------------------------------------+
-//| Reset H2 State Machine                                            |
-//+------------------------------------------------------------------+
-void ResetH2StateMachine()
-{
-    g_H2State = H2_WAITING_FOR_PULLBACK;
-    g_H2_TrendHigh = 0;
-    g_H2_PullbackStartLow = 0;
-    g_H2_H1High = 0;
-    g_H2_H1BarIndex = -1;
-    g_H2_IsStrongTrend = false;
-}
-
-//+------------------------------------------------------------------+
-//| Reset L2 State Machine                                            |
-//+------------------------------------------------------------------+
-void ResetL2StateMachine()
-{
-    g_L2State = L2_WAITING_FOR_BOUNCE;
-    g_L2_TrendLow = 0;
-    g_L2_BounceStartHigh = 0;
-    g_L2_L1Low = 0;
-    g_L2_L1BarIndex = -1;
-    g_L2_IsStrongTrend = false;
-}
-
-//+------------------------------------------------------------------+
-//| Is Inside Bar (当前 K 线是否为内包线)                              |
-//| 定义：高点不高于前高，低点不低于前低 (high <= prevHigh && low >= prevLow) |
-//| barIndex: 1 = 当前棒，2 = 前一根棒                                 |
-//+------------------------------------------------------------------+
-bool IsInsideBar(int barIndex)
-{
-    if(barIndex < 1 || barIndex + 1 >= ArraySize(g_HighBuffer) || barIndex + 1 >= ArraySize(g_LowBuffer))
-        return false;
-    
-    double currHigh = g_HighBuffer[barIndex];
-    double currLow  = g_LowBuffer[barIndex];
-    double prevHigh = g_HighBuffer[barIndex + 1];
-    double prevLow  = g_LowBuffer[barIndex + 1];
-    
-    return (currHigh <= prevHigh && currLow >= prevLow);
-}
-
-//+------------------------------------------------------------------+
-//| Is Small Body Bar (是否为小实体棒，用于时间回调判定)                |
-//| 实体 < 0.35×ATR 或 实体 < 范围×20%                                 |
-//+------------------------------------------------------------------+
-bool IsSmallBodyBar(int barIndex, double atr)
-{
-    if(barIndex >= ArraySize(g_OpenBuffer) || barIndex >= ArraySize(g_CloseBuffer)) return false;
-    if(barIndex >= ArraySize(g_HighBuffer) || barIndex >= ArraySize(g_LowBuffer)) return false;
-    
-    double open  = g_OpenBuffer[barIndex];
-    double close = g_CloseBuffer[barIndex];
-    double high  = g_HighBuffer[barIndex];
-    double low   = g_LowBuffer[barIndex];
-    
-    double body  = MathAbs(close - open);
-    double range = high - low;
-    
-    if(range <= 0) return false;
-    
-    if(atr > 0 && body < atr * 0.35) return true;
-    if(body < range * 0.20) return true;  // Doji 型
-    
-    return false;
-}
-
-//+------------------------------------------------------------------+
-//| Has Time Correction Bars (强趋势中：是否有有效的“时间回调”)          |
-//| 连续或单根 Inside Bar / 小实体棒 均视为有效 Counting Bars            |
-//+------------------------------------------------------------------+
-bool HasTimeCorrectionBars(int startBar, int endBar, double atr)
-{
-    if(startBar < 0 || startBar <= endBar) return false;
-    
-    int count = 0;
-    for(int i = endBar + 1; i < startBar; i++)
-    {
-        if(i >= ArraySize(g_HighBuffer)) break;
-        
-        if(IsInsideBar(i))
-            count++;
-        else if(IsSmallBodyBar(i, atr))
-            count++;
-        
-        if(count >= 1) return true;  // 至少 1 根即视为有效时间回调
-    }
-    
-    return count >= 1;
-}
-
-//+------------------------------------------------------------------+
-//| Has Counting Bars (检查回调/反弹深度)                              |
-//| Al Brooks: 回调有两种形式：                                         |
-//|   1. 价格回调 (Correction in Price)：反向 K 线（阴线/阳线）          |
-//|   2. 时间回调 (Correction in Time)：横盘整理（Inside Bar, Doji）    |
-//| 时间回调代表趋势方非常强势，不允许价格回调，只通过时间消化超买/超卖    |
-//+------------------------------------------------------------------+
-bool HasCountingBars(int startBar, int endBar, bool lookForBearish)
-{
-    if(startBar < 0 || startBar <= endBar) return false;
-    
-    int priceCorrection = 0;   // 价格回调计数（反向 K 线）
-    int timeCorrection = 0;    // 时间回调计数（横盘整理）
-    int consecutiveSideways = 0; // 连续横盘棒计数
-    
-    for(int i = endBar + 1; i < startBar; i++)
-    {
-        if(i >= ArraySize(g_CloseBuffer)) break;
-        if(i >= ArraySize(g_OpenBuffer)) break;
-        if(i >= ArraySize(g_HighBuffer)) break;
-        if(i >= ArraySize(g_LowBuffer)) break;
-        
-        double open = g_OpenBuffer[i];
-        double close = g_CloseBuffer[i];
-        double high = g_HighBuffer[i];
-        double low = g_LowBuffer[i];
-        double body = MathAbs(close - open);
-        double range = high - low;
-        
-        //=============================================================
-        // 检测价格回调（反向 K 线）
-        //=============================================================
-        if(lookForBearish)
-        {
-            // H2 买入信号需要阴线回调
-            if(close < open) priceCorrection++;
-        }
-        else
-        {
-            // L2 卖出信号需要阳线回调
-            if(close > open) timeCorrection++;
-        }
-        
-        //=============================================================
-        // 检测时间回调（横盘整理）
-        // Al Brooks: 横盘是强势方的表现，不允许价格回调
-        //=============================================================
-        bool isSidewaysBar = false;
-        
-        // Doji：实体 < K 线范围的 15%
-        if(range > 0 && body < range * 0.15)
-        {
-            isSidewaysBar = true;
-        }
-        
-        // Inside Bar：完全包含在前一根 K 线内
-        if(i + 1 < ArraySize(g_HighBuffer) && i + 1 < ArraySize(g_LowBuffer))
-        {
-            double prevHigh = g_HighBuffer[i + 1];
-            double prevLow = g_LowBuffer[i + 1];
-            if(high <= prevHigh && low >= prevLow)
-            {
-                isSidewaysBar = true;
-            }
-        }
-        
-        // 小实体棒：实体小于前一根实体的 50%
-        if(i + 1 < ArraySize(g_OpenBuffer) && i + 1 < ArraySize(g_CloseBuffer))
-        {
-            double prevBody = MathAbs(g_CloseBuffer[i + 1] - g_OpenBuffer[i + 1]);
-            if(prevBody > 0 && body < prevBody * 0.5)
-            {
-                isSidewaysBar = true;
-            }
-        }
-        
-        if(isSidewaysBar)
-        {
-            timeCorrection++;
-            consecutiveSideways++;
-        }
-        else
-        {
-            consecutiveSideways = 0; // 重置连续计数
-        }
-    }
-    
-    //=================================================================
-    // 判定逻辑
-    //=================================================================
-    
-    // 情况 1：有价格回调（至少 1 根反向 K 线）
-    if(priceCorrection >= 1)
-    {
-        return true;
-    }
-    
-    // 情况 2：强趋势中的时间回调
-    // 在 STRONG_TREND 或 TIGHT_CHANNEL 下，连续 2 根横盘棒也算有效回调
-    bool isStrongTrend = (g_MarketState == MARKET_STATE_STRONG_TREND || 
-                          g_MarketState == MARKET_STATE_TIGHT_CHANNEL ||
-                          g_MarketState == MARKET_STATE_BREAKOUT);
-    
-    if(isStrongTrend && timeCorrection >= 2)
-    {
-        Print("📊 时间回调确认: ", timeCorrection, " 根横盘棒 (Inside Bar/Doji)");
-        Print("   Al Brooks: 横盘整理 = 强势方不允许价格回调，只通过时间消化");
-        return true;
-    }
-    
-    // 情况 3：区间太短（1-2 根 K 线）
-    int barCount = startBar - endBar - 1;
-    if(barCount <= 1)
-    {
-        return true; // 区间太短，放宽要求
-    }
-    
-    return false;
-}
-
-//+------------------------------------------------------------------+
-//| Has Pause Bars (停顿棒检测 - 强趋势中的替代逻辑)                     |
-//| Al Brooks: 强趋势中的回调可以很浅，只需有"犹豫"即可                   |
-//| 停顿棒类型：                                                        |
-//| - Doji：实体 < K 线范围的 10%                                       |
-//| - Inside Bar：完全包含在前一根 K 线内                                |
-//| - 小实体棒：实体 < 0.3 × ATR                                        |
-//+------------------------------------------------------------------+
-bool HasPauseBars(int startBar, int endBar, double atr)
-{
-    if(startBar < 0 || startBar <= endBar) return false;
-    
-    // 遍历 H1/L1 到当前信号棒之间的所有 K 线
-    for(int i = endBar + 1; i < startBar; i++)
-    {
-        if(i >= ArraySize(g_CloseBuffer)) break;
-        if(i >= ArraySize(g_HighBuffer)) break;
-        if(i >= ArraySize(g_LowBuffer)) break;
-        if(i >= ArraySize(g_OpenBuffer)) break;
-        
-        double open = g_OpenBuffer[i];
-        double close = g_CloseBuffer[i];
-        double high = g_HighBuffer[i];
-        double low = g_LowBuffer[i];
-        
-        double body = MathAbs(close - open);
-        double range = high - low;
-        
-        // 防止除零
-        if(range <= 0) continue;
-        
-        //=================================================================
-        // 检测 Doji：实体 < K 线范围的 10%
-        //=================================================================
-        bool isDoji = (body < range * 0.1);
-        
-        //=================================================================
-        // 检测小实体棒：实体 < 0.3 × ATR
-        //=================================================================
-        bool isSmallBody = (atr > 0 && body < atr * 0.3);
-        
-        //=================================================================
-        // 检测 Inside Bar：完全包含在前一根 K 线内
-        //=================================================================
-        bool isInsideBar = false;
-        if(i + 1 < ArraySize(g_HighBuffer) && i + 1 < ArraySize(g_LowBuffer))
-        {
-            double prevHigh = g_HighBuffer[i + 1];
-            double prevLow = g_LowBuffer[i + 1];
-            isInsideBar = (high <= prevHigh && low >= prevLow);
-        }
-        
-        // 只要有一根停顿棒，即视为有效
-        if(isDoji || isSmallBody || isInsideBar)
-        {
-            return true;
-        }
-    }
-    
-    // 如果没有找到停顿棒，但区间只有 1-2 根 K 线，也放宽要求
-    // 这是因为强趋势中，回调本来就很浅
-    int barCount = startBar - endBar - 1;
-    if(barCount <= 2)
-    {
-        return true; // 强趋势中，1-2 根 K 线的回调已足够
-    }
-    
-    return false;
-}
-
-//+------------------------------------------------------------------+
-//| Check Failed Breakout                                             |
-//+------------------------------------------------------------------+
-ENUM_SIGNAL_TYPE CheckFailedBreakout(double ema, double atr, double &stopLoss, double &baseHeight)
-{
-    int lookback = 10;
-    
-    // 计算近期高低点
-    double maxHigh = g_HighBuffer[2];
-    double minLow = g_LowBuffer[2];
-    for(int i = 2; i <= lookback + 1; i++)
-    {
-        if(g_HighBuffer[i] > maxHigh) maxHigh = g_HighBuffer[i];
-        if(g_LowBuffer[i] < minLow) minLow = g_LowBuffer[i];
-    }
-    
-    double currentHigh = g_HighBuffer[1];
-    double currentLow = g_LowBuffer[1];
+    double htfEMA = g_HTFEMABuffer[1];
     double currentClose = g_CloseBuffer[1];
-    double currentOpen = g_OpenBuffer[1];
-    double klineRange = currentHigh - currentLow;
+    double atr = g_ATRBuffer[1];
+    if(atr <= 0) return;
     
-    if(klineRange <= 0) return SIGNAL_NONE;
+    double threshold = atr * 0.5;
     
-    // 创新高后反转
-    if(currentHigh > maxHigh)
-    {
-        if(currentClose < currentOpen) // 阴线
-        {
-            double closePosition = (currentHigh - currentClose) / klineRange;
-            if(closePosition >= 0.60)
-            {
-                if(CheckSignalCooldown("sell"))
-                {
-                    stopLoss = CalculateStopLoss("sell", atr);
-                    if(stopLoss > 0)
-                    {
-                        baseHeight = maxHigh - minLow;
-                        UpdateSignalCooldown("sell");
-                        return SIGNAL_FAILED_BO_SELL;
-                    }
-                }
-            }
-        }
-    }
-    
-    // 创新低后反转
-    if(currentLow < minLow)
-    {
-        if(currentClose > currentOpen) // 阳线
-        {
-            double closePosition = (currentClose - currentLow) / klineRange;
-            if(closePosition >= 0.60)
-            {
-                if(CheckSignalCooldown("buy"))
-                {
-                    stopLoss = CalculateStopLoss("buy", atr);
-                    if(stopLoss > 0)
-                    {
-                        baseHeight = maxHigh - minLow;
-                        UpdateSignalCooldown("buy");
-                        return SIGNAL_FAILED_BO_BUY;
-                    }
-                }
-            }
-        }
-    }
-    
-    return SIGNAL_NONE;
+    if(currentClose > htfEMA + threshold)
+        g_HTFTrendDir = "up";
+    else if(currentClose < htfEMA - threshold)
+        g_HTFTrendDir = "down";
+    else
+        g_HTFTrendDir = "";
 }
 
-//+------------------------------------------------------------------+
-//| Check Wedge Reversal                                              |
-//+------------------------------------------------------------------+
-ENUM_SIGNAL_TYPE CheckWedge(double ema, double atr, double &stopLoss, double &baseHeight)
-{
-    int lookback = 30;
-    
-    // 查找三推高点递降（楔顶）
-    double peaks[3] = {0, 0, 0};
-    int peakIndices[3] = {-1, -1, -1};
-    int peakCount = 0;
-    
-    for(int i = 3; i <= lookback && peakCount < 3; i++)
-    {
-        // 简单的峰值检测
-        if(g_HighBuffer[i] > g_HighBuffer[i-1] && 
-           g_HighBuffer[i] > g_HighBuffer[i-2] &&
-           g_HighBuffer[i] > g_HighBuffer[i+1] && 
-           g_HighBuffer[i] > g_HighBuffer[i+2])
-        {
-            if(peakCount == 0 || g_HighBuffer[i] < peaks[peakCount-1])
-            {
-                peaks[peakCount] = g_HighBuffer[i];
-                peakIndices[peakCount] = i;
-                peakCount++;
-            }
-        }
-    }
-    
-    // 检测楔顶反转（三推高点递降后做空）
-    if(peakCount >= 3)
-    {
-        double wedgeHigh = peaks[0];
-        
-        // 当前K线突破后回落
-        if(g_HighBuffer[1] > wedgeHigh * 0.999)
-        {
-            double klineRange = g_HighBuffer[1] - g_LowBuffer[1];
-            if(klineRange > 0)
-            {
-                double closePosition = (g_HighBuffer[1] - g_CloseBuffer[1]) / klineRange;
-                if(closePosition >= 0.50 && g_CloseBuffer[1] < g_OpenBuffer[1])
-                {
-                    if(CheckSignalCooldown("sell"))
-                    {
-                        stopLoss = wedgeHigh + (atr > 0 ? 0.5 * atr : wedgeHigh * 0.001);
-                        baseHeight = wedgeHigh - g_LowBuffer[peakIndices[2]];
-                        UpdateSignalCooldown("sell");
-                        return SIGNAL_WEDGE_SELL;
-                    }
-                }
-            }
-        }
-    }
-    
-    // 查找三推低点递升（楔底）
-    double troughs[3] = {0, 0, 0};
-    int troughIndices[3] = {-1, -1, -1};
-    int troughCount = 0;
-    
-    for(int i = 3; i <= lookback && troughCount < 3; i++)
-    {
-        if(g_LowBuffer[i] < g_LowBuffer[i-1] && 
-           g_LowBuffer[i] < g_LowBuffer[i-2] &&
-           g_LowBuffer[i] < g_LowBuffer[i+1] && 
-           g_LowBuffer[i] < g_LowBuffer[i+2])
-        {
-            if(troughCount == 0 || g_LowBuffer[i] > troughs[troughCount-1])
-            {
-                troughs[troughCount] = g_LowBuffer[i];
-                troughIndices[troughCount] = i;
-                troughCount++;
-            }
-        }
-    }
-    
-    // 检测楔底反转（三推低点递升后做多）
-    if(troughCount >= 3)
-    {
-        double wedgeLow = troughs[0];
-        
-        if(g_LowBuffer[1] < wedgeLow * 1.001)
-        {
-            double klineRange = g_HighBuffer[1] - g_LowBuffer[1];
-            if(klineRange > 0)
-            {
-                double closePosition = (g_CloseBuffer[1] - g_LowBuffer[1]) / klineRange;
-                if(closePosition >= 0.50 && g_CloseBuffer[1] > g_OpenBuffer[1])
-                {
-                    if(CheckSignalCooldown("buy"))
-                    {
-                        stopLoss = wedgeLow - (atr > 0 ? 0.5 * atr : wedgeLow * 0.001);
-                        baseHeight = g_HighBuffer[troughIndices[2]] - wedgeLow;
-                        UpdateSignalCooldown("buy");
-                        return SIGNAL_WEDGE_BUY;
-                    }
-                }
-            }
-        }
-    }
-    
-    return SIGNAL_NONE;
-}
-
-//+------------------------------------------------------------------+
-//| Check Climax Reversal (高潮反转检测)                               |
-//| Al Brooks PA 核心原则：                                             |
-//| 1. Spike 阶段默认屏蔽逆势（保护新手，Spike 会持续得比想象中更久）     |
-//| 2. V 型反转是高级信号，需要极高门槛才能在 Spike 中触发               |
-//| strictMode = true: Spike V 型反转，要求极端行情 + 强力反转          |
-//| strictMode = false: 正常 TradingRange/FinalFlag 调用               |
-//+------------------------------------------------------------------+
-ENUM_SIGNAL_TYPE CheckClimax(double ema, double atr, double &stopLoss, double &baseHeight, 
-                             bool strictMode = false)
-{
-    if(atr <= 0) return SIGNAL_NONE;
-    
-    //=================================================================
-    // Spike V 型反转开关检查
-    //=================================================================
-    if(strictMode && !InpEnableSpikeClimax)
-    {
-        return SIGNAL_NONE;  // 禁用 Spike 中的反转
-    }
-    
-    //=================================================================
-    // 动态 Climax ATR 倍数
-    // 正常模式：2.5 × ATR
-    // Spike V 型反转：使用输入参数 InpSpikeClimaxATRMult
-    //=================================================================
-    double climaxMult = strictMode ? InpSpikeClimaxATRMult : 2.5;
-    
-    // 前一根K线（潜在的 Climax 棒）
-    double prevHigh = g_HighBuffer[2];
-    double prevLow = g_LowBuffer[2];
-    double prevOpen = g_OpenBuffer[2];
-    double prevClose = g_CloseBuffer[2];
-    double prevRange = prevHigh - prevLow;
-    double prevBody = MathAbs(prevClose - prevOpen);
-    
-    // 当前K线（潜在的反转棒）
-    double currHigh = g_HighBuffer[1];
-    double currLow = g_LowBuffer[1];
-    double currOpen = g_OpenBuffer[1];
-    double currClose = g_CloseBuffer[1];
-    double currRange = currHigh - currLow;
-    double currBody = MathAbs(currClose - currOpen);
-    
-    if(currRange <= 0 || prevBody <= 0) return SIGNAL_NONE;
-    
-    //=================================================================
-    // 【Spike V 型反转】多重门槛检查
-    //=================================================================
-    if(strictMode)
-    {
-        //=============================================================
-        // 门槛 1: Spike 持续时间检查
-        // V 型反转通常发生在 Spike 末期（连续多根趋势棒之后）
-        //=============================================================
-        int spikeBars = CountConsecutiveTrendBars();
-        if(spikeBars < InpMinSpikeBars)
-        {
-            return SIGNAL_NONE;  // Spike 尚未成熟，不允许反转
-        }
-        
-        //=============================================================
-        // 门槛 2: Climax 棒长度检查（必须是极端长棒）
-        //=============================================================
-        if(prevRange < atr * climaxMult)
-        {
-            return SIGNAL_NONE;  // 不够极端
-        }
-        
-        //=============================================================
-        // 门槛 3: 反转棒覆盖率（必须有足够的实体）
-        //=============================================================
-        double reversalCoverage = currBody / prevBody;
-        if(reversalCoverage < InpReversalCoverage)
-        {
-            return SIGNAL_NONE;
-        }
-        
-        //=============================================================
-        // 门槛 4: 反转棒穿透率（必须穿入 Climax 棒实体）
-        // 做空反转：反转棒必须穿入 Climax 阳线实体的一定比例
-        // 做多反转：反转棒必须穿入 Climax 阴线实体的一定比例
-        //=============================================================
-        double penetration = 0;
-        bool isBullishClimax = (prevClose > prevOpen);  // Climax 是阳线
-        bool isBearishClimax = (prevClose < prevOpen);  // Climax 是阴线
-        
-        if(isBullishClimax)
-        {
-            // 向上 Climax -> 反转棒应穿入 Climax 实体下方
-            double climaxBodyLow = prevOpen;   // Climax 阳线的实体底部
-            double climaxBodyHigh = prevClose; // Climax 阳线的实体顶部
-            double climaxBodySize = climaxBodyHigh - climaxBodyLow;
-            
-            if(climaxBodySize > 0)
-            {
-                // 反转棒收盘应该穿透 Climax 实体
-                double penetrationDepth = climaxBodyHigh - currClose;
-                penetration = penetrationDepth / climaxBodySize;
-            }
-        }
-        else if(isBearishClimax)
-        {
-            // 向下 Climax -> 反转棒应穿入 Climax 实体上方
-            double climaxBodyLow = prevClose;  // Climax 阴线的实体底部
-            double climaxBodyHigh = prevOpen;  // Climax 阴线的实体顶部
-            double climaxBodySize = climaxBodyHigh - climaxBodyLow;
-            
-            if(climaxBodySize > 0)
-            {
-                double penetrationDepth = currClose - climaxBodyLow;
-                penetration = penetrationDepth / climaxBodySize;
-            }
-        }
-        
-        if(penetration < InpReversalPenetration)
-        {
-            return SIGNAL_NONE;  // 穿透不够深
-        }
-        
-        //=============================================================
-        // 门槛 5: 反转棒收盘位置（必须在强势区域）
-        // 做空反转：收盘应在下半部（弱势端）
-        // 做多反转：收盘应在上半部（强势端）
-        //=============================================================
-        double closePosition = (currClose - currLow) / currRange;
-        
-        if(isBullishClimax)  // 做空反转
-        {
-            // 收盘应该在下方（弱势端）
-            if(closePosition > (1.0 - InpReversalClosePos))
-            {
-                return SIGNAL_NONE;
-            }
-        }
-        else if(isBearishClimax)  // 做多反转
-        {
-            // 收盘应该在上方（强势端）
-            if(closePosition < InpReversalClosePos)
-            {
-                return SIGNAL_NONE;
-            }
-        }
-        
-        //=============================================================
-        // 门槛 6: 第二入场检查 (Al Brooks: 强趋势第一次反转80%失败)
-        // 只有当启用且有之前失败的反转尝试时，才允许触发信号
-        //=============================================================
-        if(InpRequireSecondEntry)
-        {
-            string attemptDirection = isBullishClimax ? "bearish" : "bullish";
-            
-            // 检查是否有之前的失败反转尝试
-            bool hasFailedAttempt = CheckForFailedReversalAttempt(attemptDirection, atr);
-            
-            if(!hasFailedAttempt)
-            {
-                // 记录当前为"第一次反转尝试"，但不发出信号
-                RecordReversalAttempt(attemptDirection, isBullishClimax ? currLow : currHigh);
-                
-                Print("━━━━━━━━ V 型反转: 第一次尝试 (不触发) ━━━━━━━━");
-                Print("   Al Brooks: 强趋势中第一次反转尝试80%会失败");
-                Print("   方向: ", attemptDirection);
-                Print("   极值: ", DoubleToString(isBullishClimax ? currLow : currHigh, g_SymbolDigits));
-                Print("   等待: 价格突破此极值后的第二次反转尝试");
-                
-                return SIGNAL_NONE;  // 不发出信号，等待第二入场
-            }
-            else
-            {
-                Print("━━━━━━━━ V 型反转: 第二入场确认 ━━━━━━━━");
-                Print("   Al Brooks: 第一次反转已失败，第二次入场成功率更高");
-                // 继续执行，发出信号
-            }
-        }
-        
-        //=============================================================
-        // 所有门槛通过 - 记录日志
-        //=============================================================
-        Print("━━━━━━━━ V 型反转检测通过 ━━━━━━━━");
-        Print("   Spike 持续: ", spikeBars, " 根 K 线");
-        Print("   Climax 棒长度: ", DoubleToString(prevRange / atr, 2), "×ATR (阈值: ", InpSpikeClimaxATRMult, ")");
-        Print("   反转棒覆盖率: ", DoubleToString(reversalCoverage * 100, 1), "% (阈值: ", InpReversalCoverage * 100, "%)");
-        Print("   反转棒穿透率: ", DoubleToString(penetration * 100, 1), "% (阈值: ", InpReversalPenetration * 100, "%)");
-        Print("   收盘位置: ", DoubleToString(closePosition * 100, 1), "% (阈值: ", InpReversalClosePos * 100, "%)");
-    }
-    
-    //=================================================================
-    // 向上 Climax -> 做空反转
-    //=================================================================
-    if(prevRange > atr * climaxMult && prevClose > prevOpen)
-    {
-        // 当前棒必须是阴线，且收盘低于前一根收盘
-        if(currClose < currOpen && currClose < prevClose)
-        {
-            // 尾部影线检查（上影线表示空头力量）
-            double upperTail = currHigh - MathMax(currOpen, currClose);
-            double tailRatio = upperTail / currRange;
-            
-            double minTailRatio = strictMode ? 0.20 : 0.15;
-            
-            if(tailRatio >= minTailRatio)
-            {
-                if(CheckSignalCooldown("sell"))
-                {
-                    // 检查前期走势（必须有足够的上涨空间）
-                    double lookbackLow = g_LowBuffer[3];
-                    for(int i = 3; i <= 10; i++)
-                        if(g_LowBuffer[i] < lookbackLow) lookbackLow = g_LowBuffer[i];
-                    
-                    double priorMove = prevHigh - lookbackLow;
-                    double minPriorMove = strictMode ? atr * 4.0 : atr * 2.0;
-                    
-                    if(priorMove >= minPriorMove)
-                    {
-                        stopLoss = CalculateStopLoss("sell", atr);
-                        if(stopLoss > 0)
-                        {
-                            baseHeight = prevRange;
-                            UpdateSignalCooldown("sell");
-                            
-                            if(strictMode)
-                            {
-                                Print("🔴 V 型反转 SELL 触发!");
-                                Print("   前期上涨: ", DoubleToString(priorMove / atr, 1), "×ATR");
-                                Print("   ⚠️ Al Brooks: 高级信号，需严格风控");
-                            }
-                            return SIGNAL_CLIMAX_SELL;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    
-    //=================================================================
-    // 向下 Climax -> 做多反转
-    //=================================================================
-    if(prevRange > atr * climaxMult && prevClose < prevOpen)
-    {
-        // 当前棒必须是阳线，且收盘高于前一根收盘
-        if(currClose > currOpen && currClose > prevClose)
-        {
-            // 尾部影线检查（下影线表示多头力量）
-            double lowerTail = MathMin(currOpen, currClose) - currLow;
-            double tailRatio = lowerTail / currRange;
-            
-            double minTailRatio = strictMode ? 0.20 : 0.15;
-            
-            if(tailRatio >= minTailRatio)
-            {
-                if(CheckSignalCooldown("buy"))
-                {
-                    double lookbackHigh = g_HighBuffer[3];
-                    for(int i = 3; i <= 10; i++)
-                        if(g_HighBuffer[i] > lookbackHigh) lookbackHigh = g_HighBuffer[i];
-                    
-                    double priorMove = lookbackHigh - prevLow;
-                    double minPriorMove = strictMode ? atr * 4.0 : atr * 2.0;
-                    
-                    if(priorMove >= minPriorMove)
-                    {
-                        stopLoss = CalculateStopLoss("buy", atr);
-                        if(stopLoss > 0)
-                        {
-                            baseHeight = prevRange;
-                            UpdateSignalCooldown("buy");
-                            
-                            if(strictMode)
-                            {
-                                Print("🟢 V 型反转 BUY 触发!");
-                                Print("   前期下跌: ", DoubleToString(priorMove / atr, 1), "×ATR");
-                                Print("   ⚠️ Al Brooks: 高级信号，需严格风控");
-                            }
-                            return SIGNAL_CLIMAX_BUY;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    
-    return SIGNAL_NONE;
-}
-
-//+------------------------------------------------------------------+
-//| Count Consecutive Trend Bars (计算连续趋势棒数量)                   |
-//| 用于判断 Spike 是否成熟到可以触发 V 型反转                          |
-//+------------------------------------------------------------------+
-int CountConsecutiveTrendBars()
+int CalculateGapCount(double ema, double atr)
 {
     int count = 0;
-    bool bullTrend = (g_CloseBuffer[2] > g_OpenBuffer[2]);  // 当前 Climax 方向
+    if(atr <= 0) return 0;
+    double threshold = atr * 0.3;
     
-    // 从 bar[2] 开始向回数
-    for(int i = 2; i <= 20; i++)
+    bool checkingUp   = g_CloseBuffer[1] > ema + threshold;
+    bool checkingDown = g_CloseBuffer[1] < ema - threshold;
+    
+    if(!checkingUp && !checkingDown)
     {
-        double barOpen = g_OpenBuffer[i];
-        double barClose = g_CloseBuffer[i];
-        double barRange = g_HighBuffer[i] - g_LowBuffer[i];
-        double barBody = MathAbs(barClose - barOpen);
+        g_GapCount = 0;
+        g_GapCountExtreme = 0;
+        return 0;
+    }
+    
+    int maxLookback = MathMin(50, g_BufferSize - 1);
+    int maxEMA = ArraySize(g_EMABuffer) - 1;
+    if(maxEMA < maxLookback) maxLookback = maxEMA;
+    
+    g_GapCountExtreme = checkingUp ? -DBL_MAX : DBL_MAX;
+    
+    for(int i = 1; i <= maxLookback; i++)
+    {
+        double barEMA = g_EMABuffer[i];
         
-        if(barRange <= 0) break;
-        
-        // 检查是否是趋势方向的棒线
-        bool isTrendBar = false;
-        double bodyRatio = barBody / barRange;
-        
-        if(bullTrend)
+        if(checkingUp)
         {
-            // 上涨 Spike: 阳线或高收盘阴线（停顿棒）
-            isTrendBar = (barClose > barOpen) || 
-                         (barClose < barOpen && (barClose - g_LowBuffer[i]) / barRange > 0.6);
+            if(g_LowBuffer[i] > barEMA)
+            {
+                count++;
+                if(g_HighBuffer[i] > g_GapCountExtreme)
+                    g_GapCountExtreme = g_HighBuffer[i];
+            }
+            else break;
         }
         else
         {
-            // 下跌 Spike: 阴线或低收盘阳线（停顿棒）
-            isTrendBar = (barClose < barOpen) ||
-                         (barClose > barOpen && (g_HighBuffer[i] - barClose) / barRange > 0.6);
-        }
-        
-        // 趋势棒必须有一定的实体
-        if(isTrendBar && bodyRatio >= 0.3)
-        {
-            count++;
-        }
-        else
-        {
-            break;  // 遇到非趋势棒，停止计数
+            if(g_HighBuffer[i] < barEMA)
+            {
+                count++;
+                if(g_LowBuffer[i] < g_GapCountExtreme)
+                    g_GapCountExtreme = g_LowBuffer[i];
+            }
+            else break;
         }
     }
     
+    g_GapCount = count;
     return count;
 }
 
+
 //+------------------------------------------------------------------+
-//| Record Reversal Attempt (记录反转尝试)                              |
-//| Al Brooks: 强趋势中第一次反转尝试 80% 会失败，记录以等待第二入场      |
+//| 20 Gap Bar Rule                                                   |
+//+------------------------------------------------------------------+
+void Update20GapBarRule(double ema, double atr)
+{
+    if(!InpEnable20GapRule) return;
+    if(atr <= 0) return;
+    
+    double threshold = atr * 0.3;
+    bool priceAboveEMA   = g_CloseBuffer[1] > ema + threshold;
+    bool priceBelowEMA   = g_CloseBuffer[1] < ema - threshold;
+    bool priceTouchingEMA= !priceAboveEMA && !priceBelowEMA;
+    
+    if(!g_IsOverextended && g_GapCount >= InpGapBarThreshold)
+    {
+        g_IsOverextended = true;
+        g_OverextendDirection = priceAboveEMA ? "up" : "down";
+        g_OverextendStartTime = TimeCurrent();
+        g_FirstPullbackBlocked = false;
+        g_WaitingForRecovery = false;
+        g_FirstPullbackComplete = false;
+        g_ConsolidationCount = 0;
+        g_PullbackExtreme = 0;
+        if(InpDebugMode) Print("20 Gap Bar 触发: GapCount=", g_GapCount, " 方向=", g_OverextendDirection);
+    }
+    
+    if(g_IsOverextended)
+    {
+        if(!g_FirstPullbackComplete && priceTouchingEMA)
+        {
+            if(!g_FirstPullbackBlocked)
+            {
+                g_FirstPullbackBlocked = true;
+                g_WaitingForRecovery = true;
+                g_PullbackExtreme = g_OverextendDirection == "up" ? g_LowBuffer[1] : g_HighBuffer[1];
+            }
+            g_ConsolidationCount++;
+        }
+        
+        if(g_WaitingForRecovery)
+        {
+            bool recovered = false;
+            
+            // 横盘整理恢复
+            if(g_ConsolidationCount >= InpConsolidationBars && atr > 0)
+            {
+                double rH = g_HighBuffer[1], rL = g_LowBuffer[1];
+                for(int i = 2; i <= InpConsolidationBars && i < g_BufferSize; i++)
+                {
+                    if(g_HighBuffer[i] > rH) rH = g_HighBuffer[i];
+                    if(g_LowBuffer[i] < rL) rL = g_LowBuffer[i];
+                }
+                if((rH - rL) <= atr * InpConsolidationRange) recovered = true;
+            }
+            
+            // 双底/双顶恢复
+            if(!recovered && g_PullbackExtreme > 0 && atr > 0)
+            {
+                double tol = atr * 0.3;
+                if(g_OverextendDirection == "up" &&
+                   g_LowBuffer[1] <= g_PullbackExtreme + tol && 
+                   g_LowBuffer[1] >= g_PullbackExtreme - tol &&
+                   g_CloseBuffer[1] > g_OpenBuffer[1])
+                    recovered = true;
+                if(g_OverextendDirection == "down" &&
+                   g_HighBuffer[1] >= g_PullbackExtreme - tol && 
+                   g_HighBuffer[1] <= g_PullbackExtreme + tol &&
+                   g_CloseBuffer[1] < g_OpenBuffer[1])
+                    recovered = true;
+            }
+            
+            // 价格穿越EMA恢复
+            if(!recovered)
+            {
+                if((g_OverextendDirection == "up" && priceBelowEMA) ||
+                   (g_OverextendDirection == "down" && priceAboveEMA))
+                    recovered = true;
+            }
+            
+            if(recovered)
+            {
+                g_FirstPullbackComplete = true;
+                g_WaitingForRecovery = false;
+            }
+        }
+        
+        // 重置条件: 需要连续2根K线确认方向改变,避免假突破
+        bool shouldReset = false;
+        if(g_GapCount == 0)
+            shouldReset = true;
+        else if(g_OverextendDirection == "up" && priceBelowEMA)
+        {
+            // 需要连续2根K线收盘在EMA下方才重置
+            if(g_BufferSize >= 3 && g_CloseBuffer[2] < g_EMABuffer[2] - threshold)
+                shouldReset = true;
+        }
+        else if(g_OverextendDirection == "down" && priceAboveEMA)
+        {
+            // 需要连续2根K线收盘在EMA上方才重置
+            if(g_BufferSize >= 3 && g_CloseBuffer[2] > g_EMABuffer[2] + threshold)
+                shouldReset = true;
+        }
+        
+        if(shouldReset)
+            Reset20GapBarState();
+    }
+}
+
+void Reset20GapBarState()
+{
+    g_IsOverextended = false;
+    g_FirstPullbackBlocked = false;
+    g_OverextendDirection = "";
+    g_OverextendStartTime = 0;
+    g_WaitingForRecovery = false;
+    g_ConsolidationCount = 0;
+    g_PullbackExtreme = 0;
+    g_FirstPullbackComplete = false;
+}
+
+bool Check20GapBarBlock(string signalType)
+{
+    if(!InpEnable20GapRule || !InpBlockFirstPullback) return false;
+    if(!g_IsOverextended || !g_FirstPullbackBlocked || !g_WaitingForRecovery) return false;
+    
+    if((signalType == "H1" && g_OverextendDirection == "up") ||
+       (signalType == "L1" && g_OverextendDirection == "down"))
+        return true;
+    
+    return false;
+}
+
+//+------------------------------------------------------------------+
+//| Reversal Attempt Tracking                                         |
 //+------------------------------------------------------------------+
 void RecordReversalAttempt(string direction, double extremePrice)
 {
@@ -3252,96 +3124,49 @@ void RecordReversalAttempt(string direction, double extremePrice)
     g_LastReversalAttempt.price = extremePrice;
     g_LastReversalAttempt.direction = direction;
     g_LastReversalAttempt.failed = false;
-    
     g_HasPendingReversal = true;
     g_ReversalAttemptCount++;
-    
-    Print("📝 反转尝试记录: 方向=", direction, 
-          " | 极值=", DoubleToString(extremePrice, g_SymbolDigits),
-          " | 尝试次数=", g_ReversalAttemptCount);
 }
 
-//+------------------------------------------------------------------+
-//| Check For Failed Reversal Attempt (检查是否有失败的反转尝试)         |
-//| 条件: 之前有反转尝试，且价格已突破了该尝试的极值（表示失败）           |
-//+------------------------------------------------------------------+
 bool CheckForFailedReversalAttempt(string direction, double atr)
 {
-    // 没有待处理的反转尝试
-    if(!g_HasPendingReversal)
-    {
-        return false;
-    }
-    
-    // 方向不匹配（例如之前是做多反转尝试，现在是做空反转尝试）
+    if(!g_HasPendingReversal) return false;
     if(g_LastReversalAttempt.direction != direction)
     {
-        // 清除之前的记录，重新开始
         ClearReversalAttempt();
         return false;
     }
     
-    // 检查时间窗口（超过 InpSecondEntryLookback 根 K 线后失效）
+    int maxTimeDiff = PeriodSeconds(PERIOD_CURRENT) * InpSecondEntryLookback;
     datetime currentBarTime = iTime(_Symbol, PERIOD_CURRENT, 1);
-    datetime attemptTime = g_LastReversalAttempt.time;
     
-    // 粗略检查：如果时间差太大，清除记录
-    int periodSeconds = PeriodSeconds(PERIOD_CURRENT);
-    int maxTimeDiff = periodSeconds * InpSecondEntryLookback;
-    
-    if(currentBarTime - attemptTime > maxTimeDiff)
+    if(currentBarTime - g_LastReversalAttempt.time > maxTimeDiff)
     {
-        Print("⏰ 反转尝试过期: 超过 ", InpSecondEntryLookback, " 根 K 线");
         ClearReversalAttempt();
         return false;
     }
     
-    // 检查是否已经失败（价格突破了反转尝试的极值）
     double extremePrice = g_LastReversalAttempt.price;
-    double currentHigh = g_HighBuffer[1];
-    double currentLow = g_LowBuffer[1];
-    
+    int maxLookback = MathMin(InpSecondEntryLookback, g_BufferSize);
     bool failed = false;
     
     if(direction == "bearish")
     {
-        // 做空反转尝试：如果价格创了新高，则第一次尝试失败
-        // 检查最近 N 根 K 线是否有突破
-        for(int i = 1; i < InpSecondEntryLookback && i < ArraySize(g_HighBuffer); i++)
-        {
-            if(g_HighBuffer[i] > extremePrice + atr * 0.1)
-            {
-                failed = true;
-                break;
-            }
-        }
+        for(int i = 1; i < maxLookback; i++)
+            if(g_HighBuffer[i] > extremePrice + atr * 0.1) { failed = true; break; }
     }
-    else if(direction == "bullish")
+    else
     {
-        // 做多反转尝试：如果价格创了新低，则第一次尝试失败
-        for(int i = 1; i < InpSecondEntryLookback && i < ArraySize(g_LowBuffer); i++)
-        {
-            if(g_LowBuffer[i] < extremePrice - atr * 0.1)
-            {
-                failed = true;
-                break;
-            }
-        }
+        for(int i = 1; i < maxLookback; i++)
+            if(g_LowBuffer[i] < extremePrice - atr * 0.1) { failed = true; break; }
     }
     
     if(failed && !g_LastReversalAttempt.failed)
-    {
         g_LastReversalAttempt.failed = true;
-        Print("❌ 第一次反转尝试失败: 价格突破了极值 ", DoubleToString(extremePrice, g_SymbolDigits));
-        Print("   Al Brooks: 现在可以等待第二入场");
-    }
     
     return g_LastReversalAttempt.failed;
 }
 
-//+------------------------------------------------------------------+
-//| Clear Reversal Attempt (清除反转尝试记录)                           |
-//+------------------------------------------------------------------+
 void ClearReversalAttempt()
 {
     g_HasPendingReversal = false;
@@ -3352,657 +3177,68 @@ void ClearReversalAttempt()
     g_LastReversalAttempt.failed = false;
 }
 
-//+------------------------------------------------------------------+
-//| Update Reversal Attempt Tracking (更新反转尝试跟踪)                 |
-//| 在每根新 K 线时调用，检查市场状态变化                                 |
-//+------------------------------------------------------------------+
 void UpdateReversalAttemptTracking()
 {
-    // 如果市场状态不再是强趋势，清除反转尝试记录
     bool isStrongTrend = (g_MarketState == MARKET_STATE_STRONG_TREND ||
                           g_MarketState == MARKET_STATE_BREAKOUT ||
                           g_MarketCycle == MARKET_CYCLE_SPIKE);
     
     if(!isStrongTrend && g_HasPendingReversal)
     {
-        Print("📊 市场状态变化: 不再是强趋势，清除反转尝试记录");
         ClearReversalAttempt();
+        return;
+    }
+    
+    if(g_HasPendingReversal && !g_LastReversalAttempt.failed)
+    {
+        double atr = g_ATRBuffer[1];
+        if(atr > 0) CheckForFailedReversalAttempt(g_LastReversalAttempt.direction, atr);
+    }
+    
+    if(g_HasPendingReversal && g_LastReversalAttempt.failed)
+    {
+        int maxTimeDiff = PeriodSeconds(PERIOD_CURRENT) * InpSecondEntryLookback * 2;
+        if(TimeCurrent() - g_LastReversalAttempt.time > maxTimeDiff)
+            ClearReversalAttempt();
+    }
+    
+    if(g_HasPendingReversal)
+    {
+        if((g_LastReversalAttempt.direction == "bullish" && g_TrendDirection == "down") ||
+           (g_LastReversalAttempt.direction == "bearish" && g_TrendDirection == "up"))
+            ClearReversalAttempt();
     }
 }
 
-//+------------------------------------------------------------------+
-//| Check MTR (Major Trend Reversal)                                  |
-//+------------------------------------------------------------------+
-ENUM_SIGNAL_TYPE CheckMTR(double ema, double atr, double &stopLoss, double &baseHeight)
-{
-    // 简化的 MTR 检测
-    // 完整版需要趋势线突破 + 回测 + 反转信号棒
-    
-    int lookback = 60;
-    
-    // 识别趋势方向
-    string trendDir = "";
-    double extremePrice = 0;
-    
-    // 检查是否有显著趋势
-    int higherHighs = 0;
-    int lowerLows = 0;
-    
-    for(int i = 2; i <= lookback; i++)
-    {
-        if(i > lookback) break;
-        if(g_HighBuffer[i] > g_HighBuffer[i+1]) higherHighs++;
-        if(g_LowBuffer[i] < g_LowBuffer[i+1]) lowerLows++;
-    }
-    
-    // 上升趋势
-    if(higherHighs > lowerLows * 1.5 && higherHighs >= lookback * 0.4)
-    {
-        trendDir = "up";
-        extremePrice = g_HighBuffer[2];
-        for(int i = 2; i <= 10; i++)
-            if(g_HighBuffer[i] > extremePrice) extremePrice = g_HighBuffer[i];
-    }
-    // 下降趋势
-    else if(lowerLows > higherHighs * 1.5 && lowerLows >= lookback * 0.4)
-    {
-        trendDir = "down";
-        extremePrice = g_LowBuffer[2];
-        for(int i = 2; i <= 10; i++)
-            if(g_LowBuffer[i] < extremePrice) extremePrice = g_LowBuffer[i];
-    }
-    
-    if(trendDir == "") return SIGNAL_NONE;
-    
-    // 检查回测和反转
-    double currClose = g_CloseBuffer[1];
-    double currOpen = g_OpenBuffer[1];
-    double currHigh = g_HighBuffer[1];
-    double currLow = g_LowBuffer[1];
-    
-    if(trendDir == "up")
-    {
-        // 回测前高
-        double tolerance = atr > 0 ? atr * 0.5 : extremePrice * 0.005;
-        if(currHigh >= extremePrice - tolerance)
-        {
-            // 反转信号棒（阴线）
-            if(currClose < currOpen && ValidateSignalBar("sell"))
-            {
-                if(CheckSignalCooldown("sell"))
-                {
-                    stopLoss = extremePrice + (atr > 0 ? atr * 0.5 : extremePrice * 0.005);
-                    baseHeight = extremePrice - currClose;
-                    if(baseHeight < atr * 0.5 && atr > 0) baseHeight = atr * 2.0;
-                    UpdateSignalCooldown("sell");
-                    return SIGNAL_MTR_SELL;
-                }
-            }
-        }
-    }
-    else if(trendDir == "down")
-    {
-        // 回测前低
-        double tolerance = atr > 0 ? atr * 0.5 : extremePrice * 0.005;
-        if(currLow <= extremePrice + tolerance)
-        {
-            // 反转信号棒（阳线）
-            if(currClose > currOpen && ValidateSignalBar("buy"))
-            {
-                if(CheckSignalCooldown("buy"))
-                {
-                    stopLoss = extremePrice - (atr > 0 ? atr * 0.5 : extremePrice * 0.005);
-                    baseHeight = currClose - extremePrice;
-                    if(baseHeight < atr * 0.5 && atr > 0) baseHeight = atr * 2.0;
-                    UpdateSignalCooldown("buy");
-                    return SIGNAL_MTR_BUY;
-                }
-            }
-        }
-    }
-    
-    return SIGNAL_NONE;
-}
 
 //+------------------------------------------------------------------+
-//| Check Final Flag                                                  |
-//+------------------------------------------------------------------+
-ENUM_SIGNAL_TYPE CheckFinalFlag(double ema, double atr, double &stopLoss, double &baseHeight)
-{
-    double currClose = g_CloseBuffer[1];
-    double currOpen = g_OpenBuffer[1];
-    double currHigh = g_HighBuffer[1];
-    double currLow = g_LowBuffer[1];
-    double klineRange = currHigh - currLow;
-    
-    if(klineRange <= 0) return SIGNAL_NONE;
-    
-    // 根据之前的趋势方向决定反转方向
-    if(g_TightChannelDir == "up")
-    {
-        // 之前上涨，现在寻找做空信号
-        if(currClose < currOpen) // 阴线
-        {
-            double closePosition = (currHigh - currClose) / klineRange;
-            if(closePosition >= 0.60 && ValidateSignalBar("sell"))
-            {
-                if(CheckSignalCooldown("sell"))
-                {
-                    stopLoss = g_TightChannelExtreme > 0 ? 
-                               g_TightChannelExtreme + (atr > 0 ? atr * 0.5 : g_TightChannelExtreme * 0.005) :
-                               currHigh * 1.005;
-                    baseHeight = atr > 0 ? atr * 2.5 : klineRange * 2;
-                    UpdateSignalCooldown("sell");
-                    return SIGNAL_FINAL_FLAG_SELL;
-                }
-            }
-        }
-    }
-    else if(g_TightChannelDir == "down")
-    {
-        // 之前下跌，现在寻找做多信号
-        if(currClose > currOpen) // 阳线
-        {
-            double closePosition = (currClose - currLow) / klineRange;
-            if(closePosition >= 0.60 && ValidateSignalBar("buy"))
-            {
-                if(CheckSignalCooldown("buy"))
-                {
-                    stopLoss = g_TightChannelExtreme > 0 ?
-                               g_TightChannelExtreme - (atr > 0 ? atr * 0.5 : g_TightChannelExtreme * 0.005) :
-                               currLow * 0.995;
-                    baseHeight = atr > 0 ? atr * 2.5 : klineRange * 2;
-                    UpdateSignalCooldown("buy");
-                    return SIGNAL_FINAL_FLAG_BUY;
-                }
-            }
-        }
-    }
-    
-    return SIGNAL_NONE;
-}
-
-//+------------------------------------------------------------------+
-//| Validate Signal Bar (信号棒质量验证)                               |
+//| Validate Signal Bar - Brooks: 信号K线必须方向正确,实体足够大        |
 //+------------------------------------------------------------------+
 bool ValidateSignalBar(string side)
 {
-    double high = g_HighBuffer[1];
-    double low = g_LowBuffer[1];
-    double open = g_OpenBuffer[1];
-    double close = g_CloseBuffer[1];
+    double high = g_HighBuffer[1], low = g_LowBuffer[1];
+    double open = g_OpenBuffer[1], close = g_CloseBuffer[1];
+    double kRange = high - low;
+    if(kRange <= 0) return false;
     
-    double klineRange = high - low;
-    if(klineRange <= 0) return false;
-    
-    double bodySize = MathAbs(close - open);
-    double bodyRatio = bodySize / klineRange;
-    
-    // 实体占比检查
+    double body = MathAbs(close - open);
+    double bodyRatio = body / kRange;
     if(bodyRatio < InpMinBodyRatio) return false;
     
-    // 方向检查
-    bool isBullish = close > open;
-    bool isBearish = close < open;
+    if(side == "buy" && close <= open) return false;
+    if(side == "sell" && close >= open) return false;
     
-    if(side == "buy" && !isBullish) return false;
-    if(side == "sell" && !isBearish) return false;
-    
-    // 收盘位置检查
-    if(side == "buy")
-    {
-        double closeFromHigh = (high - close) / klineRange;
-        if(closeFromHigh > InpClosePositionPct) return false;
-    }
-    else
-    {
-        double closeFromLow = (close - low) / klineRange;
-        if(closeFromLow > InpClosePositionPct) return false;
-    }
+    // 收盘在极端位置
+    double upperTail = high - MathMax(close, open);
+    double lowerTail = MathMin(close, open) - low;
+    if(side == "buy" && upperTail / kRange > InpClosePositionPct) return false;
+    if(side == "sell" && lowerTail / kRange > InpClosePositionPct) return false;
     
     return true;
 }
 
 //+------------------------------------------------------------------+
-//| Calculate Unified Stop Loss (统一止损计算)                         |
-//| Al Brooks PA 核心原则：                                             |
-//| 1. 强趋势 → Signal Bar 止损（逻辑性止损，收紧风险）                  |
-//| 2. 震荡/通道 → Swing N=5 止损（结构性止损，容错空间大）               |
-//| 硬性约束：止损距离不得超过 3×ATR                                     |
-//+------------------------------------------------------------------+
-double CalculateUnifiedStopLoss(string side, double atr, double entryPrice)
-{
-    // 前两根 K 线数据
-    double signalHigh = g_HighBuffer[2];    // Signal Bar (bar[2])
-    double signalLow = g_LowBuffer[2];
-    double signalOpen = g_OpenBuffer[2];
-    double signalClose = g_CloseBuffer[2];
-    double entryHigh = g_HighBuffer[1];     // Entry Bar (bar[1])
-    double entryLow = g_LowBuffer[1];
-    
-    //=================================================================
-    // 获取当前实时点差（以价格为单位）
-    //=================================================================
-    double spreadPrice = GetCurrentSpreadPrice();
-    
-    //=================================================================
-    // Buffer 计算（包含点差）
-    // 强趋势用较小 Buffer，震荡用较大 Buffer
-    //=================================================================
-    bool isStrongTrend = (g_MarketState == MARKET_STATE_STRONG_TREND ||
-                          g_MarketState == MARKET_STATE_BREAKOUT ||
-                          g_MarketState == MARKET_STATE_TIGHT_CHANNEL);
-    
-    double atrBuffer = atr > 0 ? (isStrongTrend ? atr * 0.3 : atr * 0.5) : 0;
-    double minBuffer = entryPrice * 0.002;  // 最小 0.2%
-    double baseBuffer = MathMax(atrBuffer, minBuffer);
-    double totalBuffer = baseBuffer + spreadPrice;
-    
-    //=================================================================
-    // 根据市场状态选择止损策略
-    //=================================================================
-    double stopLoss = 0;
-    double stopDistance = 0;
-    string stopType = "";
-    
-    if(isStrongTrend)
-    {
-        //=============================================================
-        // 【强趋势模式】Signal Bar 止损（逻辑性止损）
-        // Al Brooks: 如果入场原因是那根强力趋势棒，价格就不应该跌破它
-        // 收紧止损 → 更好的盈亏比
-        // 不使用 Swing N=X，因为在强趋势中波段止损太宽，盈亏比差
-        //=============================================================
-        if(side == "buy")
-        {
-            // 做多：止损在 Signal Bar 低点下方
-            // Signal Bar 是触发入场的那根棒线，价格不应跌破它的起始点
-            stopLoss = signalLow - totalBuffer;
-            stopDistance = entryPrice - stopLoss;
-            stopType = "Signal Bar 止损 (逻辑性)";
-            
-            Print("📍 强趋势 BUY: ", stopType);
-            Print("   MarketState: ", EnumToString(g_MarketState), " → 跳过 Swing, 使用 Signal Bar");
-            Print("   Signal Bar Low = ", DoubleToString(signalLow, g_SymbolDigits));
-            Print("   止损 = ", DoubleToString(stopLoss, g_SymbolDigits),
-                  " | 距离 = ", DoubleToString(stopDistance / atr, 2), "×ATR");
-            Print("   Al Brooks: 价格跌破 Signal Bar = 强趋势假设失效");
-        }
-        else
-        {
-            // 做空：止损在 Signal Bar 高点上方
-            stopLoss = signalHigh + totalBuffer;
-            stopDistance = stopLoss - entryPrice;
-            stopType = "Signal Bar 止损 (逻辑性)";
-            
-            Print("📍 强趋势 SELL: ", stopType);
-            Print("   MarketState: ", EnumToString(g_MarketState), " → 跳过 Swing, 使用 Signal Bar");
-            Print("   Signal Bar High = ", DoubleToString(signalHigh, g_SymbolDigits));
-            Print("   止损 = ", DoubleToString(stopLoss, g_SymbolDigits),
-                  " | 距离 = ", DoubleToString(stopDistance / atr, 2), "×ATR");
-            Print("   Al Brooks: 价格突破 Signal Bar = 强趋势假设失效");
-        }
-    }
-    else
-    {
-        //=============================================================
-        // 【震荡/通道模式】Swing 止损（结构性止损）
-        // Al Brooks: 震荡市需要更大容错空间，防止被噪音打掉
-        // N 值根据 g_MarketState 动态切换：
-        //   TRADING_RANGE: N=5（宽幅震荡，大容错）
-        //   CHANNEL: N=3（平衡）
-        //   其他: N=3
-        //=============================================================
-        int swingLookback = 10;
-        bool foundSwing = false;
-        int swingDepth = GetSwingDepth();  // 获取动态 N 值
-        
-        if(side == "buy")
-        {
-            double swingLow = FindSwingLow(swingLookback);
-            
-            if(swingLow > 0)
-            {
-                stopLoss = swingLow - totalBuffer;
-                stopDistance = entryPrice - stopLoss;
-                
-                // 检查是否在有效范围内
-                if(atr > 0 && stopDistance <= atr * InpMaxStopATRMult && stopDistance > 0)
-                {
-                    foundSwing = true;
-                    stopType = "Swing Low 止损 (结构性, N=" + IntegerToString(swingDepth) + ")";
-                    
-                    Print("📍 震荡/通道 BUY: ", stopType);
-                    Print("   MarketState: ", EnumToString(g_MarketState), " → Swing Depth N=", swingDepth);
-                    Print("   Swing Low = ", DoubleToString(swingLow, g_SymbolDigits));
-                    Print("   止损 = ", DoubleToString(stopLoss, g_SymbolDigits),
-                          " | 距离 = ", DoubleToString(stopDistance / atr, 2), "×ATR");
-                    Print("   Al Brooks: 结构性止损防守整个波段");
-                }
-            }
-            
-            // 兜底：Swing 无效时用前两根 K 线极值
-            if(!foundSwing)
-            {
-                double lowestLow = MathMin(signalLow, entryLow);
-                stopLoss = lowestLow - totalBuffer;
-                stopDistance = entryPrice - stopLoss;
-                stopType = "前两根极值止损 (兜底)";
-                
-                Print("📐 震荡/通道 BUY: ", stopType);
-                Print("   MarketState: ", EnumToString(g_MarketState), " → Swing N=", swingDepth, " 无效");
-                Print("   最低点 = ", DoubleToString(lowestLow, g_SymbolDigits),
-                      " | 距离 = ", DoubleToString(stopDistance / atr, 2), "×ATR");
-            }
-        }
-        else
-        {
-            double swingHigh = FindSwingHigh(swingLookback);
-            
-            if(swingHigh > 0)
-            {
-                stopLoss = swingHigh + totalBuffer;
-                stopDistance = stopLoss - entryPrice;
-                
-                if(atr > 0 && stopDistance <= atr * InpMaxStopATRMult && stopDistance > 0)
-                {
-                    foundSwing = true;
-                    stopType = "Swing High 止损 (结构性, N=" + IntegerToString(swingDepth) + ")";
-                    
-                    Print("📍 震荡/通道 SELL: ", stopType);
-                    Print("   MarketState: ", EnumToString(g_MarketState), " → Swing Depth N=", swingDepth);
-                    Print("   Swing High = ", DoubleToString(swingHigh, g_SymbolDigits));
-                    Print("   止损 = ", DoubleToString(stopLoss, g_SymbolDigits),
-                          " | 距离 = ", DoubleToString(stopDistance / atr, 2), "×ATR");
-                    Print("   Al Brooks: 结构性止损防守整个波段");
-                }
-            }
-            
-            if(!foundSwing)
-            {
-                double highestHigh = MathMax(signalHigh, entryHigh);
-                stopLoss = highestHigh + totalBuffer;
-                stopDistance = stopLoss - entryPrice;
-                stopType = "前两根极值止损 (兜底)";
-                
-                Print("📐 震荡/通道 SELL: ", stopType);
-                Print("   MarketState: ", EnumToString(g_MarketState), " → Swing N=", swingDepth, " 无效");
-                Print("   最高点 = ", DoubleToString(highestHigh, g_SymbolDigits),
-                      " | 距离 = ", DoubleToString(stopDistance / atr, 2), "×ATR");
-            }
-        }
-    }
-    
-    //=================================================================
-    // 硬性约束：止损距离不得超过 3×ATR
-    //=================================================================
-    if(atr > 0 && stopDistance > atr * InpMaxStopATRMult)
-    {
-        Print("⚠️ 止损距离 ", DoubleToString(stopDistance, g_SymbolDigits), 
-              " 超过 ", InpMaxStopATRMult, "×ATR (", DoubleToString(atr * InpMaxStopATRMult, g_SymbolDigits), 
-              ") - 信号被拒绝");
-        Print("   详情: ATR=", DoubleToString(atr, g_SymbolDigits), 
-              " | 点差=", DoubleToString(spreadPrice, g_SymbolDigits),
-              " | 止损类型=", stopType);
-        return 0; // 风险过大，返回 0 表示无效
-    }
-    
-    //=================================================================
-    // 使用品种正确的小数位数规范化价格
-    //=================================================================
-    stopLoss = NormalizeDouble(stopLoss, g_SymbolDigits);
-    
-    return stopLoss;
-}
-
-//+------------------------------------------------------------------+
-//| Get Swing Depth (根据市场状态获取动态探测深度 N)                      |
-//| STRONG_TREND / BREAKOUT: N=2（快速反应）                            |
-//| TRADING_RANGE: N=5（更稳定的支撑阻力）                               |
-//| 其他状态: N=3（平衡）                                                |
-//+------------------------------------------------------------------+
-int GetSwingDepth()
-{
-    switch(g_MarketState)
-    {
-        case MARKET_STATE_STRONG_TREND:
-        case MARKET_STATE_BREAKOUT:
-            return 2;  // 强趋势中需要快速反应
-            
-        case MARKET_STATE_TRADING_RANGE:
-            return 5;  // 震荡区间需要更明显的 Swing 点
-            
-        case MARKET_STATE_CHANNEL:
-        case MARKET_STATE_TIGHT_CHANNEL:
-        case MARKET_STATE_FINAL_FLAG:
-        default:
-            return 3;  // 平衡状态
-    }
-}
-
-//+------------------------------------------------------------------+
-//| Check Bull Confirmation (检查多头确认 - Swing Low 右侧)             |
-//| 条件 B：右侧至少有一根棒线的收盘价高于前一根棒线的高点                  |
-//| 表示多头不仅是插针，而且夺回了控制权                                   |
-//+------------------------------------------------------------------+
-bool CheckBullConfirmation(int swingBarIndex)
-{
-    // 从 Swing Low 右侧（更近的棒）开始检查
-    // swingBarIndex 是 Swing Low 所在的 bar index
-    // 我们检查 bar[swingBarIndex-1] 到 bar[1] 是否有多头确认
-    
-    for(int i = swingBarIndex - 1; i >= 1; i--)
-    {
-        if(i + 1 >= ArraySize(g_CloseBuffer)) continue;
-        if(i + 1 >= ArraySize(g_HighBuffer)) continue;
-        
-        double currClose = g_CloseBuffer[i];      // 当前棒收盘
-        double prevHigh = g_HighBuffer[i + 1];    // 前一棒高点
-        
-        // 收盘价高于前一棒高点 = 多头夺回控制权
-        if(currClose > prevHigh)
-        {
-            return true;
-        }
-    }
-    
-    return false;
-}
-
-//+------------------------------------------------------------------+
-//| Check Bear Confirmation (检查空头确认 - Swing High 右侧)            |
-//| 条件 B：右侧至少有一根棒线的收盘价低于前一根棒线的低点                  |
-//| 表示空头不仅是插针，而且夺回了控制权                                   |
-//+------------------------------------------------------------------+
-bool CheckBearConfirmation(int swingBarIndex)
-{
-    for(int i = swingBarIndex - 1; i >= 1; i--)
-    {
-        if(i + 1 >= ArraySize(g_CloseBuffer)) continue;
-        if(i + 1 >= ArraySize(g_LowBuffer)) continue;
-        
-        double currClose = g_CloseBuffer[i];      // 当前棒收盘
-        double prevLow = g_LowBuffer[i + 1];      // 前一棒低点
-        
-        // 收盘价低于前一棒低点 = 空头夺回控制权
-        if(currClose < prevLow)
-        {
-            return true;
-        }
-    }
-    
-    return false;
-}
-
-//+------------------------------------------------------------------+
-//| Is Range Minimum (检查是否是区间最低点)                              |
-//| 条件 A：Price[i] 是 i-N 到 i+N 范围内的最低点                        |
-//+------------------------------------------------------------------+
-bool IsRangeMinimum(int barIndex, int depth)
-{
-    if(barIndex - depth < 1) return false;  // 右侧数据不足
-    if(barIndex + depth >= ArraySize(g_LowBuffer)) return false;  // 左侧数据不足
-    
-    double centerLow = g_LowBuffer[barIndex];
-    
-    // 检查左侧 N 根棒
-    for(int i = 1; i <= depth; i++)
-    {
-        if(g_LowBuffer[barIndex + i] < centerLow)
-            return false;  // 左侧有更低的点
-    }
-    
-    // 检查右侧 N 根棒
-    for(int i = 1; i <= depth; i++)
-    {
-        if(g_LowBuffer[barIndex - i] < centerLow)
-            return false;  // 右侧有更低的点
-    }
-    
-    return true;
-}
-
-//+------------------------------------------------------------------+
-//| Is Range Maximum (检查是否是区间最高点)                              |
-//| 条件 A：Price[i] 是 i-N 到 i+N 范围内的最高点                        |
-//+------------------------------------------------------------------+
-bool IsRangeMaximum(int barIndex, int depth)
-{
-    if(barIndex - depth < 1) return false;
-    if(barIndex + depth >= ArraySize(g_HighBuffer)) return false;
-    
-    double centerHigh = g_HighBuffer[barIndex];
-    
-    // 检查左侧 N 根棒
-    for(int i = 1; i <= depth; i++)
-    {
-        if(g_HighBuffer[barIndex + i] > centerHigh)
-            return false;
-    }
-    
-    // 检查右侧 N 根棒
-    for(int i = 1; i <= depth; i++)
-    {
-        if(g_HighBuffer[barIndex - i] > centerHigh)
-            return false;
-    }
-    
-    return true;
-}
-
-//+------------------------------------------------------------------+
-//| Find Swing Low (寻找最近的有效摆动低点)                              |
-//| Al Brooks: 技术止损应该放在最近的支撑位下方                          |
-//| 动态强度 + 双重确认逻辑：                                            |
-//|   条件 A：区间最低点（i-N 到 i+N 范围内最低）                         |
-//|   条件 B：收盘确认（右侧有多头夺回控制权的棒线）                       |
-//+------------------------------------------------------------------+
-double FindSwingLow(int lookback)
-{
-    if(lookback < 3) return 0;
-    if(ArraySize(g_LowBuffer) < lookback + 10) return 0;
-    
-    // 获取动态探测深度
-    int depth = GetSwingDepth();
-    
-    double validSwingLow = 0;
-    int validSwingBarIndex = -1;
-    
-    // 从 bar[depth+1] 开始向回搜索（需要保证右侧有足够的确认空间）
-    int startBar = depth + 1;
-    int endBar = lookback;
-    
-    for(int i = startBar; i <= endBar; i++)
-    {
-        // 条件 A：检查是否是区间最低点
-        if(!IsRangeMinimum(i, depth))
-            continue;
-        
-        // 条件 B：检查多头确认（右侧是否有收盘高于前一棒高点的棒线）
-        if(!CheckBullConfirmation(i))
-            continue;
-        
-        // 双重确认通过，找到有效 Swing Low
-        double swingPrice = g_LowBuffer[i];
-        
-        // 取最近的有效 Swing Low（第一个找到的）
-        if(validSwingLow == 0)
-        {
-            validSwingLow = swingPrice;
-            validSwingBarIndex = i;
-            
-            Print("📍 有效 Swing Low: ", DoubleToString(validSwingLow, g_SymbolDigits),
-                  " | Bar[", i, "] | 深度=", depth,
-                  " | 状态=", GetMarketStateString(g_MarketState));
-            break;  // 找到最近的一个即可
-        }
-    }
-    
-    // 如果没有找到有效 Swing Low，返回 0（让调用者回退到 ATR 止损）
-    if(validSwingLow == 0)
-    {
-        Print("📍 未找到有效 Swing Low (深度=", depth, ")，将使用 ATR 止损");
-    }
-    
-    return validSwingLow;
-}
-
-//+------------------------------------------------------------------+
-//| Find Swing High (寻找最近的有效摆动高点)                             |
-//| Al Brooks: 技术止损应该放在最近的阻力位上方                          |
-//| 动态强度 + 双重确认逻辑：                                            |
-//|   条件 A：区间最高点（i-N 到 i+N 范围内最高）                         |
-//|   条件 B：收盘确认（右侧有空头夺回控制权的棒线）                       |
-//+------------------------------------------------------------------+
-double FindSwingHigh(int lookback)
-{
-    if(lookback < 3) return 0;
-    if(ArraySize(g_HighBuffer) < lookback + 10) return 0;
-    
-    // 获取动态探测深度
-    int depth = GetSwingDepth();
-    
-    double validSwingHigh = 0;
-    int validSwingBarIndex = -1;
-    
-    int startBar = depth + 1;
-    int endBar = lookback;
-    
-    for(int i = startBar; i <= endBar; i++)
-    {
-        // 条件 A：检查是否是区间最高点
-        if(!IsRangeMaximum(i, depth))
-            continue;
-        
-        // 条件 B：检查空头确认（右侧是否有收盘低于前一棒低点的棒线）
-        if(!CheckBearConfirmation(i))
-            continue;
-        
-        // 双重确认通过
-        double swingPrice = g_HighBuffer[i];
-        
-        if(validSwingHigh == 0)
-        {
-            validSwingHigh = swingPrice;
-            validSwingBarIndex = i;
-            
-            Print("📍 有效 Swing High: ", DoubleToString(validSwingHigh, g_SymbolDigits),
-                  " | Bar[", i, "] | 深度=", depth,
-                  " | 状态=", GetMarketStateString(g_MarketState));
-            break;
-        }
-    }
-    
-    if(validSwingHigh == 0)
-    {
-        Print("📍 未找到有效 Swing High (深度=", depth, ")，将使用 ATR 止损");
-    }
-    
-    return validSwingHigh;
-}
-
-//+------------------------------------------------------------------+
-//| Calculate Stop Loss (兼容旧调用)                                    |
+//| Stop Loss Calculation - Brooks: 止损在结构位(swing point)          |
 //+------------------------------------------------------------------+
 double CalculateStopLoss(string side, double atr)
 {
@@ -4012,572 +3248,873 @@ double CalculateStopLoss(string side, double atr)
     return CalculateUnifiedStopLoss(side, atr, entryPrice);
 }
 
+double CalculateUnifiedStopLoss(string side, double atr, double entryPrice)
+{
+    double spreadPrice = GetCurrentSpreadPrice();
+    
+    bool isStrongTrend = (g_MarketState == MARKET_STATE_STRONG_TREND ||
+                          g_MarketState == MARKET_STATE_BREAKOUT ||
+                          g_MarketState == MARKET_STATE_TIGHT_CHANNEL);
+    
+    double atrBuffer = atr > 0 ? (isStrongTrend ? atr * 0.3 : atr * 0.5) : 0;
+    double minBuf = (atr > 0) ? atr * InpMinBufferATRMult : 0;
+    double totalBuffer = MathMax(atrBuffer, minBuf) + spreadPrice;
+    
+    double stopLoss = 0;
+    double stopDistance = 0;
+    
+    if(isStrongTrend)
+    {
+        // 强趋势: 信号K线止损
+        if(side == "buy")
+        {
+            stopLoss = MathMin(g_LowBuffer[1], g_LowBuffer[2]) - totalBuffer;
+            stopDistance = entryPrice - stopLoss;
+        }
+        else
+        {
+            stopLoss = MathMax(g_HighBuffer[1], g_HighBuffer[2]) + totalBuffer;
+            stopDistance = stopLoss - entryPrice;
+        }
+    }
+    else
+    {
+        // 非强趋势: 用swing point止损
+        if(side == "buy")
+        {
+            double swingLow = GetRecentSwingLow(1, true);  // allowTemp 降低结构延迟
+            if(swingLow > 0 && (entryPrice - swingLow - totalBuffer) <= atr * InpMaxStopATRMult)
+                stopLoss = swingLow - totalBuffer;
+            else
+                stopLoss = MathMin(g_LowBuffer[1], g_LowBuffer[2]) - totalBuffer;
+            stopDistance = entryPrice - stopLoss;
+        }
+        else
+        {
+            double swingHigh = GetRecentSwingHigh(1, true);  // allowTemp 降低结构延迟
+            if(swingHigh > 0 && (swingHigh + totalBuffer - entryPrice) <= atr * InpMaxStopATRMult)
+                stopLoss = swingHigh + totalBuffer;
+            else
+                stopLoss = MathMax(g_HighBuffer[1], g_HighBuffer[2]) + totalBuffer;
+            stopDistance = stopLoss - entryPrice;
+        }
+    }
+    
+    if(atr > 0 && stopDistance > atr * InpMaxStopATRMult)
+        return 0;
+    
+    return NormalizeDouble(stopLoss, g_SymbolDigits);
+}
+
+double GetCurrentSpreadPrice()
+{
+    return SymbolInfoDouble(_Symbol, SYMBOL_ASK) - SymbolInfoDouble(_Symbol, SYMBOL_BID);
+}
+
 //+------------------------------------------------------------------+
-//| Check Signal Cooldown                                             |
+//| Al Brooks 统一止损: 最近 swing 外 + 缓冲，超过 3ATR 用 K 线极值并封顶
+//+------------------------------------------------------------------+
+double GetBrooksStopLoss(const string &side, double entryPrice, double atr)
+{
+    double spread = GetCurrentSpreadPrice();
+    double buf    = (atr > 0 ? atr * 0.3 : 0) + spread;
+    double minBuf = (atr > 0) ? atr * InpMinBufferATRMult : 0;
+    if(buf < minBuf) buf = minBuf;
+    
+    if(side == "buy")
+    {
+        double swingLow = GetRecentSwingLow(1, true);  // allowTemp 降低结构延迟
+        if(swingLow > 0 && swingLow < entryPrice)
+        {
+            double dist = entryPrice - swingLow;
+            if(atr <= 0 || dist <= atr * InpMaxStopATRMult)
+                return NormalizeDouble(swingLow - buf, g_SymbolDigits);
+        }
+        double barLow = (g_BufferSize >= 2) ? MathMin(g_LowBuffer[1], g_LowBuffer[2]) : (g_BufferSize >= 1 ? g_LowBuffer[1] : 0);
+        if(barLow <= 0) return 0;
+        double sl = barLow - buf;
+        if(sl >= entryPrice) sl = entryPrice - (atr > 0 ? atr * 0.3 : buf);
+        if(atr > 0 && (entryPrice - sl) > atr * InpMaxStopATRMult)
+            sl = entryPrice - atr * InpMaxStopATRMult;
+        return NormalizeDouble(sl, g_SymbolDigits);
+    }
+    else
+    {
+        double swingHigh = GetRecentSwingHigh(1, true);  // allowTemp 降低结构延迟
+        if(swingHigh > 0 && swingHigh > entryPrice)
+        {
+            double dist = swingHigh - entryPrice;
+            if(atr <= 0 || dist <= atr * InpMaxStopATRMult)
+                return NormalizeDouble(swingHigh + buf, g_SymbolDigits);
+        }
+        double barHigh = (g_BufferSize >= 2) ? MathMax(g_HighBuffer[1], g_HighBuffer[2]) : (g_BufferSize >= 1 ? g_HighBuffer[1] : 0);
+        if(barHigh <= 0) return 0;
+        double sl = barHigh + buf;
+        if(sl <= entryPrice) sl = entryPrice + (atr > 0 ? atr * 0.3 : buf);
+        if(atr > 0 && (sl - entryPrice) > atr * InpMaxStopATRMult)
+            sl = entryPrice + atr * InpMaxStopATRMult;
+        return NormalizeDouble(sl, g_SymbolDigits);
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Signal Cooldown                                                   |
 //+------------------------------------------------------------------+
 bool CheckSignalCooldown(string side)
 {
     int currentBar = Bars(_Symbol, PERIOD_CURRENT);
+    double currentPrice = side == "buy" ? 
+                          SymbolInfoDouble(_Symbol, SYMBOL_ASK) : 
+                          SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    double atr = g_ATRBuffer[1];
     
     if(side == "buy")
     {
-        if(currentBar - g_LastBuySignalBar < InpSignalCooldown)
-            return false;
+        // K线冷却期检查
+        if(currentBar - g_LastBuySignalBar < InpSignalCooldown) return false;
+        
+        // 价格距离检查: 考虑市场已经大幅移动后回到原位的情况
+        if(g_LastBuyEntryPrice > 0 && atr > 0)
+        {
+            double priceDiff = MathAbs(currentPrice - g_LastBuyEntryPrice);
+            // 如果价格距离太近,检查是否有足够的波动(说明市场已经移动过)
+            if(priceDiff < atr * 1.5)
+            {
+                // 检查最近N根K线的波动范围
+                double rangeHigh = g_HighBuffer[1], rangeLow = g_LowBuffer[1];
+                int checkBars = MathMin(InpSignalCooldown + 2, g_BufferSize - 1);
+                for(int i = 2; i <= checkBars; i++)
+                {
+                    if(g_HighBuffer[i] > rangeHigh) rangeHigh = g_HighBuffer[i];
+                    if(g_LowBuffer[i] < rangeLow) rangeLow = g_LowBuffer[i];
+                }
+                double totalRange = rangeHigh - rangeLow;
+                // 如果波动范围小于2ATR,说明市场没有足够移动,拒绝信号
+                if(totalRange < atr * 2.0)
+                    return false;
+            }
+        }
     }
     else
     {
-        if(currentBar - g_LastSellSignalBar < InpSignalCooldown)
-            return false;
+        if(currentBar - g_LastSellSignalBar < InpSignalCooldown) return false;
+        
+        if(g_LastSellEntryPrice > 0 && atr > 0)
+        {
+            double priceDiff = MathAbs(g_LastSellEntryPrice - currentPrice);
+            if(priceDiff < atr * 1.5)
+            {
+                double rangeHigh = g_HighBuffer[1], rangeLow = g_LowBuffer[1];
+                int checkBars = MathMin(InpSignalCooldown + 2, g_BufferSize - 1);
+                for(int i = 2; i <= checkBars; i++)
+                {
+                    if(g_HighBuffer[i] > rangeHigh) rangeHigh = g_HighBuffer[i];
+                    if(g_LowBuffer[i] < rangeLow) rangeLow = g_LowBuffer[i];
+                }
+                double totalRange = rangeHigh - rangeLow;
+                if(totalRange < atr * 2.0)
+                    return false;
+            }
+        }
     }
-    
     return true;
 }
 
-//+------------------------------------------------------------------+
-//| Update Signal Cooldown                                            |
-//+------------------------------------------------------------------+
 void UpdateSignalCooldown(string side)
 {
     int currentBar = Bars(_Symbol, PERIOD_CURRENT);
-    
     if(side == "buy")
     {
         g_LastBuySignalBar = currentBar;
         g_LastBuySignalTime = TimeCurrent();
+        g_LastBuyEntryPrice = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
     }
     else
     {
         g_LastSellSignalBar = currentBar;
         g_LastSellSignalTime = TimeCurrent();
+        g_LastSellEntryPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID);
     }
 }
 
+
 //+------------------------------------------------------------------+
-//| Determine Order Type (动态订单类型分配)                            |
-//| Spike 模式：市价单（入场 > 价格）                                   |
-//| Pullback 模式：限价单（价格 > 成本）                                |
+//| Order Execution - Brooks: 所有入场用Stop Order确认方向              |
+//| Spike顺势可市价,其余全部Stop Order                                 |
 //+------------------------------------------------------------------+
 ENUM_ORDER_TYPE DetermineOrderType(ENUM_SIGNAL_TYPE signal, string side)
 {
-    // 默认为市价单
-    bool useMarketOrder = true;
-    
-    // 判断是否为 Spike 模式（Urgency - 入场比价格更重要）
-    bool isSpikeMode = (signal == SIGNAL_SPIKE_MARKET_BUY || 
-                        signal == SIGNAL_SPIKE_MARKET_SELL ||
-                        signal == SIGNAL_EMERGENCY_SPIKE_BUY ||
-                        signal == SIGNAL_EMERGENCY_SPIKE_SELL ||
-                        signal == SIGNAL_SPIKE_BUY || 
-                        signal == SIGNAL_SPIKE_SELL);
-    
-    // 判断是否为 Pullback 模式（Value - 限价单抵消点差成本）
-    bool isPullbackMode = (signal == SIGNAL_H1_BUY || signal == SIGNAL_H2_BUY ||
-                           signal == SIGNAL_L1_SELL || signal == SIGNAL_L2_SELL ||
-                           signal == SIGNAL_MICRO_CH_H1_BUY || signal == SIGNAL_MICRO_CH_H1_SELL);
-    
-    // Spike 模式：使用市价单
-    if(isSpikeMode)
-    {
-        useMarketOrder = true;
-    }
-    // Pullback 模式：使用限价单（如果启用）
-    else if(isPullbackMode && InpUseLimitOrders)
-    {
-        useMarketOrder = false;
-    }
-    
-    // 返回订单类型
-    if(useMarketOrder)
-    {
+    // Spike信号: 市价入场(已有连续确认K线)
+    if(signal == SIGNAL_SPIKE_BUY || signal == SIGNAL_SPIKE_SELL)
         return side == "buy" ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
-    }
+    
+    // 其余所有信号: Stop Order确认方向
+    if(InpUseStopOrders)
+        return side == "buy" ? ORDER_TYPE_BUY_STOP : ORDER_TYPE_SELL_STOP;
+    
+    return side == "buy" ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+}
+
+// 挂单价 = 信号K线(bar[1])高点/低点 ± 偏移；不根据当前价改写成“近似市价”，由交易所/券商在触价时执行
+double CalculateStopOrderPrice(string side)
+{
+    double price = 0;
+    double tickSize = (g_SymbolTickSize > 0) ? g_SymbolTickSize : g_SymbolPoint;
+    if(side == "buy")
+        price = g_HighBuffer[1] + (InpStopOrderOffset > 0 ? InpStopOrderOffset * tickSize : tickSize);
     else
-    {
-        return side == "buy" ? ORDER_TYPE_BUY_LIMIT : ORDER_TYPE_SELL_LIMIT;
-    }
+        price = g_LowBuffer[1] - (InpStopOrderOffset > 0 ? InpStopOrderOffset * tickSize : tickSize);
+    return NormalizeDouble(price, g_SymbolDigits);
 }
 
 //+------------------------------------------------------------------+
-//| Calculate Limit Order Price (计算限价单价格)                       |
-//| 使用前一根 K 线极值或信号棒极值                                     |
+//| 两笔单模式: 手数规范化、配对注释、平掉配对仓位                        |
 //+------------------------------------------------------------------+
-double CalculateLimitOrderPrice(string side)
+double NormalizeLot(double lot)
 {
-    // 使用前一根 K 线的极值作为限价单价格
-    // 这样可以抵消点差带来的成本
-    double limitPrice = 0;
+    double volumeMin  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+    double volumeStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+    if(lot < volumeMin) return volumeMin;
+    if(volumeStep > 0)
+        lot = MathFloor(lot / volumeStep) * volumeStep;
+    if(lot < volumeMin) lot = volumeMin;
+    return NormalizeDouble(lot, 2);
+}
+
+// (原 GetCommentBase/FindPairTicket/ClosePairIfExists 已移除：配对改由 Twin Magic 区分 Scalp/Runner)
+
+//+------------------------------------------------------------------+
+//| 方案A: 挂单校验，不满足则跳过(符合 Brooks 不追单)                    |
+//| 校验: 挂单价与市价距离、挂单价与 SL/TP 距离 >= SYMBOL_TRADE_STOPS_LEVEL |
+//+------------------------------------------------------------------+
+bool ValidateStopOrder(string side, double stopOrderPrice, double brokerSL, double tp, string &reason)
+{
+    long stopLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+    int effectivePoints = (int)MathMax((long)InpMinStopsLevelPoints, stopLevel);
+    double minDist = effectivePoints * g_SymbolPoint;
+    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
     
     if(side == "buy")
     {
-        // 买入限价单：设在前一棒高点（等待回调后突破）
-        // 或者使用信号棒高点
-        limitPrice = g_HighBuffer[1];  // Entry Bar 高点
-        
-        // 可选：添加一点偏移
-        if(InpLimitOrderOffset > 0)
-            limitPrice += InpLimitOrderOffset * g_SymbolPoint;
+        if(stopOrderPrice <= ask + minDist)
+        {
+            reason = "BuyStop距市价过近或已越过 Ask=" + DoubleToString(ask, g_SymbolDigits);
+            return false;
+        }
+        if(MathAbs(stopOrderPrice - brokerSL) < minDist)
+        {
+            reason = "BuyStop与SL距离不足 minDist=" + DoubleToString(minDist, g_SymbolDigits);
+            return false;
+        }
+        if(tp > 0 && MathAbs(stopOrderPrice - tp) < minDist)
+        {
+            reason = "BuyStop与TP距离不足 minDist=" + DoubleToString(minDist, g_SymbolDigits);
+            return false;
+        }
     }
     else
     {
-        // 卖出限价单：设在前一棒低点
-        limitPrice = g_LowBuffer[1];  // Entry Bar 低点
-        
-        // 可选：添加一点偏移
-        if(InpLimitOrderOffset > 0)
-            limitPrice -= InpLimitOrderOffset * g_SymbolPoint;
+        if(stopOrderPrice >= bid - minDist)
+        {
+            reason = "SellStop距市价过近或已越过 Bid=" + DoubleToString(bid, g_SymbolDigits);
+            return false;
+        }
+        if(MathAbs(stopOrderPrice - brokerSL) < minDist)
+        {
+            reason = "SellStop与SL距离不足 minDist=" + DoubleToString(minDist, g_SymbolDigits);
+            return false;
+        }
+        if(tp > 0 && MathAbs(stopOrderPrice - tp) < minDist)
+        {
+            reason = "SellStop与TP距离不足 minDist=" + DoubleToString(minDist, g_SymbolDigits);
+            return false;
+        }
     }
-    
-    return NormalizeDouble(limitPrice, g_SymbolDigits);
+    return true;
 }
 
 //+------------------------------------------------------------------+
-//| Process Signal (处理信号) - 使用 CTrade 类下单                      |
-//| 支持动态订单类型分配：市价单 / 限价单                               |
-//| 【新增】混合止损机制 (Hybrid Stop Mechanism)                        |
-//|   - 硬止损：放宽后发送到服务器，作为灾难保护线                        |
-//|   - 软止损：EA 监控原始技术位，收盘破坏则市价平仓                     |
+//| 带重试的交易执行 - RETCODE_REQUOTE/PRICE_CHANGED/LOCKED/ContextBusy 时重试 |
+//| 返回 true=成功; 失败时由调用方记录详细日志(挂单价/SL/买卖价)              |
+//+------------------------------------------------------------------+
+bool ExecuteTradeWithRetry(int magic, string side, bool isStopOrder, double lot,
+                          double stopOrderPrice, double brokerSL, double tp,
+                          datetime expiration, string comment)
+{
+    trade.SetExpertMagicNumber(magic);
+    trade.SetDeviationInPoints((ulong)MathMax(1, InpMaxSlippage));
+    
+    bool ok = false;
+    for(int retry = 0; retry < 3; retry++)
+    {
+        if(isStopOrder)
+        {
+            if(side == "buy")
+                ok = trade.BuyStop(lot, stopOrderPrice, _Symbol, brokerSL, tp, ORDER_TIME_SPECIFIED, expiration, comment);
+            else
+                ok = trade.SellStop(lot, stopOrderPrice, _Symbol, brokerSL, tp, ORDER_TIME_SPECIFIED, expiration, comment);
+        }
+        else
+        {
+            if(side == "buy")
+                ok = trade.Buy(lot, _Symbol, 0, brokerSL, tp, comment);
+            else
+                ok = trade.Sell(lot, _Symbol, 0, brokerSL, tp, comment);
+        }
+        if(ok) return true;
+        
+        uint retcode = trade.ResultRetcode();
+        int err = GetLastError();
+        bool retryable = (retcode == TRADE_RETCODE_REQUOTE || retcode == TRADE_RETCODE_PRICE_CHANGED ||
+                          retcode == TRADE_RETCODE_LOCKED || err == 146);
+        if(!retryable || retry >= 3) break;  // 至少3次重试(共4次尝试)
+        Sleep(100);
+    }
+    return false;
+}
+
+// 平仓带重试 - REQUOTE/PRICE_CHANGED 时至少重试3次
+bool PositionCloseWithRetry(ulong ticket)
+{
+    for(int retry = 0; retry < 4; retry++)
+    {
+        if(trade.PositionClose(ticket)) return true;
+        uint retcode = trade.ResultRetcode();
+        if(retcode != TRADE_RETCODE_REQUOTE && retcode != TRADE_RETCODE_PRICE_CHANGED) break;
+        if(retry < 3) Sleep(100);
+    }
+    return false;
+}
+
+// 分批平仓带重试 - REQUOTE/PRICE_CHANGED 时至少重试3次
+bool PositionClosePartialWithRetry(ulong ticket, double volume)
+{
+    for(int retry = 0; retry < 4; retry++)
+    {
+        if(trade.PositionClosePartial(ticket, volume)) return true;
+        uint retcode = trade.ResultRetcode();
+        if(retcode != TRADE_RETCODE_REQUOTE && retcode != TRADE_RETCODE_PRICE_CHANGED) break;
+        if(retry < 3) Sleep(100);
+    }
+    return false;
+}
+
+// 修改止损/止盈带重试 - REQUOTE/PRICE_CHANGED/LOCKED 时重试
+bool PositionModifyWithRetry(ulong ticket, double sl, double tp)
+{
+    for(int retry = 0; retry < 4; retry++)
+    {
+        if(trade.PositionModify(ticket, sl, tp)) return true;
+        uint retcode = trade.ResultRetcode();
+        bool retryable = (retcode == TRADE_RETCODE_REQUOTE || retcode == TRADE_RETCODE_PRICE_CHANGED || retcode == TRADE_RETCODE_LOCKED);
+        if(!retryable || retry >= 3) break;
+        if(InpDebugMode) Print("PositionModify 重试 #", ticket, " retcode=", retcode, " ", trade.ResultRetcodeDescription());
+        Sleep(100);
+    }
+    if(InpDebugMode) Print("PositionModify 失败 #", ticket, " retcode=", trade.ResultRetcode(), " ", trade.ResultRetcodeDescription());
+    return false;
+}
+
+// 记录下单失败详情(挂单价/止损价/当前买卖价)供回测分析
+void LogTradeFailure(string signalName, string side, double orderPrice, double brokerSL, double tp)
+{
+    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    uint retcode = trade.ResultRetcode();
+    string errDesc = trade.ResultRetcodeDescription();
+    if(InpDebugMode)
+        Print("下单失败: ", signalName, " ", side, " | ", errDesc, " (retcode=", retcode, ") | ",
+              "挂单/市价=", DoubleToString(orderPrice, g_SymbolDigits), " SL=", DoubleToString(brokerSL, g_SymbolDigits),
+              " TP=", DoubleToString(tp, g_SymbolDigits), " | Ask=", DoubleToString(ask, g_SymbolDigits),
+              " Bid=", DoubleToString(bid, g_SymbolDigits));
+}
+
+//+------------------------------------------------------------------+
+//| Process Signal                                                    |
 //+------------------------------------------------------------------+
 void ProcessSignal(ENUM_SIGNAL_TYPE signal, double stopLoss, double baseHeight)
 {
-    if(!InpEnableTrading) 
-    {
-        Print("ℹ️ 交易未启用 - 信号: ", SignalTypeToString(signal));
-        return;
-    }
-    
-    // 检查现有持仓
-    int positions = CountPositions();
-    if(positions >= InpMaxPositions) 
-    {
-        Print("ℹ️ 已达最大持仓数 (", positions, "/", InpMaxPositions, ") - 信号: ", SignalTypeToString(signal));
-        return;
-    }
-    
-    // 获取信号方向
     string side = GetSignalSide(signal);
     if(side == "") return;
-    
     string signalName = SignalTypeToString(signal);
     
-    //=================================================================
-    // 动态订单类型分配
-    //=================================================================
+    // Always In过滤: 顺势信号必须与AI方向一致
+    bool isTrendSignal = (signal == SIGNAL_SPIKE_BUY || signal == SIGNAL_SPIKE_SELL ||
+                          signal == SIGNAL_H1_BUY || signal == SIGNAL_H2_BUY ||
+                          signal == SIGNAL_L1_SELL || signal == SIGNAL_L2_SELL ||
+                          signal == SIGNAL_MICRO_CH_BUY || signal == SIGNAL_MICRO_CH_SELL ||
+                          signal == SIGNAL_TREND_BAR_BUY || signal == SIGNAL_TREND_BAR_SELL ||
+                          signal == SIGNAL_GAP_BAR_BUY || signal == SIGNAL_GAP_BAR_SELL ||
+                          signal == SIGNAL_TR_BREAKOUT_BUY || signal == SIGNAL_TR_BREAKOUT_SELL ||
+                          signal == SIGNAL_BO_PULLBACK_BUY || signal == SIGNAL_BO_PULLBACK_SELL);
+    
+    if(isTrendSignal)
+    {
+        if(side == "buy" && g_AlwaysIn == AI_SHORT) return;
+        if(side == "sell" && g_AlwaysIn == AI_LONG) return;
+    }
+    
+    // 点差过滤
+    if(InpEnableSpreadFilter && g_SpreadFilterActive) return;
+    
+    // 反向持仓检查: 避免锁仓（已有空头时不开多，已有多头时不开空）
+    if(side == "buy" && HasPositionOfType(POSITION_TYPE_SELL)) return;
+    if(side == "sell" && HasPositionOfType(POSITION_TYPE_BUY)) return;
+    
     ENUM_ORDER_TYPE orderType = DetermineOrderType(signal, side);
     bool isMarketOrder = (orderType == ORDER_TYPE_BUY || orderType == ORDER_TYPE_SELL);
-    bool isLimitOrder = (orderType == ORDER_TYPE_BUY_LIMIT || orderType == ORDER_TYPE_SELL_LIMIT);
+    bool isStopOrder   = (orderType == ORDER_TYPE_BUY_STOP || orderType == ORDER_TYPE_SELL_STOP);
     
-    //=================================================================
-    // 计算入场价格
-    //=================================================================
-    double entryPrice = 0;
-    double limitPrice = 0;
-    
+    double entryPrice = 0, stopOrderPrice = 0;
     if(isMarketOrder)
     {
-        if(side == "buy")
-            entryPrice = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-        else
-            entryPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+        entryPrice = side == "buy" ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) : SymbolInfoDouble(_Symbol, SYMBOL_BID);
+        stopOrderPrice = entryPrice;  // 市价单时用于日志
     }
-    else if(isLimitOrder)
+    else if(isStopOrder)
     {
-        limitPrice = CalculateLimitOrderPrice(side);
-        entryPrice = limitPrice;
+        stopOrderPrice = CalculateStopOrderPrice(side);
+        entryPrice = stopOrderPrice;
     }
     
-    //=================================================================
-    // 验证止损（硬性约束：不得超过 3×ATR）
-    //=================================================================
-    if(stopLoss <= 0)
-    {
-        Print("❌ ", signalName, " - 无效止损");
-        return;
-    }
+    if(stopLoss <= 0) return;
     
     double atr = g_ATRBuffer[1];
-    double risk = side == "buy" ? (entryPrice - stopLoss) : (stopLoss - entryPrice);
-    
-    if(risk <= 0)
+    // Al Brooks 统一止损: 一律用最近 swing 外 + 缓冲，替代各信号自算的止损
+    double technicalSL = GetBrooksStopLoss(side, entryPrice, atr);
+    if(technicalSL <= 0) return;
+    // 强趋势下取信号K线止损与GetBrooksStopLoss的更紧者
+    if(InpUseSignalBarSLInStrongTrend && atr > 0 && stopLoss > 0)
     {
-        Print("❌ ", signalName, " - 风险计算无效 (risk=", DoubleToString(risk, g_SymbolDigits), ")");
-        return;
+        bool isStrongTrend = (g_MarketState == MARKET_STATE_STRONG_TREND ||
+                             g_MarketState == MARKET_STATE_BREAKOUT ||
+                             g_MarketState == MARKET_STATE_TIGHT_CHANNEL);
+        if(isStrongTrend)
+        {
+            if(side == "buy" && stopLoss < entryPrice && (entryPrice - stopLoss) <= atr * InpMaxStopATRMult)
+                technicalSL = MathMax(technicalSL, stopLoss);
+            else if(side == "sell" && stopLoss > entryPrice && (stopLoss - entryPrice) <= atr * InpMaxStopATRMult)
+                technicalSL = MathMin(technicalSL, stopLoss);
+        }
     }
+    double risk = side == "buy" ? (entryPrice - technicalSL) : (technicalSL - entryPrice);
+    if(risk <= 0 || (atr > 0 && risk > atr * InpMaxStopATRMult)) return;
     
-    if(atr > 0 && risk > atr * InpMaxStopATRMult)
-    {
-        Print("❌ ", signalName, " - 止损距离 ", DoubleToString(risk, g_SymbolDigits), 
-              " 超过硬性约束 ", InpMaxStopATRMult, "×ATR = ", DoubleToString(atr * InpMaxStopATRMult, g_SymbolDigits));
-        return;
-    }
-    
-    //=================================================================
-    // 【混合止损机制】保存原始技术止损位（用于软止损）
-    //=================================================================
-    double technicalSL = stopLoss;  // 原始技术止损位
-    double brokerSL = 0;            // 发送给 Broker 的硬止损
-    
+    double brokerSL = 0;
     if(InpEnableHardStop)
     {
-        // 硬止损：放宽后的灾难保护线
         double extraBuffer = risk * (InpHardStopBufferMult - 1.0);
-        if(side == "buy")
-            brokerSL = stopLoss - extraBuffer;
-        else
-            brokerSL = stopLoss + extraBuffer;
-        
+        brokerSL = side == "buy" ? technicalSL - extraBuffer : technicalSL + extraBuffer;
         brokerSL = NormalizeDouble(brokerSL, g_SymbolDigits);
-        
-        Print("🛡️ 混合止损: 技术位=", DoubleToString(technicalSL, g_SymbolDigits),
-              " | 硬止损(Broker)=", DoubleToString(brokerSL, g_SymbolDigits),
-              " (放宽 ", DoubleToString(InpHardStopBufferMult, 1), "倍)");
-    }
-    else
-    {
-        // 不启用硬止损：SL 填 0
-        brokerSL = 0;
-        Print("🛡️ 混合止损: 技术位=", DoubleToString(technicalSL, g_SymbolDigits),
-              " | 硬止损=禁用 (无服务器止损)");
     }
     
-    //=================================================================
-    // 动态止盈 TP1 (Al Brooks 等距测算 + 状态调节)
-    // 基础高度: SignalBarBody = |Open[2] - Close[2]|
-    // 公式: TP1_Dist = MathMax(ATR * InpTP1Multiplier, SignalBarBody) * 状态调节乘数
-    // 强趋势 1.2 → 博取等距利润；震荡 0.7 → 快速落袋
-    //=================================================================
-    double tp1 = 0, tp2 = 0;
+    // TP计算: Scalp TP1=1:1盈亏比; Swing TP2=测量移动(信号棒+前棒高度*200%)或通道线
+    double tp1 = GetScalpTP1(side, entryPrice, technicalSL);
+    double tp2 = GetMeasuredMoveTP2(side, entryPrice, atr);
     
-    // 信号棒实体高度（bar[2] = 触发信号的棒线）
-    double signalBarOpen   = g_OpenBuffer[2];
-    double signalBarClose = g_CloseBuffer[2];
-    double signalBarBody  = MathAbs(signalBarClose - signalBarOpen);
-    double signalBarHigh  = g_HighBuffer[2];
-    double signalBarLow   = g_LowBuffer[2];
-    
-    // 基础高度：取 ATR 参考与信号棒实体较大者
-    double atrBase = (atr > 0) ? atr * InpTP1Multiplier : signalBarBody;
-    double tp1BaseHeight = MathMax(atrBase, signalBarBody);
-    
-    // 状态调节乘数
-    double stateMultiplier = 1.0;
-    string stateLabel = "标准(1.0)";
-    
-    if(g_MarketState == MARKET_STATE_STRONG_TREND ||
-       g_MarketState == MARKET_STATE_BREAKOUT ||
-       g_MarketCycle == MARKET_CYCLE_SPIKE)
-    {
-        stateMultiplier = 1.2;
-        stateLabel = "强趋势(1.2)";
-    }
-    else if(g_MarketState == MARKET_STATE_TRADING_RANGE)
-    {
-        stateMultiplier = 0.7;
-        stateLabel = "震荡(0.7)";
-    }
-    
-    // TP1 距离 = 基础高度 × 状态调节乘数
-    double tp1Distance = tp1BaseHeight * stateMultiplier;
-    double tp2Distance = risk * InpTP2RiskMultiple;
-    string tp1Method = "动态止盈 [" + stateLabel + "]";
-    
-    Print("📐 动态TP1: Base=", DoubleToString(tp1BaseHeight, g_SymbolDigits),
-          " (ATR×", DoubleToString(InpTP1Multiplier, 1), "=", DoubleToString(atrBase, g_SymbolDigits),
-          " vs Body=", DoubleToString(signalBarBody, g_SymbolDigits),
-          ") × ", stateLabel, " = ", DoubleToString(tp1Distance, g_SymbolDigits));
-    
-    if(side == "buy")
-    {
-        tp1 = entryPrice + tp1Distance;
-        tp2 = entryPrice + tp2Distance;
-    }
-    else
-    {
-        tp1 = entryPrice - tp1Distance;
-        tp2 = entryPrice - tp2Distance;
-    }
-    
-    //=================================================================
-    // 规范化所有价格
-    //=================================================================
     technicalSL = NormalizeDouble(technicalSL, g_SymbolDigits);
     tp1 = NormalizeDouble(tp1, g_SymbolDigits);
     tp2 = NormalizeDouble(tp2, g_SymbolDigits);
     entryPrice = NormalizeDouble(entryPrice, g_SymbolDigits);
-    if(isLimitOrder)
-        limitPrice = NormalizeDouble(limitPrice, g_SymbolDigits);
     
-    //=================================================================
-    // 检查最小止损距离（broker 限制）
-    //=================================================================
+    // Broker最小止损距离(与挂单校验共用兜底点数,防invalid stops)
     if(InpEnableHardStop && brokerSL > 0)
     {
         long stopLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
-        double minStopDistance = stopLevel * g_SymbolPoint;
-        
-        if(MathAbs(entryPrice - brokerSL) < minStopDistance)
+        int effectivePoints = (int)MathMax((long)InpMinStopsLevelPoints, stopLevel);
+        double minDist = effectivePoints * g_SymbolPoint;
+        if(MathAbs(entryPrice - brokerSL) < minDist)
         {
-            Print("⚠️ 硬止损距离小于 broker 最小要求 (", stopLevel, " points)");
-            if(side == "buy")
-                brokerSL = entryPrice - minStopDistance - g_SymbolPoint;
-            else
-                brokerSL = entryPrice + minStopDistance + g_SymbolPoint;
+            brokerSL = side == "buy" ? entryPrice - minDist - g_SymbolPoint : entryPrice + minDist + g_SymbolPoint;
             brokerSL = NormalizeDouble(brokerSL, g_SymbolDigits);
         }
     }
     
-    //=================================================================
-    // 使用 CTrade 类下单
-    //=================================================================
-    bool result = false;
-    string comment = signalName + "_" + TimeToString(TimeCurrent(), TIME_MINUTES);
-    string orderTypeStr = "";
+    // 两笔单模式: 仓位1 TP=TP1(服务器挂单), 仓位2 TP=TP2(开仓即设)；TP1触发后仅保本，不追踪
+    double volumeMin = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+    bool useTwoPositions = (InpTP1ClosePercent > 0 && InpTP1ClosePercent < 100);
+    double lot1 = 0, lot2 = 0;
+    if(useTwoPositions)
+    {
+        lot1 = NormalizeLot(InpLotSize * InpTP1ClosePercent / 100.0);
+        lot2 = NormalizeLot(InpLotSize - lot1);
+        if(lot2 < volumeMin) useTwoPositions = false;
+        else if(CountPositions() + 2 > InpMaxPositions * 2) return;
+    }
+    if(!useTwoPositions && CountPositions() >= InpMaxPositions) return;
     
+    string commentBase = signalName + "_" + TimeToString(TimeCurrent(), TIME_MINUTES);
+    int magicScalp  = InpMagicNumber;      // Scalp 仓位 (TP1)
+    int magicRunner = InpMagicNumber + 1;  // Runner 仓位 (TP2/Swing)
     trade.SetExpertMagicNumber(InpMagicNumber);
-    trade.SetDeviationInPoints(10);
     
-    if(isMarketOrder)
+    // 方案A: 挂单前校验，不通过则跳过(不追单)
+    if(isStopOrder)
     {
-        if(side == "buy")
+        double tpForValidation = useTwoPositions ? tp1 : tp2;
+        string reason = "";
+        if(!ValidateStopOrder(side, stopOrderPrice, brokerSL, tpForValidation, reason))
         {
-            result = trade.Buy(InpLotSize, _Symbol, 0, brokerSL, tp2, comment);
-            orderTypeStr = "市价买入";
-        }
-        else
-        {
-            result = trade.Sell(InpLotSize, _Symbol, 0, brokerSL, tp2, comment);
-            orderTypeStr = "市价卖出";
+            if(InpDebugMode) Print("挂单校验不通过，跳过: ", signalName, " ", reason);
+            return;
         }
     }
-    else if(isLimitOrder)
+    
+    if(useTwoPositions)
     {
-        datetime expiration = TimeCurrent() + PeriodSeconds(PERIOD_CURRENT) * 5;
+        const string commentScalp  = "Brooks_Scalp";
+        const string commentRunner = "Brooks_Runner";
+        bool ok1 = false, ok2 = false;
+        ulong ticket1 = 0, ticket2 = 0;
         
-        if(side == "buy")
+        // Brooks 信号棒-入场棒 时效: 挂单仅当前K线有效,下一根K线未突破则失效
+        datetime expiration = isStopOrder ? (TimeCurrent() + PeriodSeconds(PERIOD_CURRENT)) : 0;
+        stopOrderPrice = NormalizeDouble(stopOrderPrice, g_SymbolDigits);
+        
+        ok1 = ExecuteTradeWithRetry(magicScalp, side, isStopOrder, lot1, stopOrderPrice, brokerSL,
+                                   tp1, expiration, commentScalp);
+        if(ok1) ticket1 = trade.ResultOrder();
+        
+        ok2 = ExecuteTradeWithRetry(magicRunner, side, isStopOrder, lot2, stopOrderPrice, brokerSL,
+                                   tp2, expiration, isStopOrder ? commentRunner : commentRunner);
+        if(ok2) ticket2 = trade.ResultOrder();
+        
+        if(ok1 && ok2)
         {
-            result = trade.BuyLimit(InpLotSize, limitPrice, _Symbol, brokerSL, tp2, 
-                                    ORDER_TIME_SPECIFIED, expiration, comment);
-            orderTypeStr = "限价买入";
+            if(InpEnableSoftStop)
+            {
+                AddSoftStopInfo(ticket1, technicalSL, side, 0);       // Scalp: 无TP1追踪
+                AddSoftStopInfo(ticket2, technicalSL, side, tp1);     // Runner: TP1触及后移保本
+            }
+            if(isStopOrder)
+            {
+                AddPendingStopOrder(ticket1, technicalSL, tp1, side, signalName, commentScalp);
+                AddPendingStopOrder(ticket2, technicalSL, 0, side, signalName, commentRunner);
+            }
+            if(InpDebugMode) Print("=== ", signalName, " ", side == "buy" ? "BUY" : "SELL", " 两笔单 | Scalp(Magic ", magicScalp, ") TP1:", DoubleToString(tp1, g_SymbolDigits), " Runner(Magic ", magicRunner, ") TP2:", DoubleToString(tp2, g_SymbolDigits), " | SL:", DoubleToString(technicalSL, g_SymbolDigits), " ===");
         }
         else
         {
-            result = trade.SellLimit(InpLotSize, limitPrice, _Symbol, brokerSL, tp2,
-                                     ORDER_TIME_SPECIFIED, expiration, comment);
-            orderTypeStr = "限价卖出";
+            if(ok1) PositionCloseWithRetry(ticket1);
+            if(ok2) PositionCloseWithRetry(ticket2);
+            double logPrice = isStopOrder ? stopOrderPrice : entryPrice;
+            LogTradeFailure(signalName, side, logPrice, brokerSL, tp2);
         }
+        return;
     }
     
-    //=================================================================
-    // 处理结果
-    //=================================================================
+    // 单笔模式
+    string comment = commentBase;
+    datetime expiration = isStopOrder ? (TimeCurrent() + PeriodSeconds(PERIOD_CURRENT)) : 0;
+    stopOrderPrice = NormalizeDouble(stopOrderPrice, g_SymbolDigits);
+    bool result = ExecuteTradeWithRetry(InpMagicNumber, side, isStopOrder, InpLotSize,
+                                      stopOrderPrice, brokerSL, tp2, expiration, comment);
+    
     if(result)
     {
         ulong ticket = trade.ResultOrder();
-        double actualPrice = trade.ResultPrice();
-        
-        //=============================================================
-        // 【混合止损】将原始技术止损位添加到软止损列表
-        //=============================================================
-        if(InpEnableSoftStop)
-        {
-            AddSoftStopInfo(ticket, technicalSL, side);
-        }
-        
-        // 记录 TP1 价格（动态止盈触发用）
-        AddTP1Info(ticket, tp1, side);
-        
-        Print("═══════════════════════════════════════════════════════════════");
-        Print("✅ ", signalName, " 下单成功");
-        Print("   订单类型: ", orderTypeStr);
-        Print("   订单号: ", ticket);
-        Print("   方向: ", side == "buy" ? "做多" : "做空");
         if(isMarketOrder)
-            Print("   入场价: ", DoubleToString(actualPrice > 0 ? actualPrice : entryPrice, g_SymbolDigits));
-        else
-            Print("   限价: ", DoubleToString(limitPrice, g_SymbolDigits));
-        
-        // 混合止损信息
-        Print("   ─────────────────────────────────────");
-        Print("   🛡️ 混合止损机制:");
-        Print("      技术止损(软): ", DoubleToString(technicalSL, g_SymbolDigits), 
-              " (EA监控，收盘破坏则平仓)");
-        if(InpEnableHardStop)
-            Print("      硬止损(Broker): ", DoubleToString(brokerSL, g_SymbolDigits),
-                  " (灾难保护线，放宽", DoubleToString(InpHardStopBufferMult, 1), "倍)");
-        else
-            Print("      硬止损(Broker): 禁用");
-        Print("   ─────────────────────────────────────");
-        
-        Print("   风险: ", DoubleToString(risk, g_SymbolDigits));
-        Print("   TP1: ", DoubleToString(tp1, g_SymbolDigits), 
-              " [", tp1Method, "] 距离=", DoubleToString(tp1Distance, g_SymbolDigits));
-        Print("   TP2: ", DoubleToString(tp2, g_SymbolDigits), " (", DoubleToString(InpTP2RiskMultiple, 1), "R)");
-        Print("   手数: ", InpLotSize);
-        Print("   点差: ", DoubleToString(g_CurrentSpread, 1), " 点 | 平均: ", DoubleToString(g_AverageSpread, 1), " 点");
-        Print("   时段: ", g_CurrentSession);
-        Print("═══════════════════════════════════════════════════════════════");
+        {
+            if(InpEnableSoftStop) AddSoftStopInfo(ticket, technicalSL, side);
+            AddTP1Info(ticket, tp1, side);
+        }
+        else if(isStopOrder)
+            AddPendingStopOrder(ticket, technicalSL, tp1, side, signalName, comment);
+        if(InpDebugMode) Print("=== ", signalName, " ", side == "buy" ? "BUY" : "SELL",
+              " | SL:", DoubleToString(technicalSL, g_SymbolDigits),
+              (" | TP1:" + DoubleToString(tp1, g_SymbolDigits) + " | TP2:" + DoubleToString(tp2, g_SymbolDigits)), " ===");
     }
     else
-    {
-        uint errorCode = trade.ResultRetcode();
-        string errorDesc = trade.ResultRetcodeDescription();
-        
-        Print("═══════════════════════════════════════════════════════════════");
-        Print("❌ ", signalName, " 开仓失败");
-        Print("   错误代码: ", errorCode);
-        Print("   错误描述: ", errorDesc);
-        Print("   尝试入场价: ", DoubleToString(entryPrice, _Digits));
-        Print("   硬止损: ", DoubleToString(brokerSL, _Digits));
-        Print("   TP2: ", DoubleToString(tp2, _Digits));
-        Print("═══════════════════════════════════════════════════════════════");
-    }
+        LogTradeFailure(signalName, side, isStopOrder ? stopOrderPrice : entryPrice, brokerSL, tp2);
 }
 
+
 //+------------------------------------------------------------------+
-//| Add Soft Stop Info (添加软止损信息到列表)                          |
-//| 增强版：防止重复添加、容量检查                                       |
+//| Pending Stop Order Management                                     |
 //+------------------------------------------------------------------+
-void AddSoftStopInfo(ulong ticket, double technicalSL, string side)
+void AddPendingStopOrder(ulong orderTicket, double technicalSL, double tp1Price, string side, string signalName, string orderComment = "")
 {
-    // 防止重复添加
-    for(int i = 0; i < g_SoftStopCount; i++)
+    if(g_PendingStopOrderCount >= MAX_PENDING_STOP_ORDERS)
     {
-        if(g_SoftStopList[i].ticket == ticket)
+        for(int i = 0; i < g_PendingStopOrderCount - 1; i++)
+            g_PendingStopOrders[i] = g_PendingStopOrders[i + 1];
+        g_PendingStopOrderCount--;
+    }
+    
+    ArrayResize(g_PendingStopOrders, g_PendingStopOrderCount + 1);
+    g_PendingStopOrders[g_PendingStopOrderCount].orderTicket = orderTicket;
+    g_PendingStopOrders[g_PendingStopOrderCount].technicalSL = technicalSL;
+    g_PendingStopOrders[g_PendingStopOrderCount].tp1Price = tp1Price;
+    g_PendingStopOrders[g_PendingStopOrderCount].side = side;
+    g_PendingStopOrders[g_PendingStopOrderCount].signalName = signalName;
+    g_PendingStopOrders[g_PendingStopOrderCount].orderComment = orderComment;
+    g_PendingStopOrderCount++;
+}
+
+// 与 CheckSoftStopExit 逻辑对齐: 新成交仓位纳入软止损时使用 g_AtrValue(实时波动率), 避免 Spike 下 techSL 过紧导致误平仓
+void CheckPendingStopOrderFills()
+{
+    if(g_PendingStopOrderCount == 0) return;
+    
+    for(int i = g_PendingStopOrderCount - 1; i >= 0; i--)
+    {
+        if(i < 0 || i >= g_PendingStopOrderCount || i >= ArraySize(g_PendingStopOrders)) break;
+        ulong orderTicket = g_PendingStopOrders[i].orderTicket;
+        bool filled = false;
+        ulong posTicket = 0;
+        
+        string matchComment = g_PendingStopOrders[i].orderComment;
+        long magicScalp = InpMagicNumber, magicRunner = InpMagicNumber + 1;
+        for(int p = PositionsTotal() - 1; p >= 0; p--)
         {
-            Print("📋 软止损列表: 订单 #", ticket, " 已存在，跳过添加");
-            return;
+            if(!positionInfo.SelectByIndex(p)) continue;
+            if(positionInfo.Symbol() != _Symbol) continue;
+            long posMagic = positionInfo.Magic();
+            if(posMagic != magicScalp && posMagic != magicRunner) continue;
+            
+            string posComment = positionInfo.Comment();
+            bool match = (matchComment != "" && posComment == matchComment) ||
+                         (matchComment == "" && StringFind(posComment, g_PendingStopOrders[i].signalName) >= 0);
+            if(match)
+            {
+                posTicket = positionInfo.Ticket();
+                bool alreadyTracked = false;
+                int softListLen = ArraySize(g_SoftStopList);
+                for(int s = 0; s < g_SoftStopCount && s < softListLen; s++)
+                {
+                    if(g_SoftStopList[s].ticket == posTicket) { alreadyTracked = true; break; }
+                }
+                if(!alreadyTracked) { filled = true; break; }
+            }
+        }
+        
+        if(filled && posTicket > 0)
+        {
+            string side = g_PendingStopOrders[i].side;
+            double technicalSLToUse = g_PendingStopOrders[i].technicalSL;
+            double tp1ToUse = g_PendingStopOrders[i].tp1Price;
+            
+            if(PositionSelectByTicket(posTicket))
+            {
+                double fillPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+                double atr = (g_AtrValue > 0) ? g_AtrValue : ((ArraySize(g_ATRBuffer) > 1) ? g_ATRBuffer[1] : 0);
+                if(g_BufferSize >= 2 && atr > 0)
+                {
+                    double newTechnicalSL = GetBrooksStopLoss(side, fillPrice, atr);
+                    double riskNew = side == "buy" ? (fillPrice - newTechnicalSL) : (newTechnicalSL - fillPrice);
+                    if(newTechnicalSL > 0 && riskNew > 0 && riskNew <= atr * InpMaxStopATRMult)
+                    {
+                        if(side == "buy" && newTechnicalSL < fillPrice) technicalSLToUse = newTechnicalSL;
+                        else if(side == "sell" && newTechnicalSL > fillPrice) technicalSLToUse = newTechnicalSL;
+                    }
+                }
+                if(technicalSLToUse != g_PendingStopOrders[i].technicalSL && InpEnableHardStop)
+                {
+                    double risk = side == "buy" ? (fillPrice - technicalSLToUse) : (technicalSLToUse - fillPrice);
+                    double extra = risk * (InpHardStopBufferMult - 1.0);
+                    double brokerSL = side == "buy" ? NormalizeDouble(technicalSLToUse - extra, g_SymbolDigits) : NormalizeDouble(technicalSLToUse + extra, g_SymbolDigits);
+                    double posTP = PositionGetDouble(POSITION_TP);
+                    PositionModifyWithRetry(posTicket, brokerSL, posTP);
+                }
+                if(g_PendingStopOrders[i].orderComment != "Brooks_Scalp" && g_PendingStopOrders[i].orderComment != "Brooks_Runner")
+                {
+                    tp1ToUse = GetScalpTP1(side, fillPrice, technicalSLToUse);
+                }
+            }
+            
+            if(InpEnableSoftStop)
+                AddSoftStopInfo(posTicket, technicalSLToUse, side);
+            if(tp1ToUse > 0 && g_PendingStopOrders[i].orderComment != "Brooks_Scalp" && g_PendingStopOrders[i].orderComment != "Brooks_Runner")
+                AddTP1Info(posTicket, tp1ToUse, side);
+            
+            for(int j = i; j < g_PendingStopOrderCount - 1; j++)
+                g_PendingStopOrders[j] = g_PendingStopOrders[j + 1];
+            g_PendingStopOrderCount--;
+        }
+        else
+        {
+            bool orderExists = false;
+            for(int o = OrdersTotal() - 1; o >= 0; o--)
+            {
+                if(OrderGetTicket(o) == orderTicket) { orderExists = true; break; }
+            }
+            if(!orderExists)
+            {
+                for(int j = i; j < g_PendingStopOrderCount - 1; j++)
+                    g_PendingStopOrders[j] = g_PendingStopOrders[j + 1];
+                g_PendingStopOrderCount--;
+            }
         }
     }
     
-    // 容量保护（最大 100 条记录，防止异常情况）
+    ArrayResize(g_PendingStopOrders, g_PendingStopOrderCount > 0 ? g_PendingStopOrderCount : 1);
+}
+
+//+------------------------------------------------------------------+
+//| Brooks 信号棒-入场棒 时效: 新K线时取消未触发的挂单(经纪商不支持自动过期时) |
+//+------------------------------------------------------------------+
+void CheckAndCancelExpiredOrders()
+{
+    if(g_PendingStopOrderCount == 0) return;
+    
+    for(int i = g_PendingStopOrderCount - 1; i >= 0; i--)
+    {
+        if(i < 0 || i >= g_PendingStopOrderCount || i >= ArraySize(g_PendingStopOrders)) break;
+        ulong ticket = g_PendingStopOrders[i].orderTicket;
+        string sigName = g_PendingStopOrders[i].signalName;
+        
+        bool orderExists = false;
+        for(int o = OrdersTotal() - 1; o >= 0; o--)
+        {
+            if(OrderGetTicket(o) == ticket) { orderExists = true; break; }
+        }
+        
+        if(orderExists)
+        {
+            if(trade.OrderDelete(ticket))
+            {
+                if(InpDebugMode) Print("Brooks时效: 取消挂单 #", ticket, " ", sigName);
+            }
+            else if(InpDebugMode)
+                Print("OrderDelete 失败 #", ticket, " ", sigName, " retcode=", trade.ResultRetcode(), " ", trade.ResultRetcodeDescription());
+        }
+        
+        g_PendingStopOrderCount--;
+        if(g_PendingStopOrderCount < 0) g_PendingStopOrderCount = 0;
+        if(i < g_PendingStopOrderCount)
+            g_PendingStopOrders[i] = g_PendingStopOrders[g_PendingStopOrderCount];
+    }
+    if(g_PendingStopOrderCount > 0)
+        ArrayResize(g_PendingStopOrders, g_PendingStopOrderCount);
+    else if(ArraySize(g_PendingStopOrders) > 0)
+        ArrayResize(g_PendingStopOrders, 1);
+}
+
+//+------------------------------------------------------------------+
+//| Soft Stop / TP1 Management                                        |
+//+------------------------------------------------------------------+
+void AddSoftStopInfo(ulong ticket, double technicalSL, string side, double tp1Price = 0)
+{
+    int arrLen = ArraySize(g_SoftStopList);
+    for(int i = 0; i < g_SoftStopCount && i < arrLen; i++)
+        if(g_SoftStopList[i].ticket == ticket) return;
+    
     const int MAX_SOFT_STOP_RECORDS = 100;
     if(g_SoftStopCount >= MAX_SOFT_STOP_RECORDS)
     {
-        Print("⚠️ 软止损列表已满 (", MAX_SOFT_STOP_RECORDS, ")，触发强制清理");
-        SyncSoftStopList();  // 强制同步清理
-        
-        // 清理后仍然满，则拒绝添加
-        if(g_SoftStopCount >= MAX_SOFT_STOP_RECORDS)
-        {
-            Print("❌ 软止损列表清理后仍满，无法添加订单 #", ticket);
-            return;
-        }
+        SyncSoftStopList();
+        if(g_SoftStopCount >= MAX_SOFT_STOP_RECORDS) return;
     }
     
-    // 扩展数组
-    int newSize = g_SoftStopCount + 1;
-    ArrayResize(g_SoftStopList, newSize);
-    
-    // 添加新记录
+    ArrayResize(g_SoftStopList, g_SoftStopCount + 1);
     g_SoftStopList[g_SoftStopCount].ticket = ticket;
     g_SoftStopList[g_SoftStopCount].technicalSL = technicalSL;
     g_SoftStopList[g_SoftStopCount].side = side;
+    g_SoftStopList[g_SoftStopCount].tp1Price = tp1Price;
     g_SoftStopCount++;
-    
-    Print("📋 软止损列表: 添加订单 #", ticket, 
-          " | 技术位=", DoubleToString(technicalSL, g_SymbolDigits),
-          " | 当前数量=", g_SoftStopCount);
 }
 
-//+------------------------------------------------------------------+
-//| Remove Soft Stop Info (从列表移除软止损信息)                       |
-//+------------------------------------------------------------------+
+// 收养旧版本/其他实例开的同 Magic 持仓，纳入软止损管理（仅启动后执行一次）
+void AdoptExistingPositionsIfNeeded(double atr)
+{
+    static bool adopted = false;
+    if(adopted || atr <= 0) return;
+    
+    long magicScalp = InpMagicNumber, magicRunner = InpMagicNumber + 1;
+    for(int p = PositionsTotal() - 1; p >= 0; p--)
+    {
+        if(!positionInfo.SelectByIndex(p)) continue;
+        if(positionInfo.Symbol() != _Symbol) continue;
+        long mag = positionInfo.Magic();
+        if(mag != magicScalp && mag != magicRunner) continue;
+        
+        ulong ticket = positionInfo.Ticket();
+        bool inList = false;
+        int softLen = ArraySize(g_SoftStopList);
+        for(int s = 0; s < g_SoftStopCount && s < softLen; s++)
+            if(g_SoftStopList[s].ticket == ticket) { inList = true; break; }
+        if(inList) continue;
+        
+        double entryPrice = positionInfo.PriceOpen();
+        double posSL      = positionInfo.StopLoss();
+        string side      = (positionInfo.PositionType() == POSITION_TYPE_BUY) ? "buy" : "sell";
+        double technicalSL = (side == "buy" && posSL > 0 && posSL < entryPrice) ? posSL :
+                             (side == "sell" && posSL > 0 && posSL > entryPrice) ? posSL : 0;
+        if(technicalSL <= 0 && atr > 0)
+            technicalSL = GetBrooksStopLoss(side, entryPrice, atr);
+        if(technicalSL > 0)
+        {
+            double tp1 = (mag == magicRunner) ? GetScalpTP1(side, entryPrice, technicalSL) : 0;
+            AddSoftStopInfo(ticket, technicalSL, side, tp1);
+        }
+    }
+    adopted = true;
+}
+
 void RemoveSoftStopInfo(ulong ticket)
 {
-    for(int i = 0; i < g_SoftStopCount; i++)
+    int arrLen = ArraySize(g_SoftStopList);
+    for(int i = 0; i < g_SoftStopCount && i < arrLen; i++)
     {
         if(g_SoftStopList[i].ticket == ticket)
         {
-            // 移动后面的元素
-            for(int j = i; j < g_SoftStopCount - 1; j++)
-            {
-                g_SoftStopList[j] = g_SoftStopList[j + 1];
-            }
             g_SoftStopCount--;
-            
-            // 缩小数组（最小保留 1 个元素的空间）
-            int newSize = g_SoftStopCount > 0 ? g_SoftStopCount : 1;
-            ArrayResize(g_SoftStopList, newSize);
-            
-            Print("📋 软止损列表: 移除订单 #", ticket, " | 剩余数量=", g_SoftStopCount);
+            if(g_SoftStopCount < 0) g_SoftStopCount = 0;
+            if(i < g_SoftStopCount)
+                g_SoftStopList[i] = g_SoftStopList[g_SoftStopCount];  // swap-with-last, O(1) 无 ArrayCopy
             return;
         }
     }
-    // 如果没找到，不输出日志（可能已被清理）
 }
 
-//+------------------------------------------------------------------+
-//| Sync Soft Stop List (同步软止损列表与实际持仓)                      |
-//| 健壮性保证：清理所有无效记录（持仓已不存在的）                        |
-//+------------------------------------------------------------------+
 void SyncSoftStopList()
 {
-    if(g_SoftStopCount == 0) return;
-    
-    int removedCount = 0;
-    
-    // 从后往前遍历，安全删除
+    ValidateSoftStopArray();
+    long magicScalp = InpMagicNumber, magicRunner = InpMagicNumber + 1;
+    int arrLen = ArraySize(g_SoftStopList);
     for(int i = g_SoftStopCount - 1; i >= 0; i--)
     {
-        ulong ticket = g_SoftStopList[i].ticket;
-        
-        // 检查持仓是否存在
-        bool positionExists = PositionSelectByTicket(ticket);
-        bool magicMatches = positionExists && 
-                            (PositionGetInteger(POSITION_MAGIC) == InpMagicNumber);
-        
-        if(!positionExists || !magicMatches)
+        if(i < 0 || i >= g_SoftStopCount || i >= arrLen) break;
+        bool exists = PositionSelectByTicket(g_SoftStopList[i].ticket);
+        long mag = exists ? PositionGetInteger(POSITION_MAGIC) : 0;
+        bool magicOk = exists && (mag == magicScalp || mag == magicRunner);
+        if(!exists || !magicOk)
         {
-            // 直接移除（不调用 RemoveSoftStopInfo 避免重复日志）
-            for(int j = i; j < g_SoftStopCount - 1; j++)
-            {
-                g_SoftStopList[j] = g_SoftStopList[j + 1];
-            }
             g_SoftStopCount--;
-            removedCount++;
+            if(g_SoftStopCount < 0) g_SoftStopCount = 0;
+            if(i < g_SoftStopCount)
+                g_SoftStopList[i] = g_SoftStopList[g_SoftStopCount];
         }
     }
-    
-    // 调整数组大小
-    if(removedCount > 0)
-    {
-        int newSize = g_SoftStopCount > 0 ? g_SoftStopCount : 1;
-        ArrayResize(g_SoftStopList, newSize);
-        Print("📋 软止损列表同步: 清理 ", removedCount, " 条无效记录 | 剩余=", g_SoftStopCount);
-    }
+    if(g_SoftStopCount > 0)
+        ArrayResize(g_SoftStopList, g_SoftStopCount);
 }
 
-//+------------------------------------------------------------------+
-//| Add TP1 Info (记录 TP1 价格，用于动态止盈触发)                      |
-//+------------------------------------------------------------------+
 void AddTP1Info(ulong ticket, double tp1Price, string side)
 {
-    for(int i = 0; i < g_TP1Count; i++)
-    {
-        if(g_TP1List[i].ticket == ticket) return;  // 已存在
-    }
+    int tp1Len = ArraySize(g_TP1List);
+    for(int i = 0; i < g_TP1Count && i < tp1Len; i++)
+        if(g_TP1List[i].ticket == ticket) return;
     
     if(g_TP1Count >= MAX_TP1_RECORDS)
     {
-        // 简单压缩：移除第一条
         for(int i = 0; i < g_TP1Count - 1; i++)
             g_TP1List[i] = g_TP1List[i + 1];
         g_TP1Count--;
     }
     
-    int newSize = g_TP1Count + 1;
-    ArrayResize(g_TP1List, newSize);
+    ArrayResize(g_TP1List, g_TP1Count + 1);
     g_TP1List[g_TP1Count].ticket = ticket;
     g_TP1List[g_TP1Count].tp1Price = tp1Price;
     g_TP1List[g_TP1Count].side = side;
     g_TP1Count++;
 }
 
-//+------------------------------------------------------------------+
-//| Remove TP1 Info (移除 TP1 记录)                                    |
-//+------------------------------------------------------------------+
 void RemoveTP1Info(ulong ticket)
 {
-    for(int i = 0; i < g_TP1Count; i++)
+    int tp1Len = ArraySize(g_TP1List);
+    for(int i = 0; i < g_TP1Count && i < tp1Len; i++)
     {
         if(g_TP1List[i].ticket == ticket)
         {
@@ -4590,39 +4127,27 @@ void RemoveTP1Info(ulong ticket)
     }
 }
 
-//+------------------------------------------------------------------+
-//| Get TP1 Price (获取持仓的 TP1 价格，用于判断是否触发)               |
-//+------------------------------------------------------------------+
 double GetTP1Price(ulong ticket)
 {
-    for(int i = 0; i < g_TP1Count; i++)
-    {
-        if(g_TP1List[i].ticket == ticket)
-            return g_TP1List[i].tp1Price;
-    }
+    int tp1Len = ArraySize(g_TP1List);
+    for(int i = 0; i < g_TP1Count && i < tp1Len; i++)
+        if(g_TP1List[i].ticket == ticket) return g_TP1List[i].tp1Price;
     return 0;
 }
 
-//+------------------------------------------------------------------+
-//| Get TP1 Side (获取持仓方向，用于 TP1 触发判断)                      |
-//+------------------------------------------------------------------+
 string GetTP1Side(ulong ticket)
 {
-    for(int i = 0; i < g_TP1Count; i++)
-    {
-        if(g_TP1List[i].ticket == ticket)
-            return g_TP1List[i].side;
-    }
+    int tp1Len = ArraySize(g_TP1List);
+    for(int i = 0; i < g_TP1Count && i < tp1Len; i++)
+        if(g_TP1List[i].ticket == ticket) return g_TP1List[i].side;
     return "";
 }
 
-//+------------------------------------------------------------------+
-//| Sync TP1 List (移除已平仓订单的 TP1 记录)                           |
-//+------------------------------------------------------------------+
 void SyncTP1List()
 {
     for(int i = g_TP1Count - 1; i >= 0; i--)
     {
+        if(i < 0 || i >= g_TP1Count || i >= ArraySize(g_TP1List)) break;
         if(!PositionSelectByTicket(g_TP1List[i].ticket))
         {
             for(int j = i; j < g_TP1Count - 1; j++)
@@ -4630,387 +4155,978 @@ void SyncTP1List()
             g_TP1Count--;
         }
     }
-    if(g_TP1Count >= 0)
-        ArrayResize(g_TP1List, g_TP1Count > 0 ? g_TP1Count : 1);
+    ArrayResize(g_TP1List, g_TP1Count > 0 ? g_TP1Count : 1);
+}
+
+// 保本距离: ATR倍数>0时用0.1*ATR，否则用固定点数
+double GetBreakevenDistance(double atr)
+{
+    if(atr > 0 && InpBreakevenATRMult > 0)
+        return atr * InpBreakevenATRMult;
+    int pts = (InpBreakevenPoints > 0) ? InpBreakevenPoints : 5;
+    return pts * g_SymbolPoint;
+}
+
+// 防御性检查: 极速行情下防止 count/数组不同步导致越界
+void ValidateSoftStopArray()
+{
+    if(g_SoftStopCount < 0) g_SoftStopCount = 0;
+    int arrLen = ArraySize(g_SoftStopList);
+    if(arrLen > 0 && g_SoftStopCount > arrLen)
+        g_SoftStopCount = arrLen;
 }
 
 //+------------------------------------------------------------------+
-//| Check Soft Stop Exit (检查软止损 - 收盘价逻辑止损)                  |
-//| Al Brooks: 交易前提失效 (Premise Failed) 则立即离场                 |
-//| 做多：如果收盘价 < 原始技术止损位，说明结构被破坏                     |
-//| 做空：如果收盘价 > 原始技术止损位，说明结构被破坏                     |
+//| Soft Stop Exit Check                                              |
 //+------------------------------------------------------------------+
 void CheckSoftStopExit()
 {
-    if(!InpEnableSoftStop) return;
+    if(!InpEnableSoftStop || g_SoftStopCount == 0) return;
+    ValidateSoftStopArray();
     if(g_SoftStopCount == 0) return;
     
-    // 定期同步检查（每 10 根 K 线同步一次，确保列表健康）
     static int syncCounter = 0;
-    syncCounter++;
-    if(syncCounter >= 10)
-    {
-        SyncSoftStopList();
-        syncCounter = 0;
-    }
+    if(++syncCounter >= 10) { SyncSoftStopList(); syncCounter = 0; }
+    ValidateSoftStopArray();
+    if(g_SoftStopCount == 0) return;
     
-    // 获取前一根 K 线收盘价
+    if(g_BufferSize < 2) return;
+    
+    int currentBar = Bars(_Symbol, PERIOD_CURRENT);
+    static int s_lastTrailBar = -1;
+    bool doTrail = !InpTrailStopOnNewBarOnly || (currentBar != s_lastTrailBar);
+    if(doTrail) s_lastTrailBar = currentBar;
+    
     double prevClose = g_CloseBuffer[1];
+    double prevOpen  = g_OpenBuffer[1];
     
-    // 遍历所有软止损记录（从后往前，安全删除）
     for(int i = g_SoftStopCount - 1; i >= 0; i--)
     {
+        int arrLen = ArraySize(g_SoftStopList);
+        if(i < 0 || i >= g_SoftStopCount || i >= arrLen) break;  // 防止 count 与数组不同步或循环内 Remove 导致越界
         ulong ticket = g_SoftStopList[i].ticket;
-        double technicalSL = g_SoftStopList[i].technicalSL;
-        string side = g_SoftStopList[i].side;
+        double techSL = g_SoftStopList[i].technicalSL;
+        string side   = g_SoftStopList[i].side;
         
-        // 检查持仓是否还存在
         if(!PositionSelectByTicket(ticket))
         {
-            // 持仓已不存在（可能被硬止损打掉），移除记录
             RemoveSoftStopInfo(ticket);
             continue;
         }
         
-        // 验证 Magic Number
-        if(PositionGetInteger(POSITION_MAGIC) != InpMagicNumber)
+        long posMagic = PositionGetInteger(POSITION_MAGIC);
+        if(posMagic != InpMagicNumber && posMagic != InpMagicNumber + 1)
         {
             RemoveSoftStopInfo(ticket);
             continue;
+        }
+        
+        double entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+        double atr        = (g_AtrValue > 0) ? g_AtrValue : ((ArraySize(g_ATRBuffer) > 1) ? g_ATRBuffer[1] : 0);
+        long magicScalp  = InpMagicNumber;
+        long magicRunner = InpMagicNumber + 1;
+        
+        // 结构跟踪: 仅 Runner 且仅当 M5 新 Higher Low/Lower High 时上移；Scalp 不移动止损
+        if(doTrail && atr > 0 && posMagic == magicRunner)
+        {
+            double newSL = 0;
+            if(side == "buy")
+                newSL = GetM5StructuralStopForBuy(entryPrice, techSL, atr);
+            else
+                newSL = GetM5StructuralStopForSell(entryPrice, techSL, atr);
+            if(newSL > 0)
+            {
+                if(side == "buy" && newSL > techSL && newSL < entryPrice)
+                {
+                    g_SoftStopList[i].technicalSL = newSL;
+                    techSL = newSL;
+                    if(InpEnableHardStop)
+                    {
+                        double risk   = entryPrice - newSL;
+                        double extra  = risk * (InpHardStopBufferMult - 1.0);
+                        double brokerSL = NormalizeDouble(newSL - extra, g_SymbolDigits);
+                        double posTP   = PositionGetDouble(POSITION_TP);
+                        if(PositionModifyWithRetry(ticket, brokerSL, posTP) && InpDebugMode)
+                            Print("Runner 结构跟踪 #", ticket, " SL上移至 ", DoubleToString(newSL, g_SymbolDigits));
+                    }
+                }
+                else if(side == "sell" && newSL < techSL && newSL > entryPrice)
+                {
+                    g_SoftStopList[i].technicalSL = newSL;
+                    techSL = newSL;
+                    if(InpEnableHardStop)
+                    {
+                        double risk   = newSL - entryPrice;
+                        double extra  = risk * (InpHardStopBufferMult - 1.0);
+                        double brokerSL = NormalizeDouble(newSL + extra, g_SymbolDigits);
+                        double posTP   = PositionGetDouble(POSITION_TP);
+                        if(PositionModifyWithRetry(ticket, brokerSL, posTP) && InpDebugMode)
+                            Print("Runner 结构跟踪 #", ticket, " SL下移至 ", DoubleToString(newSL, g_SymbolDigits));
+                    }
+                }
+            }
         }
         
         bool shouldClose = false;
-        
-        if(side == "buy")
+        if(InpSoftStopConfirmMode == 0)
         {
-            // 做多：收盘价 < 技术止损位 = 结构破坏
-            if(prevClose < technicalSL)
-            {
-                shouldClose = true;
-                Print("⚠️ 逻辑止损触发 [做多] #", ticket);
-                Print("   K线收盘 ", DoubleToString(prevClose, g_SymbolDigits), 
-                      " < 技术止损位 ", DoubleToString(technicalSL, g_SymbolDigits));
-                Print("   交易前提失效 (Premise Failed)，市价离场");
-            }
+            if(side == "buy" && prevClose < techSL) shouldClose = true;
+            else if(side == "sell" && prevClose > techSL) shouldClose = true;
         }
-        else if(side == "sell")
+        else if(InpSoftStopConfirmMode == 1)
         {
-            // 做空：收盘价 > 技术止损位 = 结构破坏
-            if(prevClose > technicalSL)
+            double bodyLow  = MathMin(prevOpen, prevClose);
+            double bodyHigh = MathMax(prevOpen, prevClose);
+            if(side == "buy" && bodyLow < techSL) shouldClose = true;
+            else if(side == "sell" && bodyHigh > techSL) shouldClose = true;
+        }
+        else if(InpSoftStopConfirmMode == 2 && InpSoftStopConfirmBars > 0)
+        {
+            int need = MathMin(InpSoftStopConfirmBars, g_BufferSize - 1);
+            bool allBreak = (need > 0);
+            for(int j = 1; j <= need && j < g_BufferSize && allBreak; j++)
             {
-                shouldClose = true;
-                Print("⚠️ 逻辑止损触发 [做空] #", ticket);
-                Print("   K线收盘 ", DoubleToString(prevClose, g_SymbolDigits), 
-                      " > 技术止损位 ", DoubleToString(technicalSL, g_SymbolDigits));
-                Print("   交易前提失效 (Premise Failed)，市价离场");
+                if(side == "buy" && g_CloseBuffer[j] >= techSL) allBreak = false;
+                else if(side == "sell" && g_CloseBuffer[j] <= techSL) allBreak = false;
             }
+            if(need > 0 && allBreak) shouldClose = true;
         }
         
-        // 执行市价平仓
         if(shouldClose)
         {
-            if(trade.PositionClose(ticket))
+            if(PositionCloseWithRetry(ticket))
             {
-                Print("✅ 逻辑止损平仓成功 #", ticket);
+                if(InpDebugMode) Print("逻辑止损触发 #", ticket, " 技术SL:", DoubleToString(techSL, g_SymbolDigits));
                 RemoveSoftStopInfo(ticket);
             }
             else
             {
-                Print("❌ 逻辑止损平仓失败 #", ticket, " | 错误: ", trade.ResultRetcodeDescription());
+                if(!PositionSelectByTicket(ticket))
+                    RemoveSoftStopInfo(ticket);
+            }
+        }
+    }
+}
+
+
+//+------------------------------------------------------------------+
+//| Barb Wire Detection - Brooks: 连续doji/小K线区域                   |
+//| Barb Wire = 连续3+根小实体K线,通常伴随重叠和doji                    |
+//| 在Barb Wire区域应避免交易,等待突破                                  |
+//+------------------------------------------------------------------+
+void UpdateBarbWireDetection(double atr)
+{
+    if(!InpEnableBarbWireFilter || atr <= 0 || g_BufferSize < InpBarbWireMinBars + 1)
+    {
+        g_InBarbWire = false;
+        return;
+    }
+    
+    int smallBarCount = 0;
+    int dojiCount = 0;
+    int overlapCount = 0;
+    double rangeHigh = g_HighBuffer[1];
+    double rangeLow = g_LowBuffer[1];
+    
+    // 检查最近N根K线是否构成Barb Wire
+    int checkBars = InpBarbWireMinBars + 2;
+    for(int i = 1; i <= checkBars && i < g_BufferSize; i++)
+    {
+        double high = g_HighBuffer[i];
+        double low = g_LowBuffer[i];
+        double open = g_OpenBuffer[i];
+        double close = g_CloseBuffer[i];
+        double range = high - low;
+        double body = MathAbs(close - open);
+        
+        if(range <= 0) continue;
+        
+        // 更新区域高低点
+        if(high > rangeHigh) rangeHigh = high;
+        if(low < rangeLow) rangeLow = low;
+        
+        // 小K线判定: range小于ATR阈值 或 实体占比小
+        bool isSmallBar = (range < atr * InpBarbWireRangeRatio) || 
+                          (body / range < InpBarbWireBodyRatio);
+        
+        // Doji判定: 实体极小
+        bool isDoji = (body / range < 0.15);
+        
+        if(isSmallBar) smallBarCount++;
+        if(isDoji) dojiCount++;
+        
+        // 检查与前一根K线的重叠程度 - Brooks强调的关键特征
+        if(i > 1 && i < g_BufferSize)
+        {
+            double prevHigh = g_HighBuffer[i-1];
+            double prevLow = g_LowBuffer[i-1];
+            double overlapHigh = MathMin(high, prevHigh);
+            double overlapLow = MathMax(low, prevLow);
+            double overlapSize = overlapHigh - overlapLow;
+            
+            // 如果重叠超过当前K线range的50%,算作高重叠
+            if(overlapSize > 0 && range > 0 && overlapSize / range > 0.5)
+                overlapCount++;
+        }
+    }
+    
+    // Barb Wire条件: 连续小K线 + 至少1个doji + K线高度重叠
+    double totalRange = rangeHigh - rangeLow;
+    bool highOverlap = (totalRange < atr * 1.5) || (overlapCount >= InpBarbWireMinBars - 1);
+    
+    if(smallBarCount >= InpBarbWireMinBars && dojiCount >= 1 && highOverlap)
+    {
+        if(!g_InBarbWire)
+        {
+            g_InBarbWire = true;
+            g_BarbWireBarCount = 0;
+            g_BarbWireHigh = rangeHigh;
+            g_BarbWireLow = rangeLow;
+            if(InpEnableVerboseLog)
+                if(InpDebugMode) Print("进入Barb Wire区域: High=", DoubleToString(rangeHigh, g_SymbolDigits), 
+                      " Low=", DoubleToString(rangeLow, g_SymbolDigits));
+        }
+        g_BarbWireBarCount++;
+        
+        // 更新Barb Wire边界(只扩展,不收缩)
+        if(g_HighBuffer[1] > g_BarbWireHigh) g_BarbWireHigh = g_HighBuffer[1];
+        if(g_LowBuffer[1] < g_BarbWireLow) g_BarbWireLow = g_LowBuffer[1];
+    }
+    else
+    {
+        // 检查是否突破Barb Wire
+        if(g_InBarbWire)
+        {
+            double currClose = g_CloseBuffer[1];
+            double currRange = g_HighBuffer[1] - g_LowBuffer[1];
+            double currBody = MathAbs(g_CloseBuffer[1] - g_OpenBuffer[1]);
+            
+            // 突破条件: 强势K线(大实体)收盘在Barb Wire区域外
+            bool isStrongBar = (currRange > atr * 0.5) && (currRange > 0 && currBody / currRange > 0.5);
+            bool breakoutUp = (currClose > g_BarbWireHigh && isStrongBar && g_CloseBuffer[1] > g_OpenBuffer[1]);
+            bool breakoutDown = (currClose < g_BarbWireLow && isStrongBar && g_CloseBuffer[1] < g_OpenBuffer[1]);
+            
+            if(breakoutUp || breakoutDown)
+            {
+                if(InpEnableVerboseLog)
+                    if(InpDebugMode) Print("Barb Wire突破: ", breakoutUp ? "向上" : "向下");
+                
+                // 突破Barb Wire可能触发Breakout Mode
+                if(InpEnableBreakoutMode)
+                {
+                    g_InBreakoutMode = true;
+                    g_BreakoutModeDir = breakoutUp ? "up" : "down";
+                    g_BreakoutModeBarCount = 0;
+                    g_BreakoutModeEntry = currClose;
+                    g_BreakoutModeExtreme = breakoutUp ? g_HighBuffer[1] : g_LowBuffer[1];
+                }
+                
+                // 重置Barb Wire状态
+                g_InBarbWire = false;
+                g_BarbWireBarCount = 0;
+                g_BarbWireHigh = 0;
+                g_BarbWireLow = 0;
+            }
+            else
+            {
+                // 非强势突破,仅重置Barb Wire状态
+                g_InBarbWire = false;
+                g_BarbWireBarCount = 0;
             }
         }
     }
 }
 
 //+------------------------------------------------------------------+
-//| Get Signal Side (获取信号方向)                                      |
+//| Measuring Gap Detection - Brooks: 突破缺口,趋势中点标志             |
+//| Measuring Gap = 强势突破K线与前一根K线之间的缺口                     |
+//| 缺口中点通常是整个运动的中点,可用于目标计算                          |
+//+------------------------------------------------------------------+
+void UpdateMeasuringGap(double ema, double atr)
+{
+    if(!InpEnableMeasuringGap || atr <= 0 || g_BufferSize < 3)
+        return;
+    
+    // 先更新现有Measuring Gap的bar索引(在检测新Gap之前)
+    if(g_HasMeasuringGap && g_MeasuringGap.isValid)
+    {
+        g_MeasuringGap.barIndex++;
+        
+        double currHigh = g_HighBuffer[1], currLow = g_LowBuffer[1];
+        
+        // Measuring Gap失效条件: 价格回填缺口超过50%
+        double gapMid = (g_MeasuringGap.gapHigh + g_MeasuringGap.gapLow) / 2.0;
+        if(g_MeasuringGap.direction == "up" && currLow < gapMid)
+        {
+            g_MeasuringGap.isValid = false;
+            if(InpEnableVerboseLog)
+                if(InpDebugMode) Print("向上Measuring Gap失效: 价格回填");
+        }
+        if(g_MeasuringGap.direction == "down" && currHigh > gapMid)
+        {
+            g_MeasuringGap.isValid = false;
+            if(InpEnableVerboseLog)
+                if(InpDebugMode) Print("向下Measuring Gap失效: 价格回填");
+        }
+        
+        // 超过20根K线后失效
+        if(g_MeasuringGap.barIndex > 20)
+        {
+            g_MeasuringGap.isValid = false;
+            g_HasMeasuringGap = false;
+        }
+        
+        // 如果现有Gap仍有效,不检测新Gap
+        if(g_MeasuringGap.isValid)
+            return;
+    }
+    
+    // 检测新的Measuring Gap
+    double currHigh = g_HighBuffer[1], currLow = g_LowBuffer[1];
+    double currOpen = g_OpenBuffer[1], currClose = g_CloseBuffer[1];
+    double prevHigh = g_HighBuffer[2], prevLow = g_LowBuffer[2];
+    double currRange = currHigh - currLow;
+    
+    if(currRange <= 0) return;
+    double currBody = MathAbs(currClose - currOpen);
+    
+    // 检测向上Measuring Gap
+    // 条件: 当前K线低点高于前一根K线高点 + 当前K线是强势阳线
+    double gapUp = currLow - prevHigh;
+    if(gapUp >= atr * InpMeasuringGapMinSize && currClose > currOpen && currBody / currRange > 0.5)
+    {
+        g_HasMeasuringGap = true;
+        g_MeasuringGap.gapHigh = currLow;
+        g_MeasuringGap.gapLow = prevHigh;
+        g_MeasuringGap.direction = "up";
+        g_MeasuringGap.barIndex = 0;  // 当前K线是Gap K线
+        g_MeasuringGap.isValid = true;
+        if(InpEnableVerboseLog)
+            if(InpDebugMode) Print("检测到向上Measuring Gap: ", DoubleToString(prevHigh, g_SymbolDigits), 
+                  " - ", DoubleToString(currLow, g_SymbolDigits));
+        return;
+    }
+    
+    // 检测向下Measuring Gap
+    double gapDown = prevLow - currHigh;
+    if(gapDown >= atr * InpMeasuringGapMinSize && currClose < currOpen && currBody / currRange > 0.5)
+    {
+        g_HasMeasuringGap = true;
+        g_MeasuringGap.gapHigh = prevLow;
+        g_MeasuringGap.gapLow = currHigh;
+        g_MeasuringGap.direction = "down";
+        g_MeasuringGap.barIndex = 0;
+        g_MeasuringGap.isValid = true;
+        if(InpEnableVerboseLog)
+            if(InpDebugMode) Print("检测到向下Measuring Gap: ", DoubleToString(currHigh, g_SymbolDigits), 
+                  " - ", DoubleToString(prevLow, g_SymbolDigits));
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Breakout Mode - Brooks: 突破后的特殊交易模式                        |
+//| 突破后市场进入特殊状态,应优先顺势交易,避免逆势                       |
+//| 特点: 回调浅、持续时间短、应积极追涨/追跌                            |
+//+------------------------------------------------------------------+
+void UpdateBreakoutMode(double ema, double atr)
+{
+    if(!InpEnableBreakoutMode || atr <= 0)
+        return;
+    
+    // 检测新的突破进入Breakout Mode
+    if(!g_InBreakoutMode)
+    {
+        double currRange = g_HighBuffer[1] - g_LowBuffer[1];
+        double currBody = MathAbs(g_CloseBuffer[1] - g_OpenBuffer[1]);
+        double currClose = g_CloseBuffer[1], currOpen = g_OpenBuffer[1];
+        
+        // 突破K线条件: 大range + 大实体 + 收盘在极端位置
+        if(currRange >= atr * InpBreakoutModeATRMult && currBody / currRange > 0.6)
+        {
+            bool isBullBreakout = (currClose > currOpen) && 
+                                  ((currClose - g_LowBuffer[1]) / currRange > 0.75);
+            bool isBearBreakout = (currClose < currOpen) && 
+                                  ((g_HighBuffer[1] - currClose) / currRange > 0.75);
+            
+            // 额外验证: 突破前一个swing point
+            if(isBullBreakout)
+            {
+                double recentHigh = GetRecentSwingHigh(1);
+                if(recentHigh > 0 && currClose > recentHigh)
+                {
+                    g_InBreakoutMode = true;
+                    g_BreakoutModeDir = "up";
+                    g_BreakoutModeBarCount = 0;
+                    g_BreakoutModeEntry = currClose;
+                    g_BreakoutModeExtreme = g_HighBuffer[1];
+                    if(InpEnableVerboseLog)
+                        if(InpDebugMode) Print("进入Breakout Mode: 向上突破");
+                }
+            }
+            else if(isBearBreakout)
+            {
+                double recentLow = GetRecentSwingLow(1);
+                if(recentLow > 0 && currClose < recentLow)
+                {
+                    g_InBreakoutMode = true;
+                    g_BreakoutModeDir = "down";
+                    g_BreakoutModeBarCount = 0;
+                    g_BreakoutModeEntry = currClose;
+                    g_BreakoutModeExtreme = g_LowBuffer[1];
+                    if(InpEnableVerboseLog)
+                        if(InpDebugMode) Print("进入Breakout Mode: 向下突破");
+                }
+            }
+        }
+    }
+    else
+    {
+        // 更新Breakout Mode状态
+        g_BreakoutModeBarCount++;
+        
+        // 更新极值
+        if(g_BreakoutModeDir == "up" && g_HighBuffer[1] > g_BreakoutModeExtreme)
+        { g_BreakoutModeExtreme = g_HighBuffer[1]; }
+        if(g_BreakoutModeDir == "down" && g_LowBuffer[1] < g_BreakoutModeExtreme)
+        { g_BreakoutModeExtreme = g_LowBuffer[1]; }
+        
+        // Breakout Mode退出条件
+        bool shouldExit = false;
+        
+        // 1. 超过指定K线数
+        if(g_BreakoutModeBarCount > InpBreakoutModeBars)
+            shouldExit = true;
+        
+        // 2. 出现反向强势K线
+        double currBody = MathAbs(g_CloseBuffer[1] - g_OpenBuffer[1]);
+        double currRange = g_HighBuffer[1] - g_LowBuffer[1];
+        if(currRange > 0 && currBody / currRange > 0.6)
+        {
+            if(g_BreakoutModeDir == "up" && g_CloseBuffer[1] < g_OpenBuffer[1])
+                shouldExit = true;
+            if(g_BreakoutModeDir == "down" && g_CloseBuffer[1] > g_OpenBuffer[1])
+                shouldExit = true;
+        }
+        
+        // 3. 价格回撤超过50%
+        double retracement = 0;
+        double moveRange = 0;
+        if(g_BreakoutModeDir == "up")
+        {
+            moveRange = g_BreakoutModeExtreme - g_BreakoutModeEntry;
+            if(moveRange > atr * 0.1)  // 确保有足够的运动空间
+                retracement = (g_BreakoutModeExtreme - g_LowBuffer[1]) / moveRange;
+        }
+        else
+        {
+            moveRange = g_BreakoutModeEntry - g_BreakoutModeExtreme;
+            if(moveRange > atr * 0.1)
+                retracement = (g_HighBuffer[1] - g_BreakoutModeExtreme) / moveRange;
+        }
+        
+        if(moveRange > atr * 0.1 && retracement > 0.5)
+            shouldExit = true;
+        
+        if(shouldExit)
+        {
+            if(InpEnableVerboseLog)
+                if(InpDebugMode) Print("退出Breakout Mode");
+            g_InBreakoutMode = false;
+            g_BreakoutModeDir = "";
+            g_BreakoutModeBarCount = 0;
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Breakout Mode Signal - Brooks: 突破模式下的特殊信号                 |
+//| 在Breakout Mode中,优先寻找顺势入场机会                              |
+//| 回调即入场,不需要等待完整的H2/L2形态                                |
+//+------------------------------------------------------------------+
+ENUM_SIGNAL_TYPE CheckBreakoutModeSignal(double ema, double atr, double &stopLoss, double &baseHeight)
+{
+    if(!g_InBreakoutMode || atr <= 0)
+        return SIGNAL_NONE;
+    
+    double currHigh = g_HighBuffer[1], currLow = g_LowBuffer[1];
+    double currOpen = g_OpenBuffer[1], currClose = g_CloseBuffer[1];
+    double currRange = currHigh - currLow;
+    
+    if(currRange <= 0) return SIGNAL_NONE;
+    
+    // 向上Breakout Mode: 寻找回调后的买入机会
+    if(g_BreakoutModeDir == "up")
+    {
+        // 条件: 回调K线(阴线或小阳线) + 当前K线是阳线确认
+        double prevClose = g_CloseBuffer[2], prevOpen = g_OpenBuffer[2];
+        bool wasPullback = (prevClose <= prevOpen) || 
+                           (prevClose > prevOpen && (prevClose - prevOpen) < atr * 0.3);
+        
+        // 当前K线是阳线,收盘在上半部
+        bool isBullConfirm = (currClose > currOpen) && 
+                             ((currClose - currLow) / currRange > 0.6);
+        
+        if(wasPullback && isBullConfirm && CheckSignalCooldown("buy"))
+        {
+            // 止损在回调低点下方
+            double pullbackLow = MathMin(g_LowBuffer[1], g_LowBuffer[2]);
+            stopLoss = pullbackLow - atr * 0.3;
+            
+            if((currClose - stopLoss) <= atr * InpMaxStopATRMult)
+            {
+                baseHeight = g_BreakoutModeExtreme - pullbackLow;
+                UpdateSignalCooldown("buy");
+                return SIGNAL_BO_PULLBACK_BUY;
+            }
+        }
+    }
+    
+    // 向下Breakout Mode: 寻找反弹后的卖出机会
+    if(g_BreakoutModeDir == "down")
+    {
+        double prevClose = g_CloseBuffer[2], prevOpen = g_OpenBuffer[2];
+        bool wasBounce = (prevClose >= prevOpen) || 
+                         (prevClose < prevOpen && (prevOpen - prevClose) < atr * 0.3);
+        
+        bool isBearConfirm = (currClose < currOpen) && 
+                             ((currHigh - currClose) / currRange > 0.6);
+        
+        if(wasBounce && isBearConfirm && CheckSignalCooldown("sell"))
+        {
+            double bounceHigh = MathMax(g_HighBuffer[1], g_HighBuffer[2]);
+            stopLoss = bounceHigh + atr * 0.3;
+            
+            if((stopLoss - currClose) <= atr * InpMaxStopATRMult)
+            {
+                baseHeight = bounceHigh - g_BreakoutModeExtreme;
+                UpdateSignalCooldown("sell");
+                return SIGNAL_BO_PULLBACK_SELL;
+            }
+        }
+    }
+    
+    return SIGNAL_NONE;
+}
+
+//+------------------------------------------------------------------+
+//| Spread & Session Tracking                                         |
+//+------------------------------------------------------------------+
+void UpdateSpreadTracking()
+{
+    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    g_CurrentSpread = (ask - bid) / g_SymbolPoint;
+    
+    if(ArraySize(g_SpreadHistory) > 0)
+    {
+        double oldValue = g_SpreadHistory[g_SpreadIndex];
+        if(oldValue > 0) g_SpreadRunningSum -= oldValue;
+        else g_SpreadValidCount++;
+        
+        g_SpreadHistory[g_SpreadIndex] = g_CurrentSpread;
+        g_SpreadRunningSum += g_CurrentSpread;
+        g_SpreadIndex = (g_SpreadIndex + 1) % InpSpreadLookback;
+        
+        g_AverageSpread = g_SpreadValidCount > 0 ? g_SpreadRunningSum / g_SpreadValidCount : g_CurrentSpread;
+    }
+    
+    if(g_AverageSpread > 0 && g_CurrentSpread > g_AverageSpread * InpMaxSpreadMult)
+        g_SpreadFilterActive = true;
+    else
+        g_SpreadFilterActive = false;
+}
+
+void UpdateSessionDetection()
+{
+    MqlDateTime dt;
+    TimeToStruct(TimeCurrent(), dt);
+    int gmtHour = (dt.hour - InpGMTOffset + 24) % 24;
+    
+    if(InpEnableWeekendFilter)
+    {
+        int day = (dt.day_of_week + 6) % 7;
+        int gmtHour = (dt.hour - InpGMTOffset + 24) % 24;
+        bool fridayLate = (dt.day_of_week == 5 && InpFridayCloseHour > 0 && gmtHour >= InpFridayCloseHour);
+        bool weekend = (dt.day_of_week == 0 || dt.day_of_week == 6) || fridayLate;
+        bool sundayBeforeOpen = (dt.day_of_week == 0 && InpMondayOpenHour > 0 && gmtHour < InpMondayOpenHour);
+        g_IsWeekend = weekend || sundayBeforeOpen;
+        g_IsFridayClose = (dt.day_of_week == 5 && InpFridayCloseHour > 0 && gmtHour >= InpFridayCloseHour);
+    }
+    else
+    {
+        g_IsWeekend = false;
+        g_IsFridayClose = false;
+    }
+}
+
+// 周一开盘大跳空时重置H/L计数(Brooks: 跳空即隐形趋势棒,已完成H1/L1)
+void CheckMondayGapReset(double atr)
+{
+    if(atr <= 0 || InpMondayGapResetATR <= 0) return;
+    MqlDateTime dt;
+    TimeToStruct(TimeCurrent(), dt);
+    if(dt.day_of_week != 1) return;
+    datetime weekStart = iTime(_Symbol, PERIOD_CURRENT, 0);
+    if(weekStart == g_MondayGapResetDone) return;
+    if(g_OpenBuffer[1] == 0 || g_CloseBuffer[2] == 0) return;
+    double gap = MathAbs(g_OpenBuffer[1] - g_CloseBuffer[2]);
+    if(gap >= atr * InpMondayGapResetATR)
+    {
+        g_H_Count = 0;
+        g_L_Count = 0;
+        g_H_LastSwingHigh = 0;
+        g_H_LastPullbackLow = 0;
+        g_L_LastSwingLow = 0;
+        g_L_LastBounceHigh = 0;
+        g_MondayGapResetDone = weekStart;
+        if(InpEnableVerboseLog)
+            if(InpDebugMode) Print("周一跳空重置H/L计数 Gap=", DoubleToString(gap, g_SymbolDigits), " ATR*", InpMondayGapResetATR, "=", DoubleToString(atr*InpMondayGapResetATR, g_SymbolDigits));
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Position Management                                               |
+//+------------------------------------------------------------------+
+void ManagePositions(double ema, double atr)
+{
+    SyncTP1List();
+    int totalPositions = 0, scalpPositions = 0;
+    CountPositionsBoth(totalPositions, scalpPositions);
+    if(totalPositions > 0) SyncSoftStopList();
+    CheckClimaxExit();
+    double beDist = GetBreakevenDistance(atr);
+    double beDistLarge = 2.0 * beDist;
+    int magicScalp  = InpMagicNumber;
+    int magicRunner = InpMagicNumber + 1;
+
+    for(int i = PositionsTotal() - 1; i >= 0; i--)
+    {
+        if(!positionInfo.SelectByIndex(i)) continue;
+        if(positionInfo.Symbol() != _Symbol) continue;
+        long magic = positionInfo.Magic();
+        if(magic != magicScalp && magic != magicRunner) continue;
+        
+        ulong  ticket   = positionInfo.Ticket();
+        double posPrice = positionInfo.PriceOpen();
+        double posSL    = positionInfo.StopLoss();
+        double posTP    = positionInfo.TakeProfit();
+        double posVol   = positionInfo.Volume();
+        long   posType  = positionInfo.PositionType();
+        
+        double currentPrice = posType == POSITION_TYPE_BUY ?
+                              SymbolInfoDouble(_Symbol, SYMBOL_BID) :
+                              SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+        double risk = posType == POSITION_TYPE_BUY ? (posPrice - posSL) : (posSL - posPrice);
+        
+        if(risk <= 0)
+        {
+            if(posSL == 0 && atr > 0)
+            {
+                double emergSL = posType == POSITION_TYPE_BUY ? posPrice - atr * 2.0 : posPrice + atr * 2.0;
+                emergSL = NormalizeDouble(emergSL, g_SymbolDigits);
+                PositionModifyWithRetry(ticket, emergSL, posTP);
+            }
+            continue;
+        }
+        
+        double currentRR = posType == POSITION_TYPE_BUY ?
+                           (currentPrice - posPrice) / risk :
+                           (posPrice - currentPrice) / risk;
+        
+        if(InpEnableWeekendFilter && g_IsFridayClose)
+        {
+            bool narrowTR = (g_MarketState == MARKET_STATE_TRADING_RANGE && g_TR_High > g_TR_Low && (g_TR_High - g_TR_Low) < atr);
+            bool strongTrend = (g_AlwaysIn == AI_LONG || g_AlwaysIn == AI_SHORT) && !g_InBarbWire && !narrowTR;
+            if(currentRR < InpFridayMinProfitR || !strongTrend)
+            {
+                PositionCloseWithRetry(ticket);
+            }
+            else
+            {
+                double beSL = (posType == POSITION_TYPE_BUY) ?
+                    NormalizeDouble(posPrice + beDist, g_SymbolDigits) : NormalizeDouble(posPrice - beDist, g_SymbolDigits);
+                if((posType == POSITION_TYPE_BUY && (posSL < posPrice - beDist || posSL == 0)) ||
+                   (posType == POSITION_TYPE_SELL && (posSL > posPrice + beDist || posSL == 0)))
+                    PositionModifyWithRetry(ticket, beSL, posTP);
+            }
+            continue;
+        }
+        
+        // --- 逻辑分支 A: Scalp 单 (Magic_A = TP1) ---
+        if(magic == magicScalp)
+        {
+            bool hasRunner = (totalPositions > scalpPositions);
+            if(hasRunner)
+            {
+                // 两笔单模式: Scalp 不做保本，SL 由 CheckSoftStopExit 结构跟踪管理，等服务器 TP1 止盈
+            }
+            else
+            {
+                // 单笔模式: 手动 TP1 部分平仓，平仓后再移保本
+                double storedTP1 = GetTP1Price(ticket);
+                if(storedTP1 > 0)
+                {
+                    string tp1Side = GetTP1Side(ticket);
+                    bool tp1Reached = tp1Side == "buy" ? (currentPrice >= storedTP1) : (currentPrice <= storedTP1);
+                    bool alreadyTP1 = (posType == POSITION_TYPE_BUY && posSL >= posPrice - beDist) || (posType == POSITION_TYPE_SELL && posSL <= posPrice + beDist);
+                    double volumeMin  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+                    double volumeStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+                    if(tp1Reached && !alreadyTP1 && posVol > volumeMin)
+                    {
+                        double closeVol = NormalizeDouble(posVol * (InpTP1ClosePercent / 100.0), 2);
+                        if(closeVol < volumeMin) closeVol = volumeMin;
+                        if(posVol - closeVol < volumeMin) closeVol = posVol - volumeMin;
+                        if(volumeStep > 0) closeVol = MathFloor(closeVol / volumeStep) * volumeStep;
+                        closeVol = NormalizeDouble(closeVol, 2);
+                        if(closeVol >= volumeMin && PositionClosePartialWithRetry(ticket, closeVol))
+                        {
+                            Sleep(100);
+                            if(PositionSelectByTicket(ticket))
+                            {
+                                double volAfter = PositionGetDouble(POSITION_VOLUME);
+                                if(volAfter < posVol - volumeMin * 0.5)
+                                {
+                                    double newSL = posType == POSITION_TYPE_BUY ? posPrice + beDistLarge : posPrice - beDistLarge;
+                                    PositionModifyWithRetry(ticket, NormalizeDouble(newSL, g_SymbolDigits), posTP);
+                                    RemoveTP1Info(ticket);
+                                    if(InpDebugMode) Print("TP1部分平仓成功 #", ticket);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        
+        // --- 逻辑分支 B: Runner 单 (Magic_B = TP2/Swing) ---
+        if(magic == magicRunner)
+        {
+            // 0) Scalp 已止盈后: 剩余 Runner 立即移保本
+            bool scalpGone = (totalPositions == 1 && scalpPositions == 0);
+            if(scalpGone)
+            {
+                bool alreadyAtEntry = (posType == POSITION_TYPE_BUY && posSL >= posPrice - g_SymbolPoint) ||
+                                       (posType == POSITION_TYPE_SELL && posSL <= posPrice + g_SymbolPoint);
+                if(!alreadyAtEntry)
+                {
+                    double beSL = NormalizeDouble(posPrice, g_SymbolDigits);
+                    if(PositionModifyWithRetry(ticket, beSL, posTP) && InpDebugMode)
+                        Print("Runner 保本触发 #", ticket, " SL移至开仓价 (Scalp已止盈) ", DoubleToString(posPrice, g_SymbolDigits));
+                }
+            }
+            // 1) 保本触发: 单笔模式或 Scalp 仍在时,只有当利润达到风险金额的 1.2 倍时,才将止损移至开仓价
+            else
+            {
+            double riskForBE = 0;
+            for(int s = 0; s < g_SoftStopCount && s < ArraySize(g_SoftStopList); s++)
+                if(g_SoftStopList[s].ticket == ticket)
+                {
+                    riskForBE = (posType == POSITION_TYPE_BUY) ? (posPrice - g_SoftStopList[s].technicalSL) : (g_SoftStopList[s].technicalSL - posPrice);
+                    break;
+                }
+            double profit = (posType == POSITION_TYPE_BUY) ? (currentPrice - posPrice) : (posPrice - currentPrice);
+            bool profitReached12R = (riskForBE > 0 && profit >= riskForBE * 1.2);
+            bool alreadyAtEntry = (posType == POSITION_TYPE_BUY && posSL >= posPrice - g_SymbolPoint) ||
+                                   (posType == POSITION_TYPE_SELL && posSL <= posPrice + g_SymbolPoint);
+            if(profitReached12R && !alreadyAtEntry)
+            {
+                double beSL = NormalizeDouble(posPrice, g_SymbolDigits);
+                if(PositionModifyWithRetry(ticket, beSL, posTP) && InpDebugMode)
+                    Print("Runner 保本触发 #", ticket, " SL移至开仓价 ", DoubleToString(posPrice, g_SymbolDigits));
+            }
+            }
+            // 2) 结构跟踪由 CheckSoftStopExit 处理（仅当 M5 新 Higher Low 时上移）
+        }
+    }
+}
+
+// 单次遍历同时统计总仓位数和 Scalp 仓位数
+void CountPositionsBoth(int &totalOut, int &scalpOut)
+{
+    totalOut = 0;
+    scalpOut = 0;
+    for(int i = PositionsTotal() - 1; i >= 0; i--)
+    {
+        if(!positionInfo.SelectByIndex(i)) continue;
+        if(positionInfo.Symbol() != _Symbol) continue;
+        long magic = positionInfo.Magic();
+        if(magic == InpMagicNumber)
+        {
+            totalOut++;
+            scalpOut++;
+        }
+        else if(magic == InpMagicNumber + 1)
+            totalOut++;
+    }
+}
+
+int CountPositions()
+{
+    int total = 0, scalp = 0;
+    CountPositionsBoth(total, scalp);
+    return total;
+}
+
+// 是否存在指定方向的持仓（避免锁仓）
+bool HasPositionOfType(ENUM_POSITION_TYPE posType)
+{
+    for(int i = PositionsTotal() - 1; i >= 0; i--)
+    {
+        if(!positionInfo.SelectByIndex(i)) continue;
+        if(positionInfo.Symbol() != _Symbol) continue;
+        long magic = positionInfo.Magic();
+        if(magic != InpMagicNumber && magic != InpMagicNumber + 1) continue;
+        if(positionInfo.PositionType() == posType) return true;
+    }
+    return false;
+}
+
+// (SaveState/LoadState 已移除 - 无状态持久化)
+
+//+------------------------------------------------------------------+
+//| Helper Functions                                                  |
 //+------------------------------------------------------------------+
 string GetSignalSide(ENUM_SIGNAL_TYPE signal)
 {
     switch(signal)
     {
-        // 买入信号
-        case SIGNAL_SPIKE_MARKET_BUY:
-        case SIGNAL_EMERGENCY_SPIKE_BUY:
-        case SIGNAL_MICRO_CH_H1_BUY:
         case SIGNAL_SPIKE_BUY:
         case SIGNAL_H1_BUY:
         case SIGNAL_H2_BUY:
+        case SIGNAL_MICRO_CH_BUY:
         case SIGNAL_WEDGE_BUY:
         case SIGNAL_CLIMAX_BUY:
         case SIGNAL_MTR_BUY:
         case SIGNAL_FAILED_BO_BUY:
-        case SIGNAL_GAPBAR_BUY:
         case SIGNAL_FINAL_FLAG_BUY:
+        case SIGNAL_DT_BUY:
+        case SIGNAL_TREND_BAR_BUY:
+        case SIGNAL_REV_BAR_BUY:
+        case SIGNAL_II_BUY:
+        case SIGNAL_OUTSIDE_BAR_BUY:
+        case SIGNAL_MEASURED_MOVE_BUY:
+        case SIGNAL_TR_BREAKOUT_BUY:
+        case SIGNAL_BO_PULLBACK_BUY:
+        case SIGNAL_GAP_BAR_BUY:
             return "buy";
             
-        // 卖出信号
-        case SIGNAL_SPIKE_MARKET_SELL:
-        case SIGNAL_EMERGENCY_SPIKE_SELL:
-        case SIGNAL_MICRO_CH_H1_SELL:
         case SIGNAL_SPIKE_SELL:
         case SIGNAL_L1_SELL:
         case SIGNAL_L2_SELL:
+        case SIGNAL_MICRO_CH_SELL:
         case SIGNAL_WEDGE_SELL:
         case SIGNAL_CLIMAX_SELL:
         case SIGNAL_MTR_SELL:
         case SIGNAL_FAILED_BO_SELL:
-        case SIGNAL_GAPBAR_SELL:
         case SIGNAL_FINAL_FLAG_SELL:
+        case SIGNAL_DT_SELL:
+        case SIGNAL_TREND_BAR_SELL:
+        case SIGNAL_REV_BAR_SELL:
+        case SIGNAL_II_SELL:
+        case SIGNAL_OUTSIDE_BAR_SELL:
+        case SIGNAL_MEASURED_MOVE_SELL:
+        case SIGNAL_TR_BREAKOUT_SELL:
+        case SIGNAL_BO_PULLBACK_SELL:
+        case SIGNAL_GAP_BAR_SELL:
             return "sell";
             
-        default:
-            return "";
+        default: return "";
     }
 }
 
-//+------------------------------------------------------------------+
-//| Manage Positions (仓位管理)                                        |
-//| - TP1 触及时平仓 50%（按记录的动态 TP1 价格触发）                     |
-//| - 将止损移动至保本位                                                |
-//+------------------------------------------------------------------+
-void ManagePositions(double ema, double atr)
-{
-    SyncTP1List();  // 清理已平仓订单的 TP1 记录
-    
-    for(int i = PositionsTotal() - 1; i >= 0; i--)
-    {
-        if(!positionInfo.SelectByIndex(i)) continue;
-        if(positionInfo.Magic() != InpMagicNumber) continue;
-        if(positionInfo.Symbol() != _Symbol) continue;
-        
-        ulong ticket = positionInfo.Ticket();
-        double positionPrice = positionInfo.PriceOpen();
-        double positionSL = positionInfo.StopLoss();
-        double positionTP = positionInfo.TakeProfit();
-        double positionVolume = positionInfo.Volume();
-        long positionType = positionInfo.PositionType();
-        string positionComment = positionInfo.Comment();
-        
-        // 获取当前价格
-        double currentPrice = positionType == POSITION_TYPE_BUY ? 
-                              SymbolInfoDouble(_Symbol, SYMBOL_BID) :
-                              SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-        
-        // 计算原始风险（入场价到止损的距离）
-        double risk = positionType == POSITION_TYPE_BUY ? 
-                      (positionPrice - positionSL) : (positionSL - positionPrice);
-        
-        // 如果没有有效止损，跳过
-        if(risk <= 0) 
-        {
-            // 尝试设置止损
-            if(positionSL == 0 && atr > 0)
-            {
-                double emergencySL = 0;
-                if(positionType == POSITION_TYPE_BUY)
-                    emergencySL = positionPrice - atr * 2.0;
-                else
-                    emergencySL = positionPrice + atr * 2.0;
-                
-                emergencySL = NormalizeDouble(emergencySL, _Digits);
-                
-                if(trade.PositionModify(ticket, emergencySL, positionTP))
-                    Print("⚠️ 为订单 ", ticket, " 设置紧急止损: ", DoubleToString(emergencySL, _Digits));
-            }
-            continue;
-        }
-        
-        // 计算当前盈亏倍数 (R-Multiple)
-        double currentRR = 0;
-        if(positionType == POSITION_TYPE_BUY)
-            currentRR = (currentPrice - positionPrice) / risk;
-        else
-            currentRR = (positionPrice - currentPrice) / risk;
-        
-        //=================================================================
-        // TP1 触发：平仓 50% 并移动止损到保本位
-        // 优先使用记录的动态 TP1 价格，无记录时按 0.8R 兜底
-        //=================================================================
-        // 检查是否已经触发过 TP1（通过检查止损是否已经移动到保本位附近）
-        bool alreadyTP1 = false;
-        if(positionType == POSITION_TYPE_BUY)
-            alreadyTP1 = positionSL >= positionPrice - _Point * 5;
-        else
-            alreadyTP1 = positionSL <= positionPrice + _Point * 5;
-        
-        // 是否达到 TP1：有记录则按价格，无记录则按 0.8R
-        bool tp1Reached = false;
-        double storedTP1 = GetTP1Price(ticket);
-        if(storedTP1 > 0)
-        {
-            string tp1Side = GetTP1Side(ticket);
-            if(tp1Side == "buy")
-                tp1Reached = (currentPrice >= storedTP1);
-            else
-                tp1Reached = (currentPrice <= storedTP1);
-        }
-        else
-            tp1Reached = (currentRR >= 0.8);  // 兜底：无记录时 0.8R
-        
-        // 最小剩余手数检查
-        double volumeMin = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-        double volumeStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
-        
-        if(tp1Reached && !alreadyTP1 && positionVolume > volumeMin)
-        {
-            // 计算 50% 平仓量
-            double closeVolume = NormalizeDouble(positionVolume * (InpTP1ClosePercent / 100.0), 2);
-            
-            // 确保符合最小手数和步进要求
-            if(closeVolume < volumeMin)
-                closeVolume = volumeMin;
-            
-            // 确保剩余手数 >= 最小手数
-            if(positionVolume - closeVolume < volumeMin)
-                closeVolume = positionVolume - volumeMin;
-            
-            // 按步进调整
-            if(volumeStep > 0)
-                closeVolume = MathFloor(closeVolume / volumeStep) * volumeStep;
-            
-            closeVolume = NormalizeDouble(closeVolume, 2);
-            
-            if(closeVolume >= volumeMin)
-            {
-                // 部分平仓
-                if(trade.PositionClosePartial(ticket, closeVolume))
-                {
-                    Print("═══════════════════════════════════════════════════════════════");
-                    Print("✅ TP1 触发 - 平仓 50%");
-                    Print("   订单号: ", ticket);
-                    Print("   平仓量: ", DoubleToString(closeVolume, 2), " 手");
-                    Print("   剩余量: ", DoubleToString(positionVolume - closeVolume, 2), " 手");
-                    Print("   当前 R: ", DoubleToString(currentRR, 2), "R");
-                    Print("   当前价: ", DoubleToString(currentPrice, _Digits));
-                    
-                    // 移动止损到保本位（入场价 + 小额利润保护）
-                    double breakevenBuffer = _Point * 10;  // 10 点缓冲
-                    double newSL = 0;
-                    
-                    if(positionType == POSITION_TYPE_BUY)
-                        newSL = positionPrice + breakevenBuffer;
-                    else
-                        newSL = positionPrice - breakevenBuffer;
-                    
-                    newSL = NormalizeDouble(newSL, _Digits);
-                    
-                    // 修改止损
-                    if(trade.PositionModify(ticket, newSL, positionTP))
-                    {
-                        Print("   新止损: ", DoubleToString(newSL, _Digits), " (保本位)");
-                    }
-                    else
-                    {
-                        Print("   ⚠️ 移动止损失败: ", trade.ResultRetcodeDescription());
-                    }
-                    Print("═══════════════════════════════════════════════════════════════");
-                    
-                    RemoveTP1Info(ticket);  // TP1 已触发，移除记录
-                }
-                else
-                {
-                    Print("❌ TP1 部分平仓失败 - 订单 ", ticket, ": ", trade.ResultRetcodeDescription());
-                }
-            }
-        }
-        
-        //=================================================================
-        // 追踪止损（可选：价格继续有利方向移动时）
-        //=================================================================
-        // 如果已经达到 TP1 且当前 R > 1.5R，可以继续追踪止损
-        if(alreadyTP1 && currentRR > 1.5)
-        {
-            double trailingSL = 0;
-            double trailBuffer = atr > 0 ? atr * 0.5 : risk * 0.3;
-            
-            if(positionType == POSITION_TYPE_BUY)
-            {
-                // 追踪止损 = 当前价 - 缓冲
-                trailingSL = currentPrice - trailBuffer;
-                trailingSL = NormalizeDouble(trailingSL, _Digits);
-                
-                // 只有新止损高于当前止损时才移动
-                if(trailingSL > positionSL + _Point * 5)
-                {
-                    if(trade.PositionModify(ticket, trailingSL, positionTP))
-                    {
-                        Print("📈 追踪止损更新 - 订单 ", ticket, ": SL -> ", DoubleToString(trailingSL, _Digits), 
-                              " (R: ", DoubleToString(currentRR, 2), ")");
-                    }
-                }
-            }
-            else
-            {
-                // 追踪止损 = 当前价 + 缓冲
-                trailingSL = currentPrice + trailBuffer;
-                trailingSL = NormalizeDouble(trailingSL, _Digits);
-                
-                // 只有新止损低于当前止损时才移动
-                if(trailingSL < positionSL - _Point * 5)
-                {
-                    if(trade.PositionModify(ticket, trailingSL, positionTP))
-                    {
-                        Print("📉 追踪止损更新 - 订单 ", ticket, ": SL -> ", DoubleToString(trailingSL, _Digits),
-                              " (R: ", DoubleToString(currentRR, 2), ")");
-                    }
-                }
-            }
-        }
-    }
-}
-
-//+------------------------------------------------------------------+
-//| Count Positions                                                   |
-//+------------------------------------------------------------------+
-int CountPositions()
-{
-    int count = 0;
-    for(int i = PositionsTotal() - 1; i >= 0; i--)
-    {
-        if(!positionInfo.SelectByIndex(i)) continue;
-        if(positionInfo.Magic() != InpMagicNumber) continue;
-        if(positionInfo.Symbol() != _Symbol) continue;
-        count++;
-    }
-    return count;
-}
-
-//+------------------------------------------------------------------+
-//| Signal Type to String                                             |
-//+------------------------------------------------------------------+
 string SignalTypeToString(ENUM_SIGNAL_TYPE signal)
 {
     switch(signal)
     {
-        // Context Bypass 应急入场
-        case SIGNAL_SPIKE_MARKET_BUY:  return "SpikeMarket_Buy";
-        case SIGNAL_SPIKE_MARKET_SELL: return "SpikeMarket_Sell";
-        case SIGNAL_EMERGENCY_SPIKE_BUY:  return "EmergencySpike_Buy";
-        case SIGNAL_EMERGENCY_SPIKE_SELL: return "EmergencySpike_Sell";
-        case SIGNAL_MICRO_CH_H1_BUY:   return "MicroCH_H1_Buy";
-        case SIGNAL_MICRO_CH_H1_SELL:  return "MicroCH_H1_Sell";
-        // 标准信号
-        case SIGNAL_SPIKE_BUY:       return "Spike_Buy";
-        case SIGNAL_SPIKE_SELL:      return "Spike_Sell";
-        case SIGNAL_H1_BUY:          return "H1_Buy";
-        case SIGNAL_H2_BUY:          return "H2_Buy";
-        case SIGNAL_L1_SELL:         return "L1_Sell";
-        case SIGNAL_L2_SELL:         return "L2_Sell";
-        case SIGNAL_WEDGE_BUY:       return "Wedge_Buy";
-        case SIGNAL_WEDGE_SELL:      return "Wedge_Sell";
-        case SIGNAL_CLIMAX_BUY:      return "Climax_Buy";
-        case SIGNAL_CLIMAX_SELL:     return "Climax_Sell";
-        case SIGNAL_MTR_BUY:         return "MTR_Buy";
-        case SIGNAL_MTR_SELL:        return "MTR_Sell";
-        case SIGNAL_FAILED_BO_BUY:   return "FailedBO_Buy";
-        case SIGNAL_FAILED_BO_SELL:  return "FailedBO_Sell";
-        case SIGNAL_GAPBAR_BUY:      return "GapBar_Buy";
-        case SIGNAL_GAPBAR_SELL:     return "GapBar_Sell";
-        case SIGNAL_FINAL_FLAG_BUY:  return "FinalFlag_Buy";
-        case SIGNAL_FINAL_FLAG_SELL: return "FinalFlag_Sell";
-        default:                     return "Unknown";
+        case SIGNAL_SPIKE_BUY:           return "Spike_Buy";
+        case SIGNAL_SPIKE_SELL:          return "Spike_Sell";
+        case SIGNAL_H1_BUY:              return "H1_Buy";
+        case SIGNAL_H2_BUY:              return "H2_Buy";
+        case SIGNAL_L1_SELL:             return "L1_Sell";
+        case SIGNAL_L2_SELL:             return "L2_Sell";
+        case SIGNAL_MICRO_CH_BUY:        return "MicroCH_Buy";
+        case SIGNAL_MICRO_CH_SELL:       return "MicroCH_Sell";
+        case SIGNAL_WEDGE_BUY:           return "Wedge_Buy";
+        case SIGNAL_WEDGE_SELL:          return "Wedge_Sell";
+        case SIGNAL_CLIMAX_BUY:          return "Climax_Buy";
+        case SIGNAL_CLIMAX_SELL:         return "Climax_Sell";
+        case SIGNAL_MTR_BUY:             return "MTR_Buy";
+        case SIGNAL_MTR_SELL:            return "MTR_Sell";
+        case SIGNAL_FAILED_BO_BUY:       return "FailedBO_Buy";
+        case SIGNAL_FAILED_BO_SELL:      return "FailedBO_Sell";
+        case SIGNAL_FINAL_FLAG_BUY:      return "FinalFlag_Buy";
+        case SIGNAL_FINAL_FLAG_SELL:     return "FinalFlag_Sell";
+        case SIGNAL_DT_BUY:              return "DoubleBottom_Buy";
+        case SIGNAL_DT_SELL:             return "DoubleTop_Sell";
+        case SIGNAL_TREND_BAR_BUY:       return "TrendBar_Buy";
+        case SIGNAL_TREND_BAR_SELL:      return "TrendBar_Sell";
+        case SIGNAL_REV_BAR_BUY:         return "RevBar_Buy";
+        case SIGNAL_REV_BAR_SELL:        return "RevBar_Sell";
+        case SIGNAL_II_BUY:              return "IIPattern_Buy";
+        case SIGNAL_II_SELL:             return "IIPattern_Sell";
+        case SIGNAL_OUTSIDE_BAR_BUY:     return "OutsideBar_Buy";
+        case SIGNAL_OUTSIDE_BAR_SELL:    return "OutsideBar_Sell";
+        case SIGNAL_MEASURED_MOVE_BUY:   return "MeasuredMove_Buy";
+        case SIGNAL_MEASURED_MOVE_SELL:  return "MeasuredMove_Sell";
+        case SIGNAL_TR_BREAKOUT_BUY:     return "TRBreakout_Buy";
+        case SIGNAL_TR_BREAKOUT_SELL:    return "TRBreakout_Sell";
+        case SIGNAL_BO_PULLBACK_BUY:     return "BOPullback_Buy";
+        case SIGNAL_BO_PULLBACK_SELL:    return "BOPullback_Sell";
+        case SIGNAL_GAP_BAR_BUY:         return "GapBar_Buy";
+        case SIGNAL_GAP_BAR_SELL:        return "GapBar_Sell";
+        default:                         return "Unknown";
     }
+}
+
+string GetMarketStateString(ENUM_MARKET_STATE state)
+{
+    switch(state)
+    {
+        case MARKET_STATE_STRONG_TREND:  return "StrongTrend";
+        case MARKET_STATE_BREAKOUT:      return "Breakout";
+        case MARKET_STATE_CHANNEL:       return "Channel";
+        case MARKET_STATE_TRADING_RANGE: return "TradingRange";
+        case MARKET_STATE_TIGHT_CHANNEL: return "TightChannel";
+        case MARKET_STATE_FINAL_FLAG:    return "FinalFlag";
+        default:                         return "Unknown";
+    }
+}
+
+string GetAlwaysInString(ENUM_ALWAYS_IN ai)
+{
+    switch(ai)
+    {
+        case AI_LONG:    return "AI_Long";
+        case AI_SHORT:   return "AI_Short";
+        case AI_NEUTRAL: return "AI_Neutral";
+        default:         return "Unknown";
+    }
+}
+
+void PrintBarLog(int gapCount, string extra)
+{
+    if(!InpDebugMode) return;
+    double close = g_CloseBuffer[1];
+    double open  = g_OpenBuffer[1];
+    string barType = close > open ? "Bull" : (close < open ? "Bear" : "Doji");
+    string specialState = "";
+    if(g_InBarbWire) specialState += "[BW]";
+    if(g_InBreakoutMode) specialState += "[BO:" + g_BreakoutModeDir + "]";
+    if(g_HasMeasuringGap && g_MeasuringGap.isValid) specialState += "[MG]";
+    Print(StringFormat("K#%d|%s|%s|%s|H:%d L:%d|Gap:%d%s",
+        g_BarCount, barType, GetMarketStateString(g_MarketState), GetAlwaysInString(g_AlwaysIn),
+        g_H_Count, g_L_Count, gapCount, specialState));
+}
+
+void PrintSignalLog(ENUM_SIGNAL_TYPE signal, double stopLoss, double atr)
+{
+    if(!InpDebugMode) return;
+    string side = GetSignalSide(signal);
+    double entryPrice = side == "buy" ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) : SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    double risk = side == "buy" ? (entryPrice - stopLoss) : (stopLoss - entryPrice);
+    double riskATR = atr > 0 ? risk / atr : 0;
+    Print(StringFormat("SIGNAL: %s | Entry:%.5f | SL:%.5f | Risk:%.1fATR", SignalTypeToString(signal), entryPrice, stopLoss, riskATR));
 }
 
 //+------------------------------------------------------------------+
