@@ -130,7 +130,7 @@ async def execute_live_order(
                     stop_price=round(float(params["tp1_price"]), 2),
                     reduce_only=True,
                 )
-                tp1_order_id = tp1_response.get("orderId")
+                tp1_order_id = tp1_response.get("orderId") or tp1_response.get("algoId")
                 trade_logger.mark_tp1_order_placed(user.name, order_id=tp1_order_id)
                 logging.info(f"[{user.name}] TP1 止盈单已挂: ID={tp1_order_id}")
             except Exception as tp1_err:
@@ -237,6 +237,9 @@ async def handle_close_request(
     action_type = close_request.get("action", "close")
     try:
         if action_type == "tp1":
+            await user.cancel_all_orders(SYMBOL)
+            trade_logger.clear_order_ids(user.name)
+
             close_qty = close_request["close_quantity"]
             remaining_qty = close_request.get("remaining_quantity", close_qty)
             tp1_qty = round_quantity_to_step_size(close_qty)
@@ -296,7 +299,7 @@ async def _place_tp2_order(
             stop_price=round(tp2_price, 2),
             reduce_only=True,
         )
-        tp2_order_id = response.get("orderId")
+        tp2_order_id = response.get("orderId") or response.get("algoId")
         trade_logger.update_tp2_sl_order_ids(user.name, tp2_order_id, None)
         logging.info(f"[{user.name}] TP2 限价止盈单已挂: ID={tp2_order_id}")
         return True

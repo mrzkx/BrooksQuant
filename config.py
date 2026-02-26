@@ -35,7 +35,7 @@ load_dotenv()
 # ============================================================================
 
 # 观察模式：设置为 True 时只模拟交易，不实际下单
-OBSERVE_MODE = os.getenv("OBSERVE_MODE", "true").lower() == "true"
+OBSERVE_MODE = os.getenv("OBSERVE_MODE", "false").lower() == "true"
 
 
 # ============================================================================

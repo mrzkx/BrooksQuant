@@ -420,24 +420,34 @@ class TradingUser:
 
     async def cancel_all_orders(self, symbol: str) -> bool:
         """
-        取消指定交易对的所有挂单
-        
-        Args:
-            symbol: 交易对（如 "BTCUSDT"）
-        
-        Returns:
-            bool: 是否成功
+        取消指定交易对的所有挂单（普通 + algo 条件单）
+
+        币安的 TAKE_PROFIT_MARKET 等止盈止损单属于 algo/conditional 类型，
+        futures_cancel_all_open_orders 只取消普通委托，不取消 algo 单，
+        因此需要额外调用 futures_cancel_all_algo_open_orders。
         """
         if self.client is None:
             raise RuntimeError(f"用户 {self.name} 尚未连接客户端")
-        
+
+        ok = True
         try:
             response = await self.client.futures_cancel_all_open_orders(symbol=symbol)
-            logging.info(f"[{self.name}] 已取消 {symbol} 所有挂单: {response}")
-            return True
+            logging.info(f"[{self.name}] 已取消 {symbol} 普通挂单: {response}")
         except Exception as e:
-            logging.error(f"[{self.name}] 取消挂单失败: {e}", exc_info=True)
-            return False
+            logging.warning(f"[{self.name}] 取消普通挂单失败: {e}")
+            ok = False
+
+        try:
+            algo_response = await self.client.futures_cancel_all_algo_open_orders(symbol=symbol)
+            logging.info(f"[{self.name}] 已取消 {symbol} algo 条件单: {algo_response}")
+        except Exception as e:
+            err_msg = str(e)
+            if "no algo open order" in err_msg.lower() or "no open" in err_msg.lower():
+                logging.debug(f"[{self.name}] 无活跃 algo 条件单")
+            else:
+                logging.warning(f"[{self.name}] 取消 algo 条件单失败: {e}")
+
+        return ok
 
     async def cancel_order(self, symbol: str, order_id: int) -> bool:
         """
