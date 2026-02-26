@@ -135,6 +135,8 @@ def get_trading_config() -> dict:
     - ORDER_PRICE_OFFSET_TICKS: 追价限价单偏移 tick 数，默认 0
     - LARGE_BALANCE_THRESHOLD: 大资金阈值（USDT），默认 1000
     - LARGE_BALANCE_POSITION_PCT: 大资金时的仓位百分比，默认 50
+    - FEE_RATE_MARKET: 市价单单边费率（如 0.0005 = 0.05%），默认 0.0005
+    - FEE_RATE_LIMIT: 限价单单边费率（如 0.0002 = 0.02%），默认 0.0002
     """
     observe_balance_str = os.getenv("OBSERVE_BALANCE", "10000")
     position_size_str = os.getenv("POSITION_SIZE_PERCENT", "100")
@@ -146,6 +148,8 @@ def get_trading_config() -> dict:
     order_price_offset_ticks_str = os.getenv("ORDER_PRICE_OFFSET_TICKS", "0")
     large_balance_threshold_str = os.getenv("LARGE_BALANCE_THRESHOLD", "1000")
     large_balance_position_pct_str = os.getenv("LARGE_BALANCE_POSITION_PCT", "50")
+    fee_rate_market_str = os.getenv("FEE_RATE_MARKET", "0.0005")
+    fee_rate_limit_str = os.getenv("FEE_RATE_LIMIT", "0.0002")
 
     try:
         observe_balance = float(observe_balance_str) if observe_balance_str else 10000.0
@@ -156,6 +160,8 @@ def get_trading_config() -> dict:
         tick_size = float(tick_size_str) if tick_size_str else 0.01
         order_price_offset_pct = float(order_price_offset_pct_str) if order_price_offset_pct_str else 0.0
         order_price_offset_ticks = int(order_price_offset_ticks_str) if order_price_offset_ticks_str else 0
+        fee_rate_market = float(fee_rate_market_str) if fee_rate_market_str else 0.0005
+        fee_rate_limit = float(fee_rate_limit_str) if fee_rate_limit_str else 0.0002
     except ValueError as e:
         logging.error(f"交易参数配置格式错误: {e}")
         raise RuntimeError(f"交易参数配置格式错误: {e}")
@@ -184,6 +190,8 @@ def get_trading_config() -> dict:
         "order_price_offset_ticks": order_price_offset_ticks,
         "large_balance_threshold": large_balance_threshold,
         "large_balance_position_pct": large_balance_position_pct,
+        "fee_rate_market": fee_rate_market,
+        "fee_rate_limit": fee_rate_limit,
     }
 
     logging.info(
@@ -213,6 +221,8 @@ ORDER_PRICE_OFFSET_PCT = TRADING_CONFIG["order_price_offset_pct"]
 ORDER_PRICE_OFFSET_TICKS = TRADING_CONFIG["order_price_offset_ticks"]
 LARGE_BALANCE_THRESHOLD = TRADING_CONFIG["large_balance_threshold"]
 LARGE_BALANCE_POSITION_PCT = TRADING_CONFIG["large_balance_position_pct"]
+FEE_RATE_MARKET = TRADING_CONFIG["fee_rate_market"]
+FEE_RATE_LIMIT = TRADING_CONFIG["fee_rate_limit"]
 
 # ============================================================================
 # 止盈止损执行方式（已改为程序执行，不挂委托）

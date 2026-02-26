@@ -55,6 +55,7 @@ async def execute_observe_order(
         is_observe=True,
         tp1_close_ratio=params["tp1_close_ratio"],
         is_climax_bar=False,
+        entry_order_type="market" if params["is_spike"] else "limit",
     )
     entry_type = "市价" if params["is_spike"] else "限价"
     logging.info(
@@ -104,6 +105,7 @@ async def execute_live_order(
             tp1_close_ratio=params["tp1_close_ratio"],
             is_climax_bar=False,
             hard_stop_loss=None,
+            entry_order_type="market" if is_spike else "limit",
         )
 
         await asyncio.sleep(1)

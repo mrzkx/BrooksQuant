@@ -4,6 +4,7 @@
 - 持仓与辅助状态存内存，可选写入 Redis（trade:position:{user}、trade:aux:{user}）
 - 启动/恢复时：先查币安，再查 Redis；Redis 有且与币安一致则用 Redis 恢复，否则用币安覆盖
 - 不落历史库：已完成交易不写入任何 DB
+- 手续费：单边市价 0.05%、限价 0.02%，保本缓冲与净盈亏按 (开仓费率+平仓费率)×名义价值 计算
 """
 
 import json
@@ -17,6 +18,39 @@ try:
     import redis
 except ImportError:
     redis = None
+
+
+def _fee_buffer_pct(entry_order_type: str) -> float:
+    """开仓+平仓费率（平仓按市价 0.05%），用于保本止损缓冲。"""
+    from config import FEE_RATE_MARKET, FEE_RATE_LIMIT
+    open_rate = FEE_RATE_LIMIT if (entry_order_type or "limit").lower() == "limit" else FEE_RATE_MARKET
+    return open_rate + FEE_RATE_MARKET
+
+
+def _trade_fee_usdt(
+    entry_price: float,
+    exit_price: float,
+    quantity: float,
+    entry_order_type: str,
+    tp1_quantity: Optional[float] = None,
+    tp1_price: Optional[float] = None,
+) -> float:
+    """
+    单边费率下：(开仓费率+平仓费率)×名义价值 合计手续费。
+    若有 TP1，则开仓名义用 full qty，平仓分两笔：TP1 部分 + 剩余部分。
+    """
+    from config import FEE_RATE_MARKET, FEE_RATE_LIMIT
+    open_rate = FEE_RATE_LIMIT if (entry_order_type or "limit").lower() == "limit" else FEE_RATE_MARKET
+    close_rate = FEE_RATE_MARKET
+    notional_open = entry_price * quantity
+    if tp1_quantity is not None and tp1_quantity > 0 and tp1_price is not None:
+        notional_tp1 = tp1_price * tp1_quantity
+        notional_rest = exit_price * (quantity - tp1_quantity)
+        fee = notional_open * open_rate + notional_tp1 * close_rate + notional_rest * close_rate
+    else:
+        notional_close = exit_price * quantity
+        fee = notional_open * open_rate + notional_close * close_rate
+    return float(fee)
 
 
 
@@ -66,6 +100,7 @@ class Trade:
     tp1_order_id: Optional[int] = None
     tp2_order_id: Optional[int] = None
     sl_order_id: Optional[int] = None
+    entry_order_type: str = "limit"  # "market" | "limit"，用于手续费与保本缓冲
 
     def __repr__(self):
         return f"<Trade(id={self.id}, user='{self.user}', signal='{self.signal}', status='{self.status}')>"
@@ -390,6 +425,7 @@ class TradeLogger:
         tp1_close_ratio: float = 0.5,
         is_climax_bar: bool = False,
         hard_stop_loss: Optional[float] = None,
+        entry_order_type: str = "limit",
     ) -> Trade:
         """开仓（线程安全，仅内存）"""
         entry_price = float(entry_price)
@@ -402,6 +438,7 @@ class TradeLogger:
         tight_channel_score = float(tight_channel_score) if tight_channel_score is not None else None
         tp1_close_ratio = float(tp1_close_ratio) if tp1_close_ratio is not None else 0.5
         hard_stop_loss = float(hard_stop_loss) if hard_stop_loss is not None else None
+        entry_order_type = (entry_order_type or "limit").lower()
 
         with self._lock:
             if self.positions.get(user):
@@ -433,6 +470,7 @@ class TradeLogger:
                 tp1_close_ratio=tp1_close_ratio,
                 is_climax_bar=is_climax_bar,
                 hard_stop_loss=hard_stop_loss,
+                entry_order_type=entry_order_type,
             )
             self.positions[user] = trade
             self._tp2_order_placed[user] = False
@@ -481,9 +519,24 @@ class TradeLogger:
                 tp1_pnl = (tp1_val - trade.entry_price) * half_qty
             else:
                 tp1_pnl = (trade.entry_price - tp1_val) * half_qty
-            trade.pnl = tp1_pnl + final_pnl
+            raw_pnl = tp1_pnl + final_pnl
+            total_fee = _trade_fee_usdt(
+                float(trade.entry_price),
+                exit_price,
+                float(trade.quantity),
+                getattr(trade, "entry_order_type", "limit"),
+                tp1_quantity=half_qty,
+                tp1_price=tp1_val,
+            )
         else:
-            trade.pnl = final_pnl
+            raw_pnl = final_pnl
+            total_fee = _trade_fee_usdt(
+                float(trade.entry_price),
+                exit_price,
+                float(trade.quantity),
+                getattr(trade, "entry_order_type", "limit"),
+            )
+        trade.pnl = raw_pnl - total_fee
 
         cost_basis = (trade.entry_price or 0) * (trade.quantity or 0)
         if cost_basis > 0:
@@ -501,7 +554,7 @@ class TradeLogger:
         self._redis_save_aux(user)
         logging.info(
             f"用户 {user} 平仓: {exit_reason} @ {exit_price:.2f}, "
-            f"盈亏={trade.pnl:.4f} USDT ({trade.pnl_percent:.2f}%) {note}"
+            f"手续费={total_fee:.4f}, 净盈亏={trade.pnl:.4f} USDT ({trade.pnl_percent:.2f}%) {note}"
         )
         return trade
 
@@ -679,7 +732,8 @@ class TradeLogger:
                     trade.exit_stage = 1
                     trade.status = "partial"
                     entry_price = float(trade.entry_price)
-                    fee_buffer = entry_price * 0.001
+                    fee_buffer_pct = _fee_buffer_pct(getattr(trade, "entry_order_type", "limit"))
+                    fee_buffer = entry_price * fee_buffer_pct
                     if trade.side == "buy":
                         breakeven_stop = entry_price + fee_buffer
                     else:
@@ -736,12 +790,19 @@ class TradeLogger:
                         and current_price <= float(trade.entry_price) - initial_risk
                     )
                     if breakeven_hit:
-                        trade.stop_loss = float(trade.entry_price)
+                        entry_price = float(trade.entry_price)
+                        fee_buffer_pct = _fee_buffer_pct(getattr(trade, "entry_order_type", "limit"))
+                        fee_buffer = entry_price * fee_buffer_pct
+                        if trade.side == "buy":
+                            be_stop = entry_price + fee_buffer
+                        else:
+                            be_stop = entry_price - fee_buffer
+                        trade.stop_loss = be_stop
                         trade.breakeven_moved = True
-                        ts_state["trailing_stop"] = float(trade.entry_price)
+                        ts_state["trailing_stop"] = be_stop
                         self._redis_save_position(user, trade)
                         self._redis_save_aux(user)
-                        logging.info(f"💡 [{user}] Breakeven触发！止损移至入场价: {float(trade.entry_price):.2f}")
+                        logging.info(f"💡 [{user}] Breakeven触发！止损移至入场+手续费缓冲: {be_stop:.2f}")
 
                 # 止损检查（收盘时）
                 effective_stop = ts_state["trailing_stop"] if ts_state["activated"] else float(trade.stop_loss)
@@ -883,7 +944,8 @@ class TradeLogger:
             trade.remaining_quantity = remaining_quantity
             trade.exit_stage = 1
             trade.status = "partial"
-            fee_buffer = entry_price * 0.001
+            fee_buffer_pct = _fee_buffer_pct(getattr(trade, "entry_order_type", "limit"))
+            fee_buffer = entry_price * fee_buffer_pct
             if trade.side == "buy":
                 breakeven_stop = entry_price + fee_buffer
             else:
